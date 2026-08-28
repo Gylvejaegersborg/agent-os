@@ -8,6 +8,7 @@
     "build": "tsc -b",
     "demo": "tsc -b && node dist/cli.js demo",
     "cli": "tsc -b && node dist/cli.js",
+    "test-live-model": "tsc -b && node dist/test-live-model.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {

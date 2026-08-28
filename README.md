@@ -33,7 +33,7 @@ independently — see `docs/architecture.md §0`.
 |---|---|---|
 | Event log (append-only, JSONL, projections) | ✅ working | `src/core/eventlog.ts` |
 | Agent loop (turn = LLM call + tool calls, event-sourced) | ✅ working | `src/core/agent-loop.ts` |
-| Model abstraction (swappable adapter interface) | ✅ working (stub adapter only) | `src/core/model.ts` |
+| Model abstraction (swappable adapter interface) | ✅ working — stub + real Anthropic/OpenAI/Ollama adapters | `src/core/model.ts`, `src/core/models/real.ts` |
 | Worker abstraction (execution environment, separate from Agent identity) | ✅ working (local-shell + stub) | `src/core/worker.ts` |
 | Task / Flow (OpenClaw's ledger + orchestration split, with optimistic-concurrency revisioning) | ✅ working | `src/core/tasks.ts` |
 | Automation (registry only — no scheduler loop yet) | 🚧 stub | `src/core/tasks.ts` |
@@ -82,6 +82,34 @@ Other commands:
 npm run typecheck   # tsc --noEmit
 npm run build        # tsc -b -> dist/
 ```
+
+## Testing a real model adapter (not the stub)
+
+The demo above never touches a network. To prove the model abstraction is
+genuinely swappable, `npm run test-live-model` runs one real agent-loop
+turn through whichever real adapter it finds, in this priority order:
+
+1. `ANTHROPIC_TOKEN` or `ANTHROPIC_API_KEY` env var -> Anthropic Messages API
+2. `OPENAI_API_KEY` env var -> OpenAI Chat Completions API
+3. A local Ollama server (`ollama serve`, probed at `localhost:11434`) ->
+   Ollama's OpenAI-compatible endpoint, zero API key, zero cost. Set
+   `OLLAMA_MODEL=<name>` to pick which locally-pulled model to use (default
+   `llama3.2` — override if you have something else pulled, e.g.
+   `OLLAMA_MODEL=llama3.1:8b`).
+
+```bash
+# with a cloud key
+export ANTHROPIC_TOKEN=sk-ant-...
+npm run test-live-model
+
+# or fully local/free
+ollama serve &
+ollama pull llama3.2   # or use OLLAMA_MODEL to point at one you already have
+npm run test-live-model
+```
+
+If none of the above are available, the command exits with a clear error
+instead of silently falling back to the stub.
 
 ## Repo layout
 

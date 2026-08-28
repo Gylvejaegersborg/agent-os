@@ -6,4 +6,5 @@ export * from "./memory.js";
 export * from "./hooks.js";
 export * from "./worker.js";
 export * from "./model.js";
+export * from "./models/real.js";
 export * from "./agent-loop.js";
