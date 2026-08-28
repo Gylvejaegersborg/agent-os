@@ -1,0 +1,17 @@
+{
+  "name": "agent-os",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Agent-native OS scaffold: event-log-first, Task/Flow/Automation/StandingOrder, Agent/Worker split, hybrid fast-path+dreaming memory.",
+  "scripts": {
+    "build": "tsc -b",
+    "demo": "tsc -b && node dist/cli.js demo",
+    "cli": "tsc -b && node dist/cli.js",
+    "typecheck": "tsc -b --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}
