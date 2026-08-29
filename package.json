@@ -10,6 +10,7 @@
     "chat": "tsc -b && node dist/cli.js chat",
     "cli": "tsc -b && node dist/cli.js",
     "test-live-model": "tsc -b && node dist/test-live-model.js",
+    "test-cron": "tsc -b && node dist/test-cron.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {

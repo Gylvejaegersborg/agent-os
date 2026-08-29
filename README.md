@@ -36,7 +36,7 @@ independently — see `docs/architecture.md §0`.
 | Model abstraction (swappable adapter interface) | ✅ working — stub + real Anthropic/OpenAI/Ollama adapters | `src/core/model.ts`, `src/core/models/real.ts` |
 | Worker abstraction (execution environment, separate from Agent identity) | ✅ working (local-shell + stub) | `src/core/worker.ts` |
 | Task / Flow (OpenClaw's ledger + orchestration split, with optimistic-concurrency revisioning) | ✅ working | `src/core/tasks.ts` |
-| Automation (registry only — no scheduler loop yet) | 🚧 stub | `src/core/tasks.ts` |
+| Automation registry + scheduler (cron tick loop + manual event dispatch) | ✅ working — Heartbeat mode NOT implemented (see below) | `src/core/scheduler.ts` |
 | **Memory: fast-path episodic + gated "dreaming" promotion** | ✅ working | `src/core/memory.ts` |
 | Hooks (deterministic, harness-run, decision vs. observe-only) | ✅ working | `src/core/hooks.ts` |
 | Standing Order (deliberately NOT a data object) | 📝 documented only | `docs/architecture.md §2` |
@@ -183,6 +183,43 @@ real container). That's an intentional "prove the layer separation first"
 choice — see `docs/architecture.md §6` for what a production sandbox
 needs on top of this.
 
+## Scheduler — Automations that actually fire
+
+Per `docs/architecture.md §2`'s "two scheduling modes" note. This
+scaffold implements ONE of the two explicitly:
+
+- **Automations** (implemented, `src/core/scheduler.ts`) — precise
+  timing, isolated context. A zero-dependency 5-field cron parser
+  (`parseCron`/`cronMatches`) plus a real tick loop (`startScheduler`,
+  default 30s interval) that checks every enabled cron-triggered
+  Automation and fires the ones that are due. Firing spawns a real Task
+  (`type: "cron"`) and runs a full agent-loop turn in a brand-new,
+  isolated session — never the automation's own history, matching
+  "isolated context" from the architecture doc. Every firing is itself
+  event-sourced (`automation.fired` events in the same `automations`
+  stream `tasks.ts` already writes to), which is also how dedup works:
+  an automation can fire at most once per matching minute, so a
+  scheduler restart never double-fires or loses its place.
+- **Heartbeat** (imprecise timing, full main-session context, for "check
+  the inbox"-style work) is a genuinely different mechanism — a
+  recurring turn in an existing long-lived session, not a spawned
+  isolated Task — and is **NOT implemented** here. Stated explicitly
+  rather than half-built alongside Automations.
+
+`event`-triggered automations are implemented as a manual dispatch
+function (`fireEventAutomations`) rather than a tick, since this
+scaffold has no event bus yet — call it from wherever the real event
+happens. `webhook`-triggered automations are not implemented (would need
+an actual HTTP listener).
+
+Verified with `npm run test-cron` (9 assertions covering step values,
+ranges, weekday matching, and malformed-input error handling) plus
+`npm run demo`'s "5. Scheduler" section, which registers a cron
+automation matching the current minute, runs a real tick, and proves:
+the automation fires and creates a real Task; a second tick in the same
+minute does NOT re-fire (dedup); and a tick one minute later does not
+fire either (the cron expression no longer matches).
+
 ## Agent filesystem namespace — the same primitives, addressed as paths
 
 Per `docs/architecture.md §7`: a read-only projection that exposes
@@ -223,12 +260,14 @@ src/
     permissions.ts      # two-layer permission policy (hook) + sandbox (worker enforcement)
     identity.ts           # minimal Agent identity store (name + persona), backs /agent/identity
     agentfs.ts              # read-only /agent/... filesystem projection over everything above
-    worker.ts                 # execution-environment interface (local-shell, stub, sandboxed wrapper)
+    scheduler.ts              # cron parser + tick loop that makes Automations actually fire
+    worker.ts                   # execution-environment interface (local-shell, stub, sandboxed wrapper)
     model.ts             # swappable LLM adapter interface (stub adapter shipped)
     models/real.ts        # real Anthropic / OpenAI / Ollama adapters
     agent-loop.ts          # the turn loop binding all of the above together
   cli.ts                    # runnable end-to-end demo of every primitive above
   test-live-model.ts         # calls a real model adapter (not the stub) — see below
+  test-cron.ts                # standalone cron parser/matcher regression tests
 skills/
   commit-message-style/       # example skill: house style for git commits
     SKILL.md

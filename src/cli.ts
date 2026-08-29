@@ -36,6 +36,7 @@ import {
   fsList,
   fsRead,
   registerAgentIdentity,
+  runSchedulerTick,
 } from "./core/index.js";
 
 const AGENT_ID = "demo-agent";
@@ -210,8 +211,54 @@ async function demoTasksAndFlows(): Promise<void> {
   console.log(`\n${automations.length} automation(s) registered.`);
 }
 
+async function demoScheduler(): Promise<void> {
+  section("5. Scheduler — Automations actually fire, not just registered");
+  console.log(
+    "Implements docs/architecture.md §2's 'Automations' scheduling mode (precise\n" +
+      "timing, isolated context) — NOT the 'Heartbeat' mode (imprecise timing, full\n" +
+      "main-session context), which is a genuinely different mechanism left for a\n" +
+      "future pass. See src/core/scheduler.ts for why.\n",
+  );
+
+  // A cron expression matching THIS exact minute, so the demo can prove a
+  // real fire without waiting for a wall-clock cron boundary. registerAutomation()
+  // takes the exact same code path a "daily at 9am" automation would.
+  const now = new Date();
+  const thisMinuteCron = `${now.getMinutes()} ${now.getHours()} * * *`;
+  const automation = await registerAutomation({
+    trigger: { kind: "cron", expr: thisMinuteCron },
+    agentId: AGENT_ID,
+    promptTemplate: "Scheduled check-in: summarize what happened.",
+    enabled: true,
+  });
+  console.log(`Registered a cron automation matching THIS minute ("${thisMinuteCron}"): ${automation.id}`);
+
+  const deps = { model: createStubModel(), worker: createStubWorker() };
+
+  const fired1 = await runSchedulerTick(deps, now);
+  console.log(`\nFirst tick at ${now.toISOString()}: fired ${fired1.length} automation(s)`);
+  for (const f of fired1) {
+    console.log(`  automation ${f.automationId} -> task ${f.taskId}, session ${f.sessionId}`);
+    console.log(`  result: "${f.finalContent}"`);
+  }
+
+  const fired2 = await runSchedulerTick(deps, now);
+  console.log(`\nSecond tick, SAME minute: fired ${fired2.length} automation(s) (expected 0 — dedup by minute)`);
+
+  const oneMinuteLater = new Date(now.getTime() + 60_000);
+  const disabledCheck = await runSchedulerTick(deps, oneMinuteLater);
+  console.log(
+    `Tick one minute later: fired ${disabledCheck.length} automation(s) ` +
+      "(expected 0 — this automation's cron expr no longer matches)",
+  );
+
+  const relatedTasks = await listTasks({ agentId: AGENT_ID, status: "succeeded" });
+  const cronTasks = relatedTasks.filter((t) => t.type === "cron");
+  console.log(`\n${cronTasks.length} 'cron'-type task(s) now exist in the task ledger from this firing.`);
+}
+
 async function demoEventLogIsTruth(): Promise<void> {
-  section("7. Everything above is just an event log — proof");
+  section("8. Everything above is just an event log — proof");
   const streams = await listStreamIds();
   console.log(`${streams.length} streams on disk under data/streams/:`);
   for (const s of streams) {
@@ -226,7 +273,7 @@ async function demoEventLogIsTruth(): Promise<void> {
 }
 
 async function demoPermissions(): Promise<void> {
-  section("5. Permissions / Sandbox — two separate layers, proven separately");
+  section("6. Permissions / Sandbox — two separate layers, proven separately");
 
   // --- Layer A: PermissionPolicy — pre-execution, model-input-based ---
   console.log("Layer A (PermissionPolicy): a policy that denies 'forbidden-tool' but allows 'shell'.\n");
@@ -280,7 +327,7 @@ async function demoPermissions(): Promise<void> {
 }
 
 async function demoAgentFilesystem(sessionId: string): Promise<void> {
-  section("6. Agent filesystem — the same primitives, addressed as paths");
+  section("7. Agent filesystem — the same primitives, addressed as paths");
   console.log(
     "Read-only projection over everything above, per docs/architecture.md §7 —\n" +
       "not a new storage layer, just a filesystem-shaped VIEW of the same event\n" +
@@ -340,6 +387,7 @@ async function main(): Promise<void> {
     await demoSkills(sessionId, skills);
     await demoMemory(sessionId);
     await demoTasksAndFlows();
+    await demoScheduler();
     await demoPermissions();
     await demoAgentFilesystem(sessionId);
     await demoEventLogIsTruth();
