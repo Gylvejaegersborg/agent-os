@@ -229,8 +229,21 @@ async function demoMemory(sessionId: string): Promise<void> {
   }
 
   const curated = await getCuratedMemory(AGENT_ID);
-  console.log("\nCurated memory (what actually gets injected into future sessions):");
+  console.log("\nMEMORY.md (durable facts/procedures — what gets injected into future sessions):");
   console.log(curated.content || "  (nothing promoted yet)");
+  console.log("\nUSER.md (user profile/preferences — kept as its own document, Hermes-style):");
+  console.log(curated.userProfile || "  (nothing promoted yet)");
+
+  console.log(
+    "\nRunning the SAME dreaming pass again with no new episodic writes in between —\n" +
+      "this used to append duplicate bullet lines every pass; now it should add nothing new:",
+  );
+  const passAgain = await runDreamingPass(AGENT_ID);
+  const curatedAfterSecondPass = await getCuratedMemory(AGENT_ID);
+  console.log(
+    `Second pass reviewed ${passAgain.episodicEntriesReviewed} entries (same as before). ` +
+      `MEMORY.md content unchanged: ${curatedAfterSecondPass.content === curated.content}`,
+  );
 
   const passes = await listDreamingPasses(AGENT_ID);
   console.log(`\n${passes.length} dreaming pass(es) recorded in the audit trail (memory:${AGENT_ID}:dreaming).`);

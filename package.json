@@ -16,6 +16,7 @@
     "test-skills-write": "tsc -b && node dist/test-skills-write.js",
     "test-heartbeat": "tsc -b && node dist/test-heartbeat.js",
     "test-subagent": "tsc -b && node dist/test-subagent.js",
+    "test-memory": "tsc -b && node dist/test-memory.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {

@@ -10,6 +10,7 @@ import type { Worker } from "./worker.js";
 import { fireHook } from "./hooks.js";
 import { generateId } from "./id.js";
 import { SkillRegistry, renderSkillCatalog } from "./skills.js";
+import { getCuratedMemory } from "./memory.js";
 
 export interface AgentTurnResult {
   sessionId: string;
@@ -40,6 +41,17 @@ export interface RunTurnOptions {
    *  specifically want that — pass it through deliberately, not by
    *  default, to avoid uncontrolled fan-out). */
   enableSubagents?: boolean;
+  /** When true (default), curated memory (MEMORY.md + USER.md,
+   *  memory.ts's getCuratedMemory) is re-read from its event stream and
+   *  injected as a system message every turn — the actual point of
+   *  having a "dreaming"-gated permanent memory at all is that it gets
+   *  used, not just computed and left unread. Re-read fresh each turn
+   *  (not cached, not stored in session history) so a dreaming pass that
+   *  runs mid-conversation is picked up on the very next turn, the same
+   *  pattern the skill catalog already uses. Set false to run a turn
+   *  with no memory context (e.g. testing eligibility scoring in
+   *  isolation without it leaking into unrelated assertions). */
+  injectMemory?: boolean;
 }
 
 function sessionStream(sessionId: string): string {
@@ -53,6 +65,22 @@ export async function getSessionHistory(sessionId: string): Promise<ModelMessage
     }
     return state;
   });
+}
+
+/** Renders curated memory (MEMORY.md + USER.md) as system-prompt text.
+ *  Empty documents produce empty sections rather than empty-but-labeled
+ *  ones, so a fresh agent with no promoted memories yet doesn't inject a
+ *  confusing "MEMORY.md: (nothing here)" block into every turn. */
+async function renderMemoryContext(agentId: string): Promise<string> {
+  const curated = await getCuratedMemory(agentId);
+  const parts: string[] = [];
+  if (curated.content.trim()) {
+    parts.push(`# MEMORY.md (durable facts/procedures learned about this work)\n${curated.content.trim()}`);
+  }
+  if (curated.userProfile.trim()) {
+    parts.push(`# USER.md (user profile/preferences learned over time)\n${curated.userProfile.trim()}`);
+  }
+  return parts.join("\n\n");
 }
 
 interface ToolDispatchResult {
@@ -103,6 +131,7 @@ async function dispatchTool(
 
 export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents } = opts;
+  const injectMemory = opts.injectMemory ?? true;
   const maxHops = opts.maxToolHops ?? 3;
 
   await appendEvent(sessionStream(sessionId), "agent.turn.start", { agentId, userMessage });
@@ -120,7 +149,12 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     const subagentText = enableSubagents
       ? "You can delegate a focused sub-task to an isolated subagent by calling the `subagent` tool with {goal}. The subagent runs independently and only its final result returns to you — its own reasoning and tool calls stay isolated."
       : "";
-    const systemParts = [catalogText, subagentText].filter(Boolean);
+    // Re-read fresh every turn (not cached) — see injectMemory's own doc
+    // comment for why. Only ever populated by the dreaming pass
+    // (memory.ts), never by this turn's own conversation, so a chatty
+    // session cannot inject its own unvetted "memory" into itself.
+    const memoryText = injectMemory ? await renderMemoryContext(agentId) : "";
+    const systemParts = [memoryText, catalogText, subagentText].filter(Boolean);
     const messages: ModelMessage[] = systemParts.length
       ? [{ role: "system", content: systemParts.join("\n\n") }, ...history]
       : history;

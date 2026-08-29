@@ -68,3 +68,21 @@ export function createStubModel(id = "stub-model"): ModelAdapter {
     },
   };
 }
+
+/** Wraps any ModelAdapter to record the exact messages array passed to
+ *  every complete() call — used to PROVE what actually reached the
+ *  model (e.g. that curated memory was really injected as a system
+ *  message), not just trust that the code intends to inject it.
+ *  lastMessages() returns the most recent call's messages, or undefined
+ *  if complete() was never called. */
+export function createRecordingModel(inner: ModelAdapter): ModelAdapter & { lastMessages: () => ModelMessage[] | undefined } {
+  let last: ModelMessage[] | undefined;
+  return {
+    id: inner.id,
+    async complete(messages: ModelMessage[]): Promise<ModelResponse> {
+      last = messages;
+      return inner.complete(messages);
+    },
+    lastMessages: () => last,
+  };
+}

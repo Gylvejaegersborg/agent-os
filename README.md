@@ -39,7 +39,7 @@ independently — see `docs/architecture.md §0`.
 | Subagent delegation (in-process, isolated context, same harness) | ✅ working — cross-harness delegation (Claude Code/Codex as a child process) is planned, not built | `src/core/subagent.ts` |
 | Automation registry + scheduler (cron tick loop + event bus + webhooks) | ✅ working — all three trigger kinds fire for real | `src/core/scheduler.ts`, `src/core/eventbus.ts`, `src/core/webhook.ts` |
 | Heartbeat (imprecise timing, full main-session context, no Task created) | ✅ working | `src/core/heartbeat.ts` |
-| **Memory: fast-path episodic + gated "dreaming" promotion** | ✅ working | `src/core/memory.ts` |
+| **Memory: fast-path episodic + gated "dreaming" promotion, MEMORY.md/USER.md split, dedup, and real injection into the agent loop** | ✅ working | `src/core/memory.ts`, `src/core/agent-loop.ts` |
 | Hooks (deterministic, harness-run, decision vs. observe-only) | ✅ working | `src/core/hooks.ts` |
 | Standing Order (deliberately NOT a data object) | 📝 documented only | `docs/architecture.md §2` |
 | Skills (agentskills.io-compatible format) | ✅ working — parser, discovery, progressive disclosure, write support | `src/core/skills.ts`, `skills/*/SKILL.md` |
@@ -53,6 +53,38 @@ curated memory is a deterministic scoring function (`scoreEligibility` in
 `memory.ts`) that a background "dreaming" pass runs — the model is only
 ever used to *phrase* what code already qualified, never to *decide* what's
 worth remembering. Full provenance is kept for every promotion.
+
+Curated memory is split into two documents mirroring Hermes' own
+MEMORY.md/USER.md shape — `EpisodicKind: "preference"` entries promote
+into USER.md (user profile/preferences), everything else promotes into
+MEMORY.md (durable facts/procedures). Both documents are re-read fresh
+and injected as a system message into **every real agent-loop turn**
+(`runTurn()`, opt-out via `injectMemory: false`) — not just computed and
+left sitting unread, which is what this scaffold did before this pass.
+Re-promoting an already-promoted episodic entry in a later dreaming pass
+no longer duplicates it in the document (dedup is tracked via each
+promotion's own provenance, keyed by episodic entry id).
+
+Verified with `npm run test-memory` (14 assertions: preference vs.
+non-preference entries land in the correct document, a second dreaming
+pass with no new writes produces byte-identical documents — proving
+dedup — a newly-eligible entry is added alongside prior promotions
+without duplicating them, and a `createRecordingModel()` wrapper proves
+curated memory ACTUALLY reaches a real model's system message in a
+brand-new session, plus that `injectMemory: false` genuinely opts out)
+and `npm run demo`'s "3. Dreaming" section, which runs the same
+dreaming pass twice back to back and prints `MEMORY.md content
+unchanged: true`.
+
+**Known limitation, stated not hidden**: `countSimilar()`'s repetition
+detection is exact-substring matching on normalized text, not semantic
+similarity — two paraphrases of the same fact are not recognized as
+repeating each other. There's also no retrieval yet: the full curated
+documents are injected in their entirety every turn rather than
+fetching only what's relevant to the current context, which won't
+scale gracefully as curated memory grows. Both are real gaps compared
+to production memory systems (mem0, Zep, MemGPT/Letta) — left as
+explicit next steps rather than implied to be solved.
 
 ## Running it
 
@@ -319,7 +351,7 @@ sections, which exercise all of it against real data side by side.
 
 **Note on test isolation**: the standalone test scripts (`test-cron`,
 `test-eventbus`, `test-webhook`, `test-skills-write`, `test-heartbeat`,
-`test-subagent`) all share the same `./data/` event-log directory as
+`test-subagent`, `test-memory`) all share the same `./data/` event-log directory as
 `npm run demo` — none of them reset it first. Running `npm run demo`
 and then a test
 script back to back can leave leftover Automations registered from the
@@ -400,6 +432,7 @@ src/
   test-skills-write.ts             # standalone skills write/round-trip tests
   test-heartbeat.ts                  # standalone Heartbeat scheduling-mode tests
   test-subagent.ts                     # standalone Subagent context-isolation tests
+  test-memory.ts                         # standalone memory dedup/split/injection tests
 skills/
   commit-message-style/       # example skill: house style for git commits
     SKILL.md
