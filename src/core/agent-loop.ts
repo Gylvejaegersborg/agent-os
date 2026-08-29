@@ -11,6 +11,7 @@ import { fireHook } from "./hooks.js";
 import { generateId } from "./id.js";
 import { SkillRegistry, renderSkillCatalog } from "./skills.js";
 import { retrieveMemoryContext } from "./memory.js";
+import { getAgentIdentity } from "./identity.js";
 import type { EpisodicKind } from "./types.js";
 
 export interface AgentTurnResult {
@@ -104,6 +105,22 @@ async function renderMemoryContext(agentId: string, queryText: string): Promise<
   return parts.join("\n\n");
 }
 
+/** Renders the agent's registered identity (identity.ts's persona field)
+ *  as system-prompt text — this is the one piece of "who is this agent"
+ *  state that lives outside memory/skills/tools. Deliberately OPTIONAL
+ *  and ADDITIVE: an agentId with no registered identity (identity.ts's
+ *  getAgentIdentity returns undefined) just yields an empty string here,
+ *  which systemParts.filter(Boolean) below drops entirely — so a turn
+ *  for an unregistered agent produces byte-for-byte the same system
+ *  message it did before this wiring existed. Looked up once per turn
+ *  (not per hop, unlike memory/skills) since identity doesn't change
+ *  mid-turn the way a dreaming pass or a skill file on disk might. */
+async function renderIdentityContext(agentId: string): Promise<string> {
+  const identity = await getAgentIdentity(agentId);
+  if (!identity?.persona) return "";
+  return `# Agent Identity\nYou are ${identity.name}. ${identity.persona}`;
+}
+
 interface ToolDispatchResult {
   ok: boolean;
   output: string;
@@ -189,6 +206,11 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   let hops = 0;
   let finalContent = "";
 
+  // Fetched once per turn, outside the hop loop — see renderIdentityContext's
+  // own doc comment for why (unlike memory/skills, identity isn't expected
+  // to change mid-turn).
+  const personaText = await renderIdentityContext(agentId);
+
   while (hops < maxHops) {
     const history = await getSessionHistory(sessionId);
     const catalogText = skills ? renderSkillCatalog(skills.listMetadata()) : "";
@@ -203,7 +225,10 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     // (memory.ts), never by this turn's own conversation, so a chatty
     // session cannot inject its own unvetted "memory" into itself.
     const memoryText = injectMemory ? await renderMemoryContext(agentId, userMessage) : "";
-    const systemParts = [memoryText, catalogText, subagentText, nominationText].filter(Boolean);
+    // personaText first — "who you are" precedes "what you remember/can do"
+    // in the assembled system message, matching how a human-written system
+    // prompt would order identity before capability context.
+    const systemParts = [personaText, memoryText, catalogText, subagentText, nominationText].filter(Boolean);
     const messages: ModelMessage[] = systemParts.length
       ? [{ role: "system", content: systemParts.join("\n\n") }, ...history]
       : history;

@@ -45,6 +45,7 @@ independently — see `docs/architecture.md §0`.
 | Skills (agentskills.io-compatible format) | ✅ working — parser, discovery, progressive disclosure, write support | `src/core/skills.ts`, `skills/*/SKILL.md` |
 | Sandboxing / permission policy (two-layer) | ✅ working — Layer A (policy hook) + Layer B (sandboxed worker) | `src/core/permissions.ts` |
 | Agent filesystem namespace | ✅ working — read/write over paths (write supported for skills only; see below) | `src/core/agentfs.ts` |
+| **Agent identity (persona, defaultModel) actually affecting behavior** | ✅ working — persona injected into every turn's system message; defaultModel consulted during model selection | `src/core/identity.ts`, `src/core/agent-loop.ts`, `src/core/models/real.ts` |
 
 The memory design directly answers "I want the agent to keep getting
 better with me, safely": episodic writes are immediate and ungated (same
@@ -420,7 +421,7 @@ sections, which exercise all of it against real data side by side.
 
 **Note on test isolation**: the standalone test scripts (`test-cron`,
 `test-eventbus`, `test-webhook`, `test-skills-write`, `test-heartbeat`,
-`test-subagent`, `test-memory`, `test-memory-v2`) all share the same `./data/` event-log directory as
+`test-subagent`, `test-memory`, `test-memory-v2`, `test-identity-wiring`) all share the same `./data/` event-log directory as
 `npm run demo` — none of them reset it first. Running `npm run demo`
 and then a test
 script back to back can leave leftover Automations registered from the
@@ -469,6 +470,82 @@ immediately so it never pollutes the actual catalog), the
 path/frontmatter name-mismatch rejection, and the
 `FsWriteNotSupportedError` thrown for unsupported path kinds.
 
+## Agent identity — persona and defaultModel actually affecting behavior
+
+Per `src/core/identity.ts`: `AgentIdentity` (`{id, name, persona,
+createdAt, updatedAt}`) is registered via `registerAgentIdentity()` and
+event-sourced over the `agent-identities` stream, same pattern as
+everything else in this scaffold. **Previously this was read-only** — an
+identity could be registered and read back (directly, or via
+`/agent/identity/<agentId>.json` in the agent filesystem projection) but
+nothing in the agent loop or model-selection logic ever consulted it. It
+existed only as documentation of intent.
+
+That's now wired through in two places:
+
+**1. Persona → system message.** `runTurn()` (`agent-loop.ts`) looks up
+`getAgentIdentity(agentId)` once per turn and, when a persona is
+registered, renders it (`# Agent Identity\nYou are <name>. <persona>`)
+as one more entry in the exact same `systemParts.filter(Boolean).join(...)`
+array the skill catalog, curated memory, and tool-capability descriptions
+already use — no separate mechanism, no special-casing. This is
+deliberately **optional and additive**: an `agentId` with no registered
+identity produces `getAgentIdentity() -> undefined`, which renders to an
+empty string, which `filter(Boolean)` drops — so an unregistered agent's
+system message (or lack of one) is byte-for-byte unchanged from before
+this wiring existed. Proven in `src/test-identity-wiring.ts` by
+inspecting the actual `messages` array a `createRecordingModel()`-wrapped
+model receives (the same technique `test-memory.ts` uses for memory
+injection).
+
+**2. defaultModel → model selection.** The conceptual `Agent` type's
+`defaultModel: string` field (`types.ts`) is, per `identity.ts`'s own
+header comment, deliberately owned by `models/real.ts` rather than by
+`identity.ts` itself — each facet of "Agent" lives with the subsystem
+that already owns that concern (memory.ts owns memory, permissions.ts
+owns policy, skills.ts owns skillCatalog). `models/real.ts` now has a
+sibling event-sourced primitive: `setAgentDefaultModel(agentId, model)`
+/ `getAgentDefaultModel(agentId)`, backed by its own
+`agent-model-preferences` stream. `createModelForAgent(agentId,
+ollamaOpts?)` is the actual wiring point — it looks up the agent's
+preference and threads it through to `createModelFromEnvOrOllama()`.
+`cli.ts`'s `runChat()` now calls `createModelForAgent(AGENT_ID)` instead
+of calling `createModelFromEnvOrOllama()` directly.
+
+**Precedence — read this before assuming a preference "picks the
+model"**:
+1. **Which provider** (Anthropic vs. OpenAI vs. Ollama vs. none) is
+   decided *purely* by which env vars are set / which local services are
+   reachable — exactly as before this wiring. A registered preference
+   can never make a provider "available" that isn't already credentialed;
+   an agent's stored data must not be able to conjure API access on its
+   own.
+2. **Which model name** is requested from that already-available
+   provider *does* defer to the agent's registered preference when one
+   exists (overriding the provider adapter's own hardcoded default model
+   name, e.g. `claude-sonnet-4-5-...`). This is the part that's
+   genuinely new — previously `defaultModel` was never read by anything.
+3. With **no registered preference** for the given `agentId`,
+   `createModelForAgent()` is behavior-identical to calling
+   `createModelFromEnvOrOllama()` directly (regression-safe).
+
+Scope note: this wiring makes an agent's *own* preference influence
+model selection when the CLI/agent-loop resolves a model *for that
+agent*. It does not add per-agent credential storage, does not change
+what `createStubModel()`-based demo/test paths do (they never call
+`createModelForAgent()`), and does not attempt any live validation that
+a preferred model name is actually valid for the resolved provider — an
+invalid model name still surfaces as a normal API error at request time,
+same as manually mistyping `ANTHROPIC_MODEL` would.
+
+`npm run test-identity-wiring` proves: persona text genuinely appears in
+the system message sent to the model for an agent with a registered
+identity; an agent with no registered identity is unaffected
+(regression); `setAgentDefaultModel`/`getAgentDefaultModel` round-trip
+and overwrite (not append) correctly; and `createModelForAgent()`
+resolves to `undefined` when no provider is credentialed regardless of a
+registered preference, matching rule 1 above.
+
 ## Repo layout
 
 ```
@@ -483,7 +560,7 @@ src/
     hooks.ts          # deterministic lifecycle hooks, harness-run not model-run
     skills.ts          # agentskills.io SKILL.md parser + progressive-disclosure registry
     permissions.ts      # two-layer permission policy (hook) + sandbox (worker enforcement)
-    identity.ts           # minimal Agent identity store (name + persona), backs /agent/identity
+    identity.ts           # Agent identity store (name + persona) — persona now injected into runTurn()'s system message
     agentfs.ts              # /agent/... filesystem projection (read all paths, write skills only)
     scheduler.ts              # cron parser + tick loop + event/webhook dispatch for Automations
     eventbus.ts                # minimal in-process pub/sub, wires event-triggered Automations
@@ -492,8 +569,8 @@ src/
     subagent.ts                      # in-process delegation to a fresh, isolated agent-loop run
     worker.ts                          # execution-environment interface (local-shell, stub, sandboxed wrapper)
     model.ts             # swappable LLM adapter interface (stub adapter shipped)
-    models/real.ts        # real Anthropic / OpenAI / Ollama adapters
-    agent-loop.ts          # the turn loop binding all of the above together
+    models/real.ts        # real Anthropic / OpenAI / Ollama adapters + per-agent defaultModel preference wiring
+    agent-loop.ts          # the turn loop binding all of the above together (persona + memory + skills + tools)
   cli.ts                    # runnable end-to-end demo of every primitive above
   test-live-model.ts         # calls a real model adapter (not the stub) — see below
   test-cron.ts                # standalone cron parser/matcher regression tests
@@ -504,6 +581,7 @@ src/
   test-subagent.ts                     # standalone Subagent context-isolation tests
   test-memory.ts                         # standalone memory dedup/split/injection tests
   test-memory-v2.ts                        # standalone similarity/retrieval/nomination tests
+  test-identity-wiring.ts                   # standalone persona-injection + defaultModel-wiring tests
 skills/
   commit-message-style/       # example skill: house style for git commits
     SKILL.md
