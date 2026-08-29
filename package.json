@@ -20,6 +20,7 @@
     "test-task-lifecycle": "tsc -b && node dist/test-task-lifecycle.js",
     "test-memory": "tsc -b && node dist/test-memory.js",
     "test-memory-v2": "tsc -b && node dist/test-memory-v2.js",
+    "test-identity-wiring": "tsc -b && node dist/test-identity-wiring.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {

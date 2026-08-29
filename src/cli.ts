@@ -7,7 +7,7 @@
 import * as readline from "node:readline";
 import {
   createStubModel,
-  createModelFromEnvOrOllama,
+  createModelForAgent,
   createLocalShellWorker,
   createSandboxedWorker,
   createStubWorker,
@@ -42,6 +42,7 @@ import {
   fsRead,
   fsWrite,
   registerAgentIdentity,
+  setAgentDefaultModel,
   runSchedulerTick,
   wireAutomationsToEventBus,
   publishEvent,
@@ -50,6 +51,7 @@ import {
   runHeartbeatTick,
   getSessionHistory,
   spawnSubagentTask,
+  createRecordingModel,
 } from "./core/index.js";
 
 const AGENT_ID = "demo-agent";
@@ -324,6 +326,64 @@ async function demoAgentMemoryVoice(sessionId: string): Promise<void> {
   await rejectAgentMemory(AGENT_ID, toReject.id, "Not actually relevant.");
   const rejected = await listAgentMemoryNominations(AGENT_ID, { status: "rejected" });
   console.log(`Nomination [${toReject.id}] now has status "${rejected.find((n) => n.id === toReject.id)?.status}" — no episodic entry, ever.`);
+}
+
+async function demoIdentityWiring(): Promise<void> {
+  section("3c. Identity wiring — persona actually reaches the model now");
+  console.log(
+    "Previously AgentIdentity (identity.ts) was a pure read-only projection: registered,\n" +
+      "stored, readable via /agent/identity/<id>.json — but never consulted by runTurn().\n" +
+      "Now getAgentIdentity(agentId) is looked up once per turn and, when a persona is\n" +
+      "registered, injected into the system message via the same\n" +
+      "systemParts.filter(Boolean).join(...) pattern memory/skills/tools already use.\n",
+  );
+
+  const identityAgentId = "identity-wiring-demo-agent";
+  await registerAgentIdentity({
+    id: identityAgentId,
+    name: "Grumpy Reviewer",
+    persona: "You are an unusually blunt code reviewer who never sugarcoats feedback.",
+  });
+
+  const recordingModel = createRecordingModel(createStubModel());
+  await runTurn({
+    sessionId: newSessionId(),
+    agentId: identityAgentId,
+    userMessage: "hello",
+    model: recordingModel,
+    worker: createStubWorker(),
+  });
+  const sentMessages = recordingModel.lastMessages() ?? [];
+  const systemMsg = sentMessages.find((m) => m.role === "system")?.content ?? "";
+  console.log(`Registered identity's persona present in the actual system message sent to the model: ${systemMsg.includes("blunt code reviewer")}`);
+
+  console.log(
+    "\nAn agent with NO registered identity still works exactly as before (regression check):",
+  );
+  const noIdentityModel = createRecordingModel(createStubModel());
+  await runTurn({
+    sessionId: newSessionId(),
+    agentId: "agent-with-no-identity-registered",
+    userMessage: "hello",
+    model: noIdentityModel,
+    worker: createStubWorker(),
+  });
+  const noIdentitySystemMsg = noIdentityModel.lastMessages()?.find((m) => m.role === "system");
+  console.log(`No system message injected for an unregistered agent (no memory/skills either): ${noIdentitySystemMsg === undefined}`);
+
+  console.log(
+    "\nThe sibling defaultModel primitive (models/real.ts's setAgentDefaultModel/\n" +
+      "getAgentDefaultModel/createModelForAgent) works the same way: it's optional,\n" +
+      "additive, and only ever overrides WHICH MODEL NAME is requested from a\n" +
+      "provider that env vars have already made available — never which provider.\n" +
+      "See real.ts's createModelForAgent() doc comment for the full precedence rules.",
+  );
+  await setAgentDefaultModel(identityAgentId, "claude-opus-4-hypothetical");
+  const resolvedModel = await createModelForAgent(identityAgentId);
+  console.log(
+    `createModelForAgent("${identityAgentId}") without ANTHROPIC/OPENAI env vars set -> ` +
+      `${resolvedModel === undefined ? "undefined (no provider credentialed, exactly as before — preference alone can't conjure one)" : resolvedModel.id}`,
+  );
 }
 
 async function demoTasksAndFlows(): Promise<void> {
@@ -687,6 +747,7 @@ async function main(): Promise<void> {
     await demoSubagent();
     await demoMemory(sessionId);
     await demoAgentMemoryVoice(sessionId);
+    await demoIdentityWiring();
     await demoTasksAndFlows();
     await demoScheduler();
     await demoHeartbeat();
@@ -708,7 +769,15 @@ async function main(): Promise<void> {
 }
 
 async function runChat(): Promise<void> {
-  const model = (await createModelFromEnvOrOllama()) ?? createStubModel();
+  // createModelForAgent (models/real.ts) consults AGENT_ID's own
+  // registered defaultModel preference (identity.ts's sibling primitive
+  // for model selection — see real.ts's precedence doc comment) before
+  // falling through to the exact same env/Ollama selection
+  // createModelFromEnvOrOllama() already did. No preference registered
+  // for AGENT_ID here (the demo never calls setAgentDefaultModel), so in
+  // practice this call is behavior-identical to before unless a
+  // preference has been set elsewhere for this agent.
+  const model = (await createModelForAgent(AGENT_ID)) ?? createStubModel();
   console.log(`Using model: ${model.id}`);
   if (model.id === "stub-model") {
     console.log(

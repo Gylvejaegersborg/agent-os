@@ -11,6 +11,7 @@
 // an oversight.
 
 import type { ModelAdapter, ModelMessage, ModelResponse } from "../model.js";
+import { appendEvent, project } from "../eventlog.js";
 
 export interface ToolSpec {
   name: string;
@@ -158,13 +159,19 @@ export function createOpenAiModel(opts: OpenAiOptions): ModelAdapter {
 
 /** Reads well-known env vars and returns whichever real adapter is
  *  available, or undefined if none are configured — lets the CLI degrade
- *  gracefully to the stub model instead of crashing when no key is set. */
-export function createModelFromEnv(): ModelAdapter | undefined {
+ *  gracefully to the stub model instead of crashing when no key is set.
+ *  `preferredModel`, when given, overrides the provider's own hardcoded
+ *  default model NAME (e.g. "claude-opus-4-..." instead of the built-in
+ *  "claude-sonnet-4-5-..."), but never changes WHICH PROVIDER gets
+ *  selected — that's still governed entirely by which env var is set.
+ *  See createModelForAgent() below for where this comes from in
+ *  practice (an agent's own registered default-model preference). */
+export function createModelFromEnv(preferredModel?: string): ModelAdapter | undefined {
   const anthropicKey = process.env.ANTHROPIC_TOKEN ?? process.env.ANTHROPIC_API_KEY;
-  if (anthropicKey) return createAnthropicModel({ apiKey: anthropicKey });
+  if (anthropicKey) return createAnthropicModel({ apiKey: anthropicKey, ...(preferredModel ? { model: preferredModel } : {}) });
 
   const openAiKey = process.env.OPENAI_API_KEY;
-  if (openAiKey) return createOpenAiModel({ apiKey: openAiKey });
+  if (openAiKey) return createOpenAiModel({ apiKey: openAiKey, ...(preferredModel ? { model: preferredModel } : {}) });
 
   return undefined;
 }
@@ -237,20 +244,97 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
 /** Checks env vars first (Anthropic/OpenAI), then falls back to a local
  *  Ollama instance if one is reachable, before giving up entirely. Use
  *  this instead of createModelFromEnv() when you want "try everything
- *  free/local before admitting no real model is available." */
+ *  free/local before admitting no real model is available."
+ *
+ *  `preferredModel`, when given, is forwarded as the specific model NAME
+ *  requested from whichever provider env vars select (or to Ollama, if
+ *  no cloud key is set) — see createModelForAgent() below for the
+ *  typical caller and the full precedence rules. */
 export async function createModelFromEnvOrOllama(
   ollamaOpts: OllamaOptions = {},
+  preferredModel?: string,
 ): Promise<ModelAdapter | undefined> {
-  const fromEnv = createModelFromEnv();
+  const fromEnv = createModelFromEnv(preferredModel);
   if (fromEnv) return fromEnv;
 
   const baseUrl = ollamaOpts.baseUrl ?? "http://localhost:11434/v1/chat/completions";
   const probeUrl = baseUrl.replace(/\/v1\/chat\/completions$/, "/api/tags");
   try {
     const probe = await fetch(probeUrl, { signal: AbortSignal.timeout(1500) });
-    if (probe.ok) return createOllamaModel(ollamaOpts);
+    if (probe.ok) return createOllamaModel({ ...ollamaOpts, ...(preferredModel ? { model: preferredModel } : {}) });
   } catch {
     // Ollama not running — fall through to undefined.
   }
   return undefined;
+}
+
+// ---- Per-agent default-model preference ----
+//
+// This is the "defaultModel" primitive named in identity.ts's header
+// comment as living HERE rather than in identity.ts itself — this
+// scaffold deliberately keeps each facet of the conceptual Agent type
+// (types.ts) addressable through the subsystem that actually owns it
+// (memory.ts owns memory, permissions.ts owns policy, skills.ts owns
+// skillCatalog, and model selection is owned by this file). Stored the
+// same event-sourced way identity.ts stores persona/name: an
+// append-only stream, projected on read, so it's auditable and
+// resumable for free like everything else in this scaffold.
+
+const AGENT_MODEL_PREF_STREAM = "agent-model-preferences";
+
+/** Registers (or overwrites) the model NAME an agent prefers to be run
+ *  with — e.g. "claude-opus-4-..." vs the provider's built-in default.
+ *  Does NOT select a provider by itself (no API key lives here); it only
+ *  ever takes effect once env vars have already determined which
+ *  provider/credentials are in play (see createModelForAgent()). */
+export async function setAgentDefaultModel(agentId: string, model: string): Promise<void> {
+  await appendEvent(AGENT_MODEL_PREF_STREAM, "agent.defaultModel.set", { agentId, model });
+}
+
+async function projectAgentModelPreferences(): Promise<Map<string, string>> {
+  return project<Map<string, string>>(AGENT_MODEL_PREF_STREAM, new Map(), (state, event) => {
+    if (event.type === "agent.defaultModel.set") {
+      const p = event.payload as any;
+      state.set(p.agentId, p.model);
+    }
+    return state;
+  });
+}
+
+/** Returns the registered default-model preference for an agent, or
+ *  undefined if none was ever set via setAgentDefaultModel(). */
+export async function getAgentDefaultModel(agentId: string): Promise<string | undefined> {
+  return (await projectAgentModelPreferences()).get(agentId);
+}
+
+/** The actual wiring point: resolves a ModelAdapter for a given agent by
+ *  consulting its own registered default-model preference FIRST, then
+ *  falling through to the exact same env/Ollama selection every other
+ *  caller uses.
+ *
+ *  Precedence (documented explicitly since this is the crux of the
+ *  wiring):
+ *   1. WHICH PROVIDER (Anthropic vs OpenAI vs Ollama vs none) is decided
+ *      purely by which env vars/local services are available — an
+ *      agent's stored preference can never make a provider "available"
+ *      that isn't already credentialed. This is intentional: a stored
+ *      preference is data an agent (or whoever registered it) wrote:
+ *      it must not be able to conjure API access that wasn't already
+ *      granted via environment configuration.
+ *   2. WHICH MODEL within that provider is requested DOES defer to the
+ *      agent's registered default when one exists — it overrides the
+ *      provider adapter's own hardcoded default model name (see
+ *      createModelFromEnv's preferredModel param). This is the part
+ *      that's genuinely new: previously an agent's defaultModel field
+ *      was pure documentation with zero code consulting it; now it's
+ *      read and threaded through on every call.
+ *   3. If no preference is registered for this agentId, behavior is
+ *      byte-for-byte identical to calling createModelFromEnvOrOllama()
+ *      directly (regression-safe, same as the persona wiring above). */
+export async function createModelForAgent(
+  agentId: string,
+  ollamaOpts: OllamaOptions = {},
+): Promise<ModelAdapter | undefined> {
+  const preferredModel = await getAgentDefaultModel(agentId);
+  return createModelFromEnvOrOllama(ollamaOpts, preferredModel);
 }
