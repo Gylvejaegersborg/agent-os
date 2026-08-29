@@ -30,13 +30,17 @@ import {
   listStreamIds,
   readStream,
   SkillRegistry,
+  serializeSkillFile,
   installPermissionPolicy,
   DEFAULT_HARD_BLOCKLIST,
   type SandboxPolicy,
   fsList,
   fsRead,
+  fsWrite,
   registerAgentIdentity,
   runSchedulerTick,
+  runHeartbeatTick,
+  getSessionHistory,
 } from "./core/index.js";
 
 const AGENT_ID = "demo-agent";
@@ -215,9 +219,9 @@ async function demoScheduler(): Promise<void> {
   section("5. Scheduler — Automations actually fire, not just registered");
   console.log(
     "Implements docs/architecture.md §2's 'Automations' scheduling mode (precise\n" +
-      "timing, isolated context) — NOT the 'Heartbeat' mode (imprecise timing, full\n" +
-      "main-session context), which is a genuinely different mechanism left for a\n" +
-      "future pass. See src/core/scheduler.ts for why.\n",
+      "timing, isolated context). The OTHER mode, 'Heartbeat' (imprecise timing,\n" +
+      "full main-session context), is demoed separately right after this section —\n" +
+      "see src/core/heartbeat.ts for why they're genuinely different mechanisms.\n",
   );
 
   // A cron expression matching THIS exact minute, so the demo can prove a
@@ -255,6 +259,49 @@ async function demoScheduler(): Promise<void> {
   const relatedTasks = await listTasks({ agentId: AGENT_ID, status: "succeeded" });
   const cronTasks = relatedTasks.filter((t) => t.type === "cron");
   console.log(`\n${cronTasks.length} 'cron'-type task(s) now exist in the task ledger from this firing.`);
+}
+
+async function demoHeartbeat(): Promise<void> {
+  section("5b. Heartbeat — the OTHER scheduling mode: imprecise timing, full context");
+  console.log(
+    "Genuinely different from Automations above, not a renamed copy — see\n" +
+      "src/core/heartbeat.ts for the precise distinction: imprecise timing\n" +
+      "(interval +/- jitter, never exact) and every tick is a turn in the SAME\n" +
+      "long-lived session (full context), with NO Task ever created.\n",
+  );
+
+  const sessionId = newSessionId();
+  const deps = { model: createStubModel(), worker: createStubWorker() };
+  const tasksBefore = (await listTasks({ agentId: AGENT_ID })).length;
+
+  const tick1 = await runHeartbeatTick({
+    agentId: AGENT_ID,
+    sessionId,
+    promptTemplate: "Heartbeat check-in #1: anything new?",
+    intervalMs: 1800_000, // 30 min, matching the architecture doc's example
+    ...deps,
+  });
+  console.log(`Tick 1 (session ${sessionId}): "${tick1.finalContent}"`);
+
+  const tick2 = await runHeartbeatTick({
+    agentId: AGENT_ID,
+    sessionId,
+    promptTemplate: "Heartbeat check-in #2: anything new?",
+    intervalMs: 1800_000,
+    ...deps,
+  });
+  console.log(`Tick 2 (same session): "${tick2.finalContent}"`);
+
+  const history = await getSessionHistory(sessionId);
+  const userTurns = history.filter((m) => m.role === "user").map((m) => m.content);
+  console.log(
+    `\nBoth tick prompts present in this ONE session's accumulated history? ` +
+      `${userTurns.includes("Heartbeat check-in #1: anything new?") && userTurns.includes("Heartbeat check-in #2: anything new?")}`,
+  );
+  console.log("(Compare to Automations above: each firing got its OWN brand-new session, never shared context.)");
+
+  const tasksAfter = (await listTasks({ agentId: AGENT_ID })).length;
+  console.log(`\nTask ledger count before heartbeat ticks: ${tasksBefore}, after: ${tasksAfter} (expected equal — no Task created).`);
 }
 
 async function demoEventLogIsTruth(): Promise<void> {
@@ -329,9 +376,10 @@ async function demoPermissions(): Promise<void> {
 async function demoAgentFilesystem(sessionId: string): Promise<void> {
   section("7. Agent filesystem — the same primitives, addressed as paths");
   console.log(
-    "Read-only projection over everything above, per docs/architecture.md §7 —\n" +
-      "not a new storage layer, just a filesystem-shaped VIEW of the same event\n" +
-      "streams and skill files.\n",
+    "Projection over everything above, per docs/architecture.md §7 — not a\n" +
+      "new storage layer, just a filesystem-shaped VIEW of the same event\n" +
+      "streams and skill files. Read-only for most paths; write support is\n" +
+      "limited to skills (see below).\n",
   );
 
   const root = await fsList("/agent");
@@ -377,6 +425,30 @@ async function demoAgentFilesystem(sessionId: string): Promise<void> {
   } catch (err) {
     console.log(`\nReading a nonexistent path correctly throws: ${(err as Error).message}`);
   }
+
+  console.log("\nWrite support: exactly one path kind — skills — since a skill is just a file.");
+  const demoSkillMd = serializeSkillFile({
+    name: "demo-fs-written-skill",
+    description: "Written live by demoAgentFilesystem() via fsWrite() — removed at the end of this demo.",
+    body: "# Demo FS-Written Skill\n\nThis skill was created through the /agent/skills/... namespace, not by hand.",
+  });
+  await fsWrite("/agent/skills/demo-fs-written-skill/SKILL.md", demoSkillMd);
+  console.log("fsWrite(\"/agent/skills/demo-fs-written-skill/SKILL.md\", ...) succeeded.");
+  const writtenBody = await fsRead("/agent/skills/demo-fs-written-skill/SKILL.md");
+  console.log(`Read it back via fsRead() -> starts with: "${writtenBody.slice(0, 55)}..."`);
+
+  try {
+    await fsWrite(`/agent/memory/${AGENT_ID}/curated/MEMORY.md`, "malicious override attempt");
+  } catch (err) {
+    console.log(`\nWriting to /agent/memory/... correctly throws: ${(err as Error).message}`);
+  }
+
+  // Clean up the demo-written skill so repeated `npm run demo` runs stay
+  // idempotent and this never pollutes the real ./skills/ catalog that
+  // `npm run chat` loads.
+  const { rm } = await import("node:fs/promises");
+  await rm("skills/demo-fs-written-skill", { recursive: true, force: true });
+  console.log("\n(Cleaned up the demo-written skill so it doesn't pollute the real skill catalog.)");
 }
 
 async function main(): Promise<void> {
@@ -388,6 +460,7 @@ async function main(): Promise<void> {
     await demoMemory(sessionId);
     await demoTasksAndFlows();
     await demoScheduler();
+    await demoHeartbeat();
     await demoPermissions();
     await demoAgentFilesystem(sessionId);
     await demoEventLogIsTruth();

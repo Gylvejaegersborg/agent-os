@@ -9,6 +9,7 @@ export * from "./permissions.js";
 export * from "./identity.js";
 export * from "./agentfs.js";
 export * from "./scheduler.js";
+export * from "./heartbeat.js";
 export * from "./worker.js";
 export * from "./model.js";
 export * from "./models/real.js";

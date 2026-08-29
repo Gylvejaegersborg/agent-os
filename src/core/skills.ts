@@ -14,7 +14,7 @@
 // convention is already respected by discoverSkills(), just not yet
 // exposed as its own loader.
 
-import { readdir, readFile, stat } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { appendEvent } from "./eventlog.js";
 
@@ -81,6 +81,83 @@ function stripQuotes(v: string): string {
     return trimmed.slice(1, -1);
   }
   return trimmed;
+}
+
+/** Quotes a scalar value for YAML frontmatter output only when needed
+ *  (contains a colon, starts with a quote/special char, or is empty) —
+ *  mirrors what parseSimpleYaml/stripQuotes can round-trip. Deliberately
+ *  does NOT escape embedded quote characters: stripQuotes only strips the
+ *  outermost quote pair by slicing the first/last character, so embedded
+ *  quotes pass through untouched on both write and re-parse. Escaping
+ *  them here would break the round-trip instead of fixing it, since
+ *  stripQuotes has no matching unescape step. */
+function quoteIfNeeded(v: string): string {
+  if (v === "") return '""';
+  if (/[:#]|^[\s'"[\]{}]/.test(v) || /^\s|\s$/.test(v)) {
+    return `"${v}"`;
+  }
+  return v;
+}
+
+/** Serializes a SkillFull's frontmatter + body back into SKILL.md text —
+ *  the exact inverse of parseSkillFile. Round-trip tested (see
+ *  test-skills-write.ts): parse(serialize(parse(x))) === parse(x). */
+export function serializeSkillFile(skill: Omit<SkillFull, "dirPath">): string {
+  const lines: string[] = ["---"];
+  lines.push(`name: ${skill.name}`);
+  lines.push(`description: ${quoteIfNeeded(skill.description)}`);
+  if (skill.license) lines.push(`license: ${quoteIfNeeded(skill.license)}`);
+  if (skill.compatibility) lines.push(`compatibility: ${quoteIfNeeded(skill.compatibility)}`);
+  if (skill.metadata && Object.keys(skill.metadata).length > 0) {
+    lines.push("metadata:");
+    for (const [k, v] of Object.entries(skill.metadata)) {
+      lines.push(`  ${k}: ${quoteIfNeeded(v)}`);
+    }
+  }
+  if (skill.allowedTools && skill.allowedTools.length > 0) {
+    lines.push(`allowed-tools: ${skill.allowedTools.join(" ")}`);
+  }
+  lines.push("---");
+  lines.push("");
+  lines.push(skill.body.trim());
+  lines.push("");
+  return lines.join("\n");
+}
+
+/** Writes (creates or overwrites) a skill's SKILL.md to
+ *  <rootDir>/<name>/SKILL.md. Validates via parseSkillFile before writing
+ *  anything to disk — an invalid skill never gets written, so
+ *  discoverSkills() can never encounter a skill this function put there
+ *  that it would then have to skip with a warning. Unlike memory/tasks/
+ *  flows (see docs/architecture.md §7 discussion), skills are genuinely
+ *  just files — no event-log invariant is being bypassed by writing one
+ *  directly — but the write is still recorded as an event for audit
+ *  purposes (skill.written), consistent with everything else in this
+ *  codebase being observable through the same event trail. */
+export async function writeSkill(
+  rootDir: string,
+  skill: { name: string; description: string; body: string; license?: string; compatibility?: string; metadata?: Record<string, string>; allowedTools?: string[] },
+  ctx?: { agentId?: string },
+): Promise<SkillFull> {
+  const dirPath = path.join(rootDir, skill.name);
+  const raw = serializeSkillFile(skill);
+
+  // Validate before touching disk — parseSkillFile throws with the exact
+  // same messages discoverSkills() would surface, so a caller gets the
+  // same validation guarantees whether writing programmatically or
+  // hand-editing a SKILL.md file.
+  const parsed = parseSkillFile(raw, dirPath);
+
+  await mkdir(dirPath, { recursive: true });
+  await writeFile(path.join(dirPath, "SKILL.md"), raw, "utf-8");
+
+  await appendEvent("skills", "skill.written", {
+    skillName: skill.name,
+    agentId: ctx?.agentId,
+    dirPath,
+  });
+
+  return parsed;
 }
 
 export function parseSkillFile(raw: string, dirPath: string): SkillFull {

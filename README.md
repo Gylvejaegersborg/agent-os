@@ -36,13 +36,14 @@ independently — see `docs/architecture.md §0`.
 | Model abstraction (swappable adapter interface) | ✅ working — stub + real Anthropic/OpenAI/Ollama adapters | `src/core/model.ts`, `src/core/models/real.ts` |
 | Worker abstraction (execution environment, separate from Agent identity) | ✅ working (local-shell + stub) | `src/core/worker.ts` |
 | Task / Flow (OpenClaw's ledger + orchestration split, with optimistic-concurrency revisioning) | ✅ working | `src/core/tasks.ts` |
-| Automation registry + scheduler (cron tick loop + manual event dispatch) | ✅ working — Heartbeat mode NOT implemented (see below) | `src/core/scheduler.ts` |
+| Automation registry + scheduler (cron tick loop + manual event dispatch) | ✅ working | `src/core/scheduler.ts` |
+| Heartbeat (imprecise timing, full main-session context, no Task created) | ✅ working | `src/core/heartbeat.ts` |
 | **Memory: fast-path episodic + gated "dreaming" promotion** | ✅ working | `src/core/memory.ts` |
 | Hooks (deterministic, harness-run, decision vs. observe-only) | ✅ working | `src/core/hooks.ts` |
 | Standing Order (deliberately NOT a data object) | 📝 documented only | `docs/architecture.md §2` |
-| Skills (agentskills.io-compatible format) | ✅ working — parser, discovery, progressive disclosure | `src/core/skills.ts`, `skills/*/SKILL.md` |
+| Skills (agentskills.io-compatible format) | ✅ working — parser, discovery, progressive disclosure, write support | `src/core/skills.ts`, `skills/*/SKILL.md` |
 | Sandboxing / permission policy (two-layer) | ✅ working — Layer A (policy hook) + Layer B (sandboxed worker) | `src/core/permissions.ts` |
-| Agent filesystem namespace | ✅ working — read-only projection over paths (skills/memory/sessions/tasks/flows/automations) | `src/core/agentfs.ts` |
+| Agent filesystem namespace | ✅ working — read/write over paths (write supported for skills only; see below) | `src/core/agentfs.ts` |
 
 The memory design directly answers "I want the agent to keep getting
 better with me, safely": episodic writes are immediate and ungated (same
@@ -185,26 +186,35 @@ needs on top of this.
 
 ## Scheduler — Automations that actually fire
 
-Per `docs/architecture.md §2`'s "two scheduling modes" note. This
-scaffold implements ONE of the two explicitly:
+Per `docs/architecture.md §2`'s "two scheduling modes" note. Both modes
+are now implemented, each as its own module, matching the doc's explicit
+warning not to collapse them into one scheduler abstraction:
 
-- **Automations** (implemented, `src/core/scheduler.ts`) — precise
-  timing, isolated context. A zero-dependency 5-field cron parser
-  (`parseCron`/`cronMatches`) plus a real tick loop (`startScheduler`,
-  default 30s interval) that checks every enabled cron-triggered
-  Automation and fires the ones that are due. Firing spawns a real Task
-  (`type: "cron"`) and runs a full agent-loop turn in a brand-new,
-  isolated session — never the automation's own history, matching
-  "isolated context" from the architecture doc. Every firing is itself
+- **Automations** (`src/core/scheduler.ts`) — precise timing, isolated
+  context. A zero-dependency 5-field cron parser (`parseCron`/
+  `cronMatches`) plus a real tick loop (`startScheduler`, default 30s
+  interval) that checks every enabled cron-triggered Automation and
+  fires the ones that are due. Firing spawns a real Task (`type:
+  "cron"`) and runs a full agent-loop turn in a brand-new, isolated
+  session — never the automation's own history, matching "isolated
+  context" from the architecture doc. Every firing is itself
   event-sourced (`automation.fired` events in the same `automations`
   stream `tasks.ts` already writes to), which is also how dedup works:
   an automation can fire at most once per matching minute, so a
   scheduler restart never double-fires or loses its place.
-- **Heartbeat** (imprecise timing, full main-session context, for "check
-  the inbox"-style work) is a genuinely different mechanism — a
-  recurring turn in an existing long-lived session, not a spawned
-  isolated Task — and is **NOT implemented** here. Stated explicitly
-  rather than half-built alongside Automations.
+- **Heartbeat** (`src/core/heartbeat.ts`) — imprecise timing (an
+  interval plus symmetric random jitter, default ±20%, so "roughly every
+  30 minutes" is genuinely approximate, not a disguised cron), full
+  main-session context (every tick is a turn appended to ONE long-lived
+  session via `runTurn`, so it sees everything that happened before —
+  the defining difference from Automations, where every firing gets a
+  brand-new isolated session), and — critically — **no Task is ever
+  created**, mirroring `types.ts`'s own comment that plain chat turns do
+  not create a Task. This is why `runHeartbeatTick`/`startHeartbeat` are
+  thin wrappers around `runTurn()` targeting an *existing* `sessionId`,
+  not task-spawning functions like `fireAutomation`. Ticks are still
+  independently auditable via `heartbeat.ticked` events in their own
+  stream, separate from session content.
 
 `event`-triggered automations are implemented as a manual dispatch
 function (`fireEventAutomations`) rather than a tick, since this
@@ -212,18 +222,21 @@ scaffold has no event bus yet — call it from wherever the real event
 happens. `webhook`-triggered automations are not implemented (would need
 an actual HTTP listener).
 
-Verified with `npm run test-cron` (9 assertions covering step values,
-ranges, weekday matching, and malformed-input error handling) plus
-`npm run demo`'s "5. Scheduler" section, which registers a cron
-automation matching the current minute, runs a real tick, and proves:
-the automation fires and creates a real Task; a second tick in the same
-minute does NOT re-fire (dedup); and a tick one minute later does not
-fire either (the cron expression no longer matches).
+Verified with `npm run test-cron` (9 assertions: step values, ranges,
+weekday matching, malformed-input error handling), `npm run
+test-heartbeat` (5 assertions: no Task created, context accumulates
+across ticks in the same session, and consecutive tick gaps under a real
+`startHeartbeat` loop are NOT identical — jitter genuinely present, not
+just claimed), plus `npm run demo`'s "5. Scheduler" and "5b. Heartbeat"
+sections, which exercise both against real data side by side so the
+contrast is visible in one run: Automations create a Task and use a
+fresh session per firing; Heartbeat creates zero Tasks and reuses one
+session across ticks.
 
 ## Agent filesystem namespace — the same primitives, addressed as paths
 
-Per `docs/architecture.md §7`: a read-only projection that exposes
-everything above as a virtual `/agent/...` filesystem, e.g.
+Per `docs/architecture.md §7`: a projection that exposes everything
+above as a virtual `/agent/...` filesystem, e.g.
 `/agent/identity/<agentId>.json`, `/agent/skills/<name>/SKILL.md`,
 `/agent/memory/<agentId>/curated/MEMORY.md`,
 `/agent/sessions/<sessionId>.jsonl`, `/agent/tasks/<taskId>/state.json`.
@@ -231,19 +244,33 @@ This is deliberately **not a new storage layer** — every path is a VIEW
 over the exact same event-log streams and skill files the rest of this
 scaffold already writes, using the same "everything is a projection"
 principle from the top of this README, just applied to a filesystem-
-shaped API (`fsList`/`fsRead` in `agentfs.ts`) instead of an event-log-
-shaped one.
+shaped API (`fsList`/`fsRead`/`fsWrite` in `agentfs.ts`) instead of an
+event-log-shaped one.
 
-Write operations through this namespace are intentionally NOT
-implemented — mapping a raw file write back onto event-log semantics
-(an appended event? a new event type?) is a real design question, not
-something to paper over with a fake write that doesn't actually persist
-correctly.
+**Write support is implemented for exactly one path kind: skills.**
+`/agent/skills/<name>/SKILL.md` can be written because a skill is
+genuinely just a file — no event-log invariant is bypassed by writing
+one directly (`fsWrite` validates via `parseSkillFile` before anything
+touches disk, and rejects a frontmatter `name` that doesn't match the
+path segment). Every other path kind (`identity`, `memory`, `sessions`,
+`tasks`, `flows`, `automations`) still throws
+`FsWriteNotSupportedError` rather than silently no-op'ing: writing e.g.
+`/agent/memory/.../MEMORY.md` would mean deciding how a raw file write
+maps back onto event-log semantics, and for memory specifically it
+would bypass the dreaming-gate invariant §3 exists to enforce — a real
+open design question, not a missing feature to paper over.
 
 `npm run demo`'s "6. Agent filesystem" section walks every path kind
 (skills, curated + episodic memory, sessions, tasks) against the exact
-data the earlier demo sections just wrote, and confirms a nonexistent
-path throws rather than returning something misleading.
+data the earlier demo sections just wrote, confirms a nonexistent path
+throws, and confirms `fsWrite` writes and reads back a real skill
+end-to-end. `npm run test-skills-write` covers the write path in
+isolation: frontmatter round-tripping (parse -> serialize -> parse),
+`writeSkill()` validating before touching disk, `fsWrite()`/`fsRead()`
+round-tripping through the real `skills/` directory (cleaned up
+immediately so it never pollutes the actual catalog), the
+path/frontmatter name-mismatch rejection, and the
+`FsWriteNotSupportedError` thrown for unsupported path kinds.
 
 ## Repo layout
 

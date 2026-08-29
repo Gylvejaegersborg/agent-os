@@ -11,6 +11,8 @@
     "cli": "tsc -b && node dist/cli.js",
     "test-live-model": "tsc -b && node dist/test-live-model.js",
     "test-cron": "tsc -b && node dist/test-cron.js",
+    "test-skills-write": "tsc -b && node dist/test-skills-write.js",
+    "test-heartbeat": "tsc -b && node dist/test-heartbeat.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {

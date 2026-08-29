@@ -15,13 +15,19 @@
 //   /agent/flows/<flowId>/state.json
 //   /agent/automations/<automationId>.json
 //
-// Write operations are deliberately NOT implemented yet — this is a
-// read-only projection for now. Writing through this namespace would
-// mean deciding how a raw file write maps back onto event-log semantics
-// (an appended event? a whole new event type?), which is a real design
-// question left for the next pass rather than papered over here.
+// Write operations are IMPLEMENTED for exactly one path kind: skills.
+// /agent/skills/<name>/SKILL.md can be written because a skill is
+// genuinely just a file — no event-log invariant is bypassed by writing
+// one directly, unlike memory/tasks/flows. Everything else in this
+// namespace remains read-only: writing e.g. /agent/memory/.../MEMORY.md
+// would mean deciding how a raw file write maps back onto event-log
+// semantics (an appended event? a whole new event type? does it bypass
+// the dreaming-gate invariant §3 exists specifically to enforce?), which
+// is a real open design question — fsWrite() throws a clear
+// FsWriteNotSupportedError for those paths rather than silently
+// no-op'ing or pretending to support something it doesn't.
 
-import { discoverSkills } from "./skills.js";
+import { discoverSkills, parseSkillFile, writeSkill } from "./skills.js";
 import { getCuratedMemory, listEpisodic } from "./memory.js";
 import { readStream, listStreamIds } from "./eventlog.js";
 import { getTask, listTasks } from "./tasks.js";
@@ -37,6 +43,12 @@ export interface FsEntry {
 export class FsNotFoundError extends Error {
   constructor(path: string) {
     super(`no such agent-fs path: ${path}`);
+  }
+}
+
+export class FsWriteNotSupportedError extends Error {
+  constructor(path: string, reason: string) {
+    super(`cannot write to agent-fs path ${path}: ${reason}`);
   }
 }
 
@@ -198,6 +210,56 @@ export async function fsRead(virtualPath: string): Promise<string> {
     const automation = await getAutomation(automationId);
     if (!automation) throw new FsNotFoundError(virtualPath);
     return JSON.stringify(automation, null, 2);
+  }
+
+  throw new FsNotFoundError(virtualPath);
+}
+
+const SKILLS_ROOT = "skills"; // matches the hardcoded root fsList/fsRead already use
+
+/** Writes raw SKILL.md content to a virtual /agent/skills/<name>/SKILL.md
+ *  path — the ONE path kind this namespace supports writing to (see the
+ *  file-level comment for why). The content is the full SKILL.md text
+ *  (frontmatter + body), validated via parseSkillFile before anything
+ *  touches disk. The name embedded in the frontmatter must match the
+ *  name segment in the path — a write to
+ *  /agent/skills/foo/SKILL.md whose frontmatter says `name: bar` is
+ *  rejected rather than silently writing to a directory that doesn't
+ *  match what the caller asked for. */
+export async function fsWrite(virtualPath: string, content: string, ctx?: { agentId?: string }): Promise<void> {
+  const parts = segments(virtualPath);
+  const [top, ...rest] = parts;
+
+  if (top === "skills" && rest.length === 2 && rest[1] === "SKILL.md") {
+    const [pathName] = rest;
+    const parsed = parseSkillFile(content, `${SKILLS_ROOT}/${pathName}`);
+    if (parsed.name !== pathName) {
+      throw new FsWriteNotSupportedError(
+        virtualPath,
+        `frontmatter "name: ${parsed.name}" does not match the path segment "${pathName}"`,
+      );
+    }
+    await writeSkill(
+      SKILLS_ROOT,
+      {
+        name: parsed.name,
+        description: parsed.description,
+        body: parsed.body,
+        license: parsed.license,
+        compatibility: parsed.compatibility,
+        metadata: parsed.metadata,
+        allowedTools: parsed.allowedTools,
+      },
+      ctx,
+    );
+    return;
+  }
+
+  if (top === "identity" || top === "memory" || top === "sessions" || top === "tasks" || top === "flows" || top === "automations") {
+    throw new FsWriteNotSupportedError(
+      virtualPath,
+      `writes to /agent/${top}/... are not supported — see the file-level comment in agentfs.ts for why (event-log invariants, not a missing feature)`,
+    );
   }
 
   throw new FsNotFoundError(virtualPath);
