@@ -9,6 +9,7 @@ import type { ModelAdapter, ModelMessage } from "./model.js";
 import type { Worker } from "./worker.js";
 import { fireHook } from "./hooks.js";
 import { generateId } from "./id.js";
+import { SkillRegistry, renderSkillCatalog } from "./skills.js";
 
 export interface AgentTurnResult {
   sessionId: string;
@@ -23,6 +24,14 @@ export interface RunTurnOptions {
   model: ModelAdapter;
   worker: Worker;
   maxToolHops?: number;
+  /** Layer-1 progressive disclosure: when provided, every skill's
+   *  name+description is injected as a system message each turn (not
+   *  stored in the session log — the catalog is external state re-read
+   *  fresh each time, mirroring how Claude Code re-injects CLAUDE.md from
+   *  disk rather than trusting a stale in-history copy). The model can
+   *  then request the `skill` tool to load a specific skill's full body
+   *  (layer 2). */
+  skills?: SkillRegistry;
 }
 
 function sessionStream(sessionId: string): string {
@@ -38,8 +47,32 @@ export async function getSessionHistory(sessionId: string): Promise<ModelMessage
   });
 }
 
+interface ToolDispatchResult {
+  ok: boolean;
+  output: string;
+  error?: string;
+}
+
+async function dispatchTool(
+  toolCall: { name: string; args: Record<string, unknown> },
+  ctx: { worker: Worker; skills?: SkillRegistry; agentId: string; sessionId: string },
+): Promise<ToolDispatchResult> {
+  if (toolCall.name === "shell") {
+    return ctx.worker.run(String(toolCall.args.command));
+  }
+  if (toolCall.name === "skill") {
+    if (!ctx.skills) return { ok: false, output: "", error: "no skill registry configured for this session" };
+    const skillName = String(toolCall.args.name);
+    const body = await ctx.skills.loadBody(skillName, { agentId: ctx.agentId, sessionId: ctx.sessionId });
+    return body !== undefined
+      ? { ok: true, output: body }
+      : { ok: false, output: "", error: `no such skill: ${skillName}` };
+  }
+  return { ok: false, output: "", error: `unknown tool: ${toolCall.name}` };
+}
+
 export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
-  const { sessionId, agentId, userMessage, model, worker } = opts;
+  const { sessionId, agentId, userMessage, model, worker, skills } = opts;
   const maxHops = opts.maxToolHops ?? 3;
 
   await appendEvent(sessionStream(sessionId), "agent.turn.start", { agentId, userMessage });
@@ -53,7 +86,11 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
 
   while (hops < maxHops) {
     const history = await getSessionHistory(sessionId);
-    const response = await model.complete(history);
+    const catalogText = skills ? renderSkillCatalog(skills.listMetadata()) : "";
+    const messages: ModelMessage[] = catalogText
+      ? [{ role: "system", content: catalogText }, ...history]
+      : history;
+    const response = await model.complete(messages);
 
     if (response.toolCall) {
       toolCalled = response.toolCall.name;
@@ -72,10 +109,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       }
 
       await appendEvent(sessionStream(sessionId), "tool.call.start", response.toolCall);
-      const result =
-        response.toolCall.name === "shell"
-          ? await worker.run(String(response.toolCall.args.command))
-          : { ok: false, output: "", error: `unknown tool: ${response.toolCall.name}` };
+      const result = await dispatchTool(response.toolCall, { worker, skills, agentId, sessionId });
       await appendEvent(sessionStream(sessionId), "tool.call.end", { ...response.toolCall, result });
       await fireHook("tool.after", { agentId, sessionId, payload: { ...response.toolCall, result } });
 

@@ -25,6 +25,7 @@ import {
   registerHook,
   listStreamIds,
   readStream,
+  SkillRegistry,
 } from "./core/index.js";
 
 const AGENT_ID = "demo-agent";
@@ -33,11 +34,16 @@ function section(title: string): void {
   console.log(`\n${"=".repeat(60)}\n${title}\n${"=".repeat(60)}`);
 }
 
-async function demoAgentLoop(): Promise<string> {
+async function demoAgentLoop(): Promise<{ sessionId: string; skills: SkillRegistry }> {
   section("1. Agent Loop — a session is just an event stream");
   const sessionId = newSessionId();
   const model = createStubModel();
   const worker = createLocalShellWorker();
+  const skills = await SkillRegistry.fromDirectory("skills");
+  console.log(
+    `Loaded ${skills.listMetadata().length} skill(s) from ./skills/ — only name+description resident until loaded:`,
+  );
+  for (const s of skills.listMetadata()) console.log(`  - ${s.name}: ${s.description.slice(0, 70)}...`);
 
   registerHook("tool.before", async (ctx) => {
     console.log(`  [hook: tool.before] about to run tool`, ctx.payload);
@@ -50,6 +56,7 @@ async function demoAgentLoop(): Promise<string> {
     userMessage: "run shell: echo hello from a worker",
     model,
     worker,
+    skills,
   });
   console.log("Turn 1 result:", r1.finalContent);
 
@@ -59,12 +66,43 @@ async function demoAgentLoop(): Promise<string> {
     userMessage: "what is the meaning of this scaffold?",
     model,
     worker,
+    skills,
   });
   console.log("Turn 2 result:", r2.finalContent);
 
   console.log(`\nSession stream now has ${(await readStream(`session:${sessionId}`)).length} events on disk.`);
-  return sessionId;
+  return { sessionId, skills };
 }
+
+async function demoSkills(sessionId: string, skills: SkillRegistry): Promise<void> {
+  section("1b. Skills — progressive disclosure (agentskills.io format)");
+  const model = createStubModel();
+  const worker = createLocalShellWorker();
+
+  const r = await runTurn({
+    sessionId,
+    agentId: AGENT_ID,
+    userMessage: "load skill: commit-message-style",
+    model,
+    worker,
+    skills,
+  });
+  console.log("Skill-load turn result:", r.finalContent);
+
+  const history = await readStream(`session:${sessionId}`);
+  const loadEvent = history.find((e) => e.type === "skill.loaded");
+  console.log(
+    "\n'skill.loaded' event recorded:",
+    loadEvent ? JSON.stringify(loadEvent.payload) : "(none — check for a bug)",
+  );
+
+  const toolResult = [...history]
+    .reverse()
+    .find((e) => e.type === "session.message" && (e.payload as any).role === "tool");
+  const bodyPreview = String((toolResult?.payload as any)?.content ?? "").slice(0, 90);
+  console.log(`Full SKILL.md body was loaded on demand (layer 2), starts with:\n  "${bodyPreview}..."`);
+}
+
 
 async function demoMemory(sessionId: string): Promise<void> {
   section("2. Memory — fast-path episodic writes (Hermes-style immediacy)");
@@ -181,7 +219,8 @@ async function main(): Promise<void> {
   const cmd = process.argv[2] ?? "demo";
 
   if (cmd === "demo") {
-    const sessionId = await demoAgentLoop();
+    const { sessionId, skills } = await demoAgentLoop();
+    await demoSkills(sessionId, skills);
     await demoMemory(sessionId);
     await demoTasksAndFlows();
     await demoEventLogIsTruth();

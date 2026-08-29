@@ -40,7 +40,7 @@ independently — see `docs/architecture.md §0`.
 | **Memory: fast-path episodic + gated "dreaming" promotion** | ✅ working | `src/core/memory.ts` |
 | Hooks (deterministic, harness-run, decision vs. observe-only) | ✅ working | `src/core/hooks.ts` |
 | Standing Order (deliberately NOT a data object) | 📝 documented only | `docs/architecture.md §2` |
-| Skills (agentskills.io-compatible format) | ⬜ not started | — |
+| Skills (agentskills.io-compatible format) | ✅ working — parser, discovery, progressive disclosure | `src/core/skills.ts`, `skills/*/SKILL.md` |
 | Sandboxing / permission policy (two-layer) | ⬜ not started | — |
 | Agent filesystem namespace | ⬜ not started | — |
 
@@ -111,6 +111,31 @@ npm run test-live-model
 If none of the above are available, the command exits with a clear error
 instead of silently falling back to the stub.
 
+## Skills — the open agentskills.io format
+
+Skills live under `./skills/<skill-name>/SKILL.md`, following the open
+[agentskills.io](https://agentskills.io/specification) spec rather than a
+bespoke format — this is the one primitive that's most converged across
+every harness studied (Hermes, Claude Code, DeepSeek Harness, and Pi all
+implement near-identical progressive disclosure). Skills written for those
+harnesses should be directly usable here, and vice versa.
+
+Progressive disclosure, exactly as the spec describes it:
+
+1. **Metadata** (name + description) is loaded for every skill at agent
+   startup — always resident in context, ~100 tokens each.
+2. **Instructions** (the full `SKILL.md` body) load only when the agent
+   calls the `skill` tool with a name — see `demoSkills()` in `cli.ts` for
+   a worked example, including the `skill.loaded` event this records.
+3. **Resources** (`scripts/`, `references/`, `assets/`) load only as
+   needed — `event-log-debugging/references/scoring-fields.md` is an
+   example resource file, referenced from its skill's body.
+
+Two example skills ship in `./skills/` and are loaded automatically by
+`npm run demo`. Malformed skills (bad `name` format, missing
+`description`, etc.) are skipped with a warning rather than failing
+discovery for the whole catalog.
+
 ## Repo layout
 
 ```
@@ -122,12 +147,21 @@ src/
     tasks.ts         # Task/Flow/Automation projections over the event log
     memory.ts         # episodic fast-path + dreaming promotion pipeline
     hooks.ts          # deterministic lifecycle hooks, harness-run not model-run
-    worker.ts          # execution-environment interface (local-shell, stub)
-    model.ts           # swappable LLM adapter interface (stub adapter shipped)
-    agent-loop.ts       # the turn loop binding all of the above together
-  cli.ts               # runnable end-to-end demo of every primitive above
+    skills.ts          # agentskills.io SKILL.md parser + progressive-disclosure registry
+    worker.ts           # execution-environment interface (local-shell, stub)
+    model.ts             # swappable LLM adapter interface (stub adapter shipped)
+    models/real.ts        # real Anthropic / OpenAI / Ollama adapters
+    agent-loop.ts          # the turn loop binding all of the above together
+  cli.ts                    # runnable end-to-end demo of every primitive above
+  test-live-model.ts         # calls a real model adapter (not the stub) — see below
+skills/
+  commit-message-style/       # example skill: house style for git commits
+    SKILL.md
+  event-log-debugging/          # example skill with a references/ subfile
+    SKILL.md
+    references/scoring-fields.md
 docs/
-  architecture.md      # the full design sketch this scaffold implements
+  architecture.md                # the full design sketch this scaffold implements
 ```
 
 ## Status

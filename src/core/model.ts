@@ -39,9 +39,14 @@ export function createStubModel(id = "stub-model"): ModelAdapter {
 
       const lastUser = [...messages].reverse().find((m) => m.role === "user");
       const text = lastUser?.content ?? "";
+
       if (/run\s+shell:/i.test(text)) {
         const command = text.replace(/.*run\s+shell:/i, "").trim();
         return { content: `Running: ${command}`, toolCall: { name: "shell", args: { command } } };
+      }
+      if (/load\s+skill:/i.test(text)) {
+        const name = text.replace(/.*load\s+skill:/i, "").trim();
+        return { content: `Loading skill: ${name}`, toolCall: { name: "skill", args: { name } } };
       }
       return { content: `[stub-model] acknowledged: ${text.slice(0, 120)}` };
     },
