@@ -279,12 +279,78 @@ Worker at all), and a dangerous command rejected at the Worker layer even
 when called directly with no permission policy in the way — while a
 harmless command through that same sandboxed Worker still succeeds.
 
-**Known scaffold limitation** (documented, not hidden): the current
-`checkSandbox` filesystem-scope check is a simple pattern match (`../`
-detection), not an OS-level enforcement boundary (Landlock, Seatbelt, a
-real container). That's an intentional "prove the layer separation first"
-choice — see `docs/architecture.md §6` for what a production sandbox
-needs on top of this.
+### The filesystem-scope check: what it does now
+
+`checkSandbox`'s filesystem-scope check (`workspace-only` /
+`workspace-and-temp`) used to be a bare `../` substring match — it caught
+`cat ../../../etc/passwd` but completely missed an absolute-path escape
+with no `..` in it at all (`type C:\Windows\System32\config\SAM`, `cat
+/etc/passwd`), which sailed straight through unblocked. That was a real
+gap, not a theoretical one.
+
+It's now a real path-containment check built on Node's `path` module
+only (zero new dependencies):
+
+1. Tokenize the command (whitespace/quote-aware, not a full shell parser)
+   and pull out path-looking tokens.
+2. Resolve each one to an absolute path with `path.resolve()` — relative
+   tokens resolve against `workspaceRoot`, absolute tokens (Windows drive
+   paths, UNC paths, POSIX-rooted paths, and MSYS/git-bash-style
+   `/c/Windows/...` paths, normalized since this scaffold runs on Windows
+   via git-bash) resolve to themselves regardless of `workspaceRoot` —
+   this is exactly the case the old check missed.
+3. Resolve symlinks with `fs.realpathSync` (walking up to the nearest
+   existing ancestor for not-yet-created paths) so a symlink planted
+   *inside* the workspace that points *outside* it doesn't fool the
+   check.
+4. Test genuine containment with `path.relative()` plus a `..`/absolute
+   check — not a string-prefix test, which would wrongly treat a sibling
+   directory like `D:\workspace-evil` as "inside" `D:\workspace` just
+   because the string happens to start the same way. On Windows the
+   comparison case-folds (NTFS is case-insensitive/case-preserving).
+
+See `src/test-sandbox-hardening.ts` (`npm run test-sandbox-hardening`)
+for the test cases proving: traversal (`../`) is still blocked, an
+absolute-path escape with no `../` is now blocked (the actual bug fixed),
+a symlink pointing out of the workspace is caught, and paths genuinely
+inside `workspaceRoot` are still allowed — including on Windows-style
+paths.
+
+### What this still does NOT provide — read this before trusting it
+
+This is still, and will always be as implemented, an **in-process
+string/path check that runs in the same Node process as the command it's
+checking** — not OS-level enforcement. It is not Landlock, not Seatbelt,
+not a container/namespace boundary, not a chroot, not a restricted
+access token. Concretely:
+
+- Nothing stops code with a different execution path from touching the
+  filesystem directly without ever going through `checkSandbox()` —
+  a spawned child process reading its own argv, a script interpreter
+  invoked with `-c`, a compiled binary, or raw syscalls all bypass this
+  entirely. **A determined attacker with arbitrary code execution inside
+  the sandboxed Worker can very plausibly find a gap this does not
+  cover.**
+- The tokenizer is not a real shell parser: it does not resolve `$VAR` /
+  `%VAR%` expansion, `~` expansion, command substitution (`$(...)`,
+  `` `...` ``), or paths reassembled from concatenated fragments. Any of
+  those can smuggle a path past this check's static view of the command
+  string.
+- `realpathSync`-based symlink resolution only covers what exists on
+  disk at check time — there is no atomicity between "we checked" and
+  "the command ran" (a TOCTOU symlink swap is not defended against).
+- It has no visibility into what an *allowed* command does once it
+  runs — e.g. an allowed `node script.js` invocation can itself open
+  arbitrary paths at runtime that were never mentioned in the original
+  command string.
+
+That's an intentional "prove the layer separation first, then make the
+in-process check meaningfully more correct" scope — real OS-level
+enforcement (Landlock on Linux, Seatbelt on macOS, a container/namespace
+boundary, or a restricted-token/AppContainer approach on Windows)
+belongs *underneath* this check, not instead of it. See
+`docs/architecture.md §6` for what a production sandbox needs on top of
+this.
 
 ## Subagent — delegating within the same harness
 
