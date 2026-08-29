@@ -6,6 +6,7 @@
 //   3. Timing has jitter — consecutive intervals are not identical.
 // Run with: node dist/test-heartbeat.js
 
+import "./test-helpers/isolate.js";
 import {
   runHeartbeatTick,
   startHeartbeat,

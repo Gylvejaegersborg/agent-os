@@ -1,5 +1,6 @@
 // Standalone smoke test for the cron parser/matcher — no event log, no
 // disk I/O, just arithmetic. Run with: node dist/test-cron.js
+import "./test-helpers/isolate.js";
 import { cronMatches, parseCron } from "./core/scheduler.js";
 
 function assert(cond: boolean, msg: string): void {

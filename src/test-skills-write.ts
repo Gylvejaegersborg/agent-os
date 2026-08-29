@@ -1,6 +1,7 @@
 // Standalone tests for skills write support (skills.ts writeSkill/
 // serializeSkillFile, agentfs.ts fsWrite) — no disk fixtures needed
 // beyond a throwaway temp directory. Run with: node dist/test-skills-write.js
+import "./test-helpers/isolate.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";

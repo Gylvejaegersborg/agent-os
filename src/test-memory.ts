@@ -4,6 +4,7 @@
 // turn's system message, not just computed and left unread.
 // Run with: node dist/test-memory.js
 
+import "./test-helpers/isolate.js";
 import {
   writeEpisodic,
   runDreamingPass,

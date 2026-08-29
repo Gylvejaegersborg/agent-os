@@ -12,6 +12,7 @@
 //      by calling spawnSubagentTask() directly.
 // Run with: node dist/test-subagent.js
 
+import "./test-helpers/isolate.js";
 import {
   spawnSubagentTask,
   runTurn,
