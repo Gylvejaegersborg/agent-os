@@ -18,6 +18,10 @@ import {
   getCuratedMemory,
   listEpisodic,
   listDreamingPasses,
+  nominateAgentMemory,
+  listAgentMemoryNominations,
+  approveAgentMemory,
+  rejectAgentMemory,
   createTask,
   transitionTask,
   listTasks,
@@ -247,6 +251,79 @@ async function demoMemory(sessionId: string): Promise<void> {
 
   const passes = await listDreamingPasses(AGENT_ID);
   console.log(`\n${passes.length} dreaming pass(es) recorded in the audit trail (memory:${AGENT_ID}:dreaming).`);
+}
+
+async function demoAgentMemoryVoice(sessionId: string): Promise<void> {
+  section("3b. Agent-nominated memory — a bounded voice, not a bypass");
+  console.log(
+    "The agent can PROPOSE something worth remembering via the `nominate-memory`\n" +
+      "tool, but proposing has ZERO effect on curated memory until a human\n" +
+      "explicitly approves it. This is deliberately ASYNC (not a blocking prompt) —\n" +
+      "see docs discussion: this scaffold has no live UI to synchronously ask a\n" +
+      "human mid-dreaming-pass, so nominations sit in 'pending' state until\n" +
+      "reviewed via approveAgentMemory()/rejectAgentMemory().\n",
+  );
+
+  const model = createStubModel();
+  const worker = createStubWorker();
+  const nominateResult = await runTurn({
+    sessionId,
+    agentId: AGENT_ID,
+    userMessage: "nominate memory: The user's preferred timezone is UTC+2.",
+    model,
+    worker,
+    enableMemoryNominations: true,
+  });
+  console.log(`Agent turn result: "${nominateResult.finalContent}"`);
+
+  const pending = await listAgentMemoryNominations(AGENT_ID, { status: "pending" });
+  console.log(`\n${pending.length} nomination(s) pending human review:`);
+  for (const n of pending) console.log(`  [${n.id}] "${n.content}"`);
+
+  console.log("\nRunning a dreaming pass WHILE the nomination is still pending — proves it has NO effect yet:");
+  const curatedBefore = await getCuratedMemory(AGENT_ID);
+  await runDreamingPass(AGENT_ID);
+  const curatedStillPending = await getCuratedMemory(AGENT_ID);
+  console.log(`MEMORY.md unchanged while pending: ${curatedStillPending.content === curatedBefore.content}`);
+
+  const toApprove = pending[pending.length - 1];
+  if (toApprove) {
+    console.log(`\nApproving nomination [${toApprove.id}] — THIS is what actually adds the weight:`);
+    const approvedEntry = await approveAgentMemory(AGENT_ID, toApprove.id, "Confirmed correct.");
+    console.log(
+      `  -> created episodic entry ${approvedEntry.id}, wasExplicitCorrection=${approvedEntry.wasExplicitCorrection}, ` +
+        `agentFlaggedImportant=${approvedEntry.agentFlaggedImportant}`,
+    );
+
+    console.log("\nRunning dreaming again now that it's approved:");
+    const passAfterApproval = await runDreamingPass(AGENT_ID);
+    const curatedAfterApproval = await getCuratedMemory(AGENT_ID);
+    const approvalPromotion = passAfterApproval.promotions.find((p) => p.episodicEntryId === approvedEntry.id);
+    console.log(`  score=${approvalPromotion?.eligibilityScore.toFixed(1)}  decision=${approvalPromotion?.decision}`);
+    console.log(`  MEMORY.md now includes it: ${curatedAfterApproval.content.includes("timezone")}`);
+  }
+
+  console.log("\nWithout enableMemoryNominations, the tool call is rejected rather than silently working:");
+  const gatedResult = await runTurn({
+    sessionId: newSessionId(),
+    agentId: AGENT_ID,
+    userMessage: "nominate memory: this should be rejected",
+    model,
+    worker,
+    // enableMemoryNominations intentionally omitted
+  });
+  console.log(`Result: "${gatedResult.finalContent}"`);
+
+  console.log("\nA human can also REJECT a nomination — it then never becomes an episodic entry at all:");
+  const toReject = await nominateAgentMemory({
+    agentId: AGENT_ID,
+    content: "The agent misheard something as important — this should be rejected.",
+    kind: "fact",
+    sourceSessionId: sessionId,
+  });
+  await rejectAgentMemory(AGENT_ID, toReject.id, "Not actually relevant.");
+  const rejected = await listAgentMemoryNominations(AGENT_ID, { status: "rejected" });
+  console.log(`Nomination [${toReject.id}] now has status "${rejected.find((n) => n.id === toReject.id)?.status}" — no episodic entry, ever.`);
 }
 
 async function demoTasksAndFlows(): Promise<void> {
@@ -609,6 +686,7 @@ async function main(): Promise<void> {
     await demoSkills(sessionId, skills);
     await demoSubagent();
     await demoMemory(sessionId);
+    await demoAgentMemoryVoice(sessionId);
     await demoTasksAndFlows();
     await demoScheduler();
     await demoHeartbeat();

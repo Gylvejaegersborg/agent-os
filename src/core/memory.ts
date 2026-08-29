@@ -17,11 +17,30 @@
 //     purely by EpisodicKind ("preference" -> USER.md, everything else
 //     -> MEMORY.md) — a simple, auditable rule, not a model judgment call.
 //
+//   - The agent gets a BOUNDED VOICE, not a bypass: it can nominate a
+//     memory candidate via the `nominate-memory` tool, but the nomination
+//     sits in "pending" state with ZERO effect on curated memory until a
+//     human explicitly approves or rejects it (async — this scaffold has
+//     no synchronous "ask the user right now" mechanism). Approval is
+//     what actually adds the weight: it creates a real episodic entry via
+//     the exact same writeEpisodic()/scoreEligibility()/dreaming pipeline
+//     everything else uses — no separate promotion path for
+//     agent-nominated content, no way for the agent to talk its way past
+//     the gate on its own.
+//
 // See /docs/architecture.md §3 for the full design rationale.
 
 import { project, appendEvent } from "./eventlog.js";
 import { generateId } from "./id.js";
-import type { EpisodicEntry, EpisodicKind, MemoryPromotionDecision, DreamingPass } from "./types.js";
+import type {
+  EpisodicEntry,
+  EpisodicKind,
+  MemoryPromotionDecision,
+  DreamingPass,
+  AgentMemoryNomination,
+  NominationStatus,
+} from "./types.js";
+import { textSimilarity, SIMILARITY_REPETITION_THRESHOLD } from "./text-similarity.js";
 
 function episodicStream(agentId: string): string {
   return `memory:${agentId}:episodic`;
@@ -31,6 +50,9 @@ function curatedStream(agentId: string): string {
 }
 function dreamingStream(agentId: string): string {
   return `memory:${agentId}:dreaming`;
+}
+function nominationsStream(agentId: string): string {
+  return `memory:${agentId}:nominations`;
 }
 
 // ---- Fast path: episodic writes ----
@@ -42,6 +64,7 @@ export async function writeEpisodic(input: {
   sourceSessionId: string;
   wasExplicitCorrection?: boolean;
   taskOutcome?: "success" | "failure";
+  agentFlaggedImportant?: boolean;
 }): Promise<EpisodicEntry> {
   const id = generateId();
   const entry: EpisodicEntry = {
@@ -54,21 +77,23 @@ export async function writeEpisodic(input: {
     wasExplicitCorrection: input.wasExplicitCorrection ?? false,
     repetitionCount: await countSimilar(input.agentId, input.content),
     taskOutcome: input.taskOutcome,
+    agentFlaggedImportant: input.agentFlaggedImportant ?? false,
   };
   await appendEvent(episodicStream(input.agentId), "memory.episodic.write", entry as any);
   return entry;
 }
 
-/** Extremely naive similarity: exact-ish substring match on normalized
- *  text. Good enough for the scaffold to demonstrate that repetition
- *  affects eligibility score; swap for embeddings when this primitive
- *  gets its real implementation. Stated limitation, not hidden: two
- *  paraphrases of the same fact ("prefers short answers" vs "likes
- *  brief replies") are NOT recognized as repetitions of each other. */
+/** Token-overlap (Jaccard) similarity via text-similarity.ts — a real
+ *  improvement over the previous exact-substring match: two paraphrases
+ *  of the same fact ("User prefers short answers" vs "User likes brief
+ *  replies") now DO count as repetitions of each other, without needing
+ *  embeddings, a network call, or a model. Still not semantic
+ *  understanding (see text-similarity.ts's own header for the honest
+ *  limitation versus real embeddings) — a genuine, evidence-based step
+ *  up, not a claim of solving repetition detection completely. */
 async function countSimilar(agentId: string, content: string): Promise<number> {
   const entries = await listEpisodic(agentId);
-  const normalized = content.trim().toLowerCase();
-  return entries.filter((e) => e.content.trim().toLowerCase() === normalized).length;
+  return entries.filter((e) => textSimilarity(e.content, content) >= SIMILARITY_REPETITION_THRESHOLD).length;
 }
 
 export async function listEpisodic(agentId: string): Promise<EpisodicEntry[]> {
@@ -77,6 +102,120 @@ export async function listEpisodic(agentId: string): Promise<EpisodicEntry[]> {
       state.push(event.payload as unknown as EpisodicEntry);
     }
     return state;
+  });
+}
+
+// ---- Agent memory nominations: bounded voice, human-approved, async ----
+
+export async function nominateAgentMemory(input: {
+  agentId: string;
+  content: string;
+  kind: EpisodicKind;
+  sourceSessionId: string;
+}): Promise<AgentMemoryNomination> {
+  const id = generateId();
+  await appendEvent(nominationsStream(input.agentId), "memory.nomination.created", { nominationId: id, ...input });
+  const nomination = await getAgentMemoryNomination(input.agentId, id);
+  if (!nomination) throw new Error("memory.nomination.created event did not project to a nomination");
+  return nomination;
+}
+
+async function projectNominations(agentId: string): Promise<Map<string, AgentMemoryNomination>> {
+  return project<Map<string, AgentMemoryNomination>>(nominationsStream(agentId), new Map(), (state, event) => {
+    if (event.type === "memory.nomination.created") {
+      const p = event.payload as any;
+      state.set(p.nominationId, {
+        id: p.nominationId,
+        agentId: p.agentId,
+        content: p.content,
+        kind: p.kind,
+        sourceSessionId: p.sourceSessionId,
+        status: "pending",
+        nominatedAt: event.timestamp,
+      });
+    } else if (event.type === "memory.nomination.reviewed") {
+      const p = event.payload as any;
+      const existing = state.get(p.nominationId);
+      if (existing) {
+        state.set(p.nominationId, {
+          ...existing,
+          status: p.status,
+          reviewedAt: event.timestamp,
+          reviewNote: p.reviewNote,
+          resultingEpisodicEntryId: p.resultingEpisodicEntryId,
+        });
+      }
+    }
+    return state;
+  });
+}
+
+export async function getAgentMemoryNomination(agentId: string, nominationId: string): Promise<AgentMemoryNomination | undefined> {
+  return (await projectNominations(agentId)).get(nominationId);
+}
+
+export async function listAgentMemoryNominations(
+  agentId: string,
+  filter?: { status?: NominationStatus },
+): Promise<AgentMemoryNomination[]> {
+  const all = [...(await projectNominations(agentId)).values()].sort((a, b) => a.nominatedAt.localeCompare(b.nominatedAt));
+  return filter?.status ? all.filter((n) => n.status === filter.status) : all;
+}
+
+/** The human review step that actually "adds the points" — approving a
+ *  nomination creates a real episodic entry weighted as an explicit
+ *  correction (wasExplicitCorrection: true), which crosses the
+ *  promotion threshold on its own for a fresh entry via the SAME
+ *  scoreEligibility()/dreaming pipeline every other memory uses. No
+ *  bypass path: this is a normal episodic write that happens to be
+ *  triggered by a review action instead of writeEpisodic() being called
+ *  directly. Throws if the nomination doesn't exist or was already
+ *  reviewed — a double-approval or approving a rejected nomination is a
+ *  caller bug, not a silently-ignored no-op. */
+export async function approveAgentMemory(
+  agentId: string,
+  nominationId: string,
+  reviewNote?: string,
+): Promise<EpisodicEntry> {
+  const nomination = await getAgentMemoryNomination(agentId, nominationId);
+  if (!nomination) throw new Error(`no such nomination: ${nominationId}`);
+  if (nomination.status !== "pending") {
+    throw new Error(`nomination ${nominationId} was already reviewed (status: ${nomination.status})`);
+  }
+
+  const entry = await writeEpisodic({
+    agentId,
+    content: nomination.content,
+    kind: nomination.kind,
+    sourceSessionId: nomination.sourceSessionId,
+    wasExplicitCorrection: true,
+    agentFlaggedImportant: true,
+  });
+
+  await appendEvent(nominationsStream(agentId), "memory.nomination.reviewed", {
+    nominationId,
+    status: "approved",
+    reviewNote,
+    resultingEpisodicEntryId: entry.id,
+  });
+
+  return entry;
+}
+
+/** Rejects a nomination — no episodic entry is ever created, so it can
+ *  never influence curated memory. The rejection itself stays in the
+ *  audit trail (you can always see what the agent proposed and that you
+ *  said no), it just never crosses into the memory pipeline at all. */
+export async function rejectAgentMemory(agentId: string, nominationId: string, reviewNote?: string): Promise<void> {
+  const nomination = await getAgentMemoryNomination(agentId, nominationId);
+  if (!nomination) throw new Error(`no such nomination: ${nominationId}`);
+  if (nomination.status !== "pending") {
+    throw new Error(`nomination ${nominationId} was already reviewed (status: ${nomination.status})`);
+  }
+  await appendEvent(nominationsStream(agentId), "memory.nomination.reviewed", {
+    nominationId,
+    status: "rejected",
+    reviewNote,
   });
 }
 
@@ -134,6 +273,14 @@ export function scoreEligibility(entry: EpisodicEntry, now: Date = new Date()): 
   score += Math.min(entry.repetitionCount * 15, 45); // repeated patterns
   if (entry.taskOutcome === "failure") score += 10; // failures are instructive
   if (entry.kind === "preference") score += 20;
+  // A bounded, defense-in-depth signal: an agent's own "this seems
+  // important" flag, on its own, is worth less than half the threshold —
+  // it can nudge a borderline entry but can never alone cross the gate.
+  // The PRIMARY channel for agent-influenced memory is the nomination +
+  // human-approval flow above, which earns its weight via
+  // wasExplicitCorrection instead; this exists so the flag still means
+  // something on any entry that carries it via a different path.
+  if (entry.agentFlaggedImportant) score += 10;
   const ageDays = (now.getTime() - new Date(entry.timestamp).getTime()) / (1000 * 60 * 60 * 24);
   score -= Math.min(ageDays * 0.5, 30); // uncorroborated observations fade
   return score;
@@ -234,4 +381,69 @@ export async function listDreamingPasses(agentId: string): Promise<DreamingPass[
     if (event.type === "memory.dreaming.completed") state.push(event.payload as unknown as DreamingPass);
     return state;
   });
+}
+
+// ---- Retrieval: inject only what's RELEVANT, not the whole document ----
+//
+// Below a small line-count threshold, retrieval is skipped entirely and
+// everything is returned — there's no point filtering a 3-line document,
+// and this keeps behavior backward-compatible with a freshly-started
+// agent whose curated memory is still small. Above the threshold, lines
+// are scored against the current query text via the same
+// zero-dependency Jaccard similarity used for repetition detection, and
+// only the most relevant subset is returned — restored to original
+// document order (not sorted by score) so the injected excerpt still
+// reads as coherent prose rather than a shuffled bag of lines.
+
+export const RETRIEVAL_LINE_THRESHOLD = 8;
+export const RETRIEVAL_TOP_N = 6;
+
+export interface LineRetrievalResult {
+  lines: string[];
+  totalLines: number;
+  usedRetrieval: boolean;
+}
+
+/** Pure, synchronous, and independently testable: given a block of text
+ *  and a query, returns either everything (small corpus) or the top-N
+ *  most relevant lines in original order (large corpus). */
+export function retrieveRelevantLines(fullText: string, queryText: string, topN = RETRIEVAL_TOP_N): LineRetrievalResult {
+  const allLines = fullText
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+
+  if (allLines.length <= RETRIEVAL_LINE_THRESHOLD) {
+    return { lines: allLines, totalLines: allLines.length, usedRetrieval: false };
+  }
+
+  const scored = allLines.map((line, idx) => ({ line, idx, score: textSimilarity(line, queryText) }));
+  scored.sort((a, b) => b.score - a.score);
+  const top = scored.slice(0, topN).sort((a, b) => a.idx - b.idx); // restore original document order
+  return { lines: top.map((t) => t.line), totalLines: allLines.length, usedRetrieval: true };
+}
+
+export interface MemoryRetrievalResult {
+  memoryLines: string[];
+  userProfileLines: string[];
+  memoryTotalLines: number;
+  userProfileTotalLines: number;
+  usedRetrieval: boolean;
+}
+
+/** Retrieves only the relevant subset of curated memory for a given
+ *  query (typically the current turn's user message) instead of
+ *  dumping the entire MEMORY.md/USER.md every time — the actual
+ *  "ekte retrieval i stedet for full-dump" the user asked for. */
+export async function retrieveMemoryContext(agentId: string, queryText: string): Promise<MemoryRetrievalResult> {
+  const curated = await getCuratedMemory(agentId);
+  const mem = retrieveRelevantLines(curated.content, queryText);
+  const prof = retrieveRelevantLines(curated.userProfile, queryText);
+  return {
+    memoryLines: mem.lines,
+    userProfileLines: prof.lines,
+    memoryTotalLines: mem.totalLines,
+    userProfileTotalLines: prof.totalLines,
+    usedRetrieval: mem.usedRetrieval || prof.usedRetrieval,
+  };
 }

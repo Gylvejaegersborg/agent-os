@@ -107,6 +107,40 @@ export interface EpisodicEntry {
   wasExplicitCorrection: boolean;
   repetitionCount: number;
   taskOutcome?: "success" | "failure";
+  /** True when this entry originated from an agent-nominated memory that
+   *  the USER explicitly approved (see AgentMemoryNomination below) —
+   *  an audit marker, not a scoring bypass. Approval itself is recorded
+   *  via wasExplicitCorrection: true (the user confirming it IS what
+   *  earns the entry its promotion weight); this flag just keeps the
+   *  provenance visible after promotion: "the agent proposed this, and
+   *  the user later agreed." */
+  agentFlaggedImportant?: boolean;
+}
+
+export type NominationStatus = "pending" | "approved" | "rejected";
+
+/** The agent's own "draft memory" channel — a bounded voice, not a
+ *  bypass. The agent can nominate something it thinks is worth
+ *  remembering via the `nominate-memory` tool mid-conversation, but a
+ *  nomination has ZERO effect on curated memory until a human explicitly
+ *  reviews it (async — see approveAgentMemory/rejectAgentMemory in
+ *  memory.ts). Approval is what actually "adds the points": it creates a
+ *  real episodic entry weighted as an explicit correction, which then
+ *  flows through the exact same deterministic scoreEligibility/dreaming
+ *  pipeline as anything else — no separate promotion path for
+ *  agent-nominated content. */
+export interface AgentMemoryNomination {
+  id: string;
+  agentId: string;
+  content: string;
+  kind: EpisodicKind;
+  sourceSessionId: string;
+  status: NominationStatus;
+  nominatedAt: string;
+  reviewedAt?: string;
+  reviewNote?: string;
+  /** Set once approved: the id of the episodic entry approval created. */
+  resultingEpisodicEntryId?: string;
 }
 
 export interface MemoryProvenance {

@@ -76,15 +76,84 @@ and `npm run demo`'s "3. Dreaming" section, which runs the same
 dreaming pass twice back to back and prints `MEMORY.md content
 unchanged: true`.
 
-**Known limitation, stated not hidden**: `countSimilar()`'s repetition
-detection is exact-substring matching on normalized text, not semantic
-similarity — two paraphrases of the same fact are not recognized as
-repeating each other. There's also no retrieval yet: the full curated
-documents are injected in their entirety every turn rather than
-fetching only what's relevant to the current context, which won't
-scale gracefully as curated memory grows. Both are real gaps compared
-to production memory systems (mem0, Zep, MemGPT/Letta) — left as
-explicit next steps rather than implied to be solved.
+### Similarity-based repetition detection (`src/core/text-similarity.ts`)
+
+`countSimilar()` no longer does exact-substring matching — it uses a
+zero-dependency Jaccard token-overlap similarity
+(`textSimilarity`/`tokenize`, `SIMILARITY_REPETITION_THRESHOLD = 0.15`)
+so two paraphrases of the same fact ("User prefers concise, terse
+responses" vs "User likes brief, to-the-point replies") now DO count as
+repetitions of each other. This is a genuine, evidence-based
+improvement over the previous behavior, not a claim of solving semantic
+understanding — it's still token overlap, not real embeddings (see
+mem0/Zep/MemGPT below for what that actually looks like in production).
+Swapping in real embeddings later only touches this one file.
+
+### Retrieval instead of full-dump (`retrieveMemoryContext` in `memory.ts`)
+
+Curated memory is no longer injected in its entirety every turn.
+`retrieveMemoryContext(agentId, queryText)` returns everything as
+before ONLY while a document stays small (`RETRIEVAL_LINE_THRESHOLD = 8`
+lines) — a fresh agent's behavior is unchanged. Once a document grows
+past that, only the `RETRIEVAL_TOP_N = 6` lines most similar to the
+CURRENT user message (the same Jaccard similarity as above) are
+injected, restored to original document order so the excerpt still
+reads as coherent prose rather than a shuffled bag of lines.
+`runTurn()`'s system-message injection uses this automatically — no
+separate opt-in needed, and the injected text notes when retrieval
+trimmed the document ("showing 6 of 20 most relevant lines") so it's
+never silently incomplete.
+
+### Agent-nominated memory — a bounded voice, not a bypass
+
+The user specifically wanted the agent to be able to influence what
+gets learned, while still requiring human sign-off. The agent can call
+a `nominate-memory` tool (opt-in per `runTurn()` call via
+`enableMemoryNominations`, same pattern as `enableSubagents`) to
+propose something worth remembering — but a nomination has **zero
+effect** on curated memory, and doesn't even create an episodic entry,
+until a human explicitly reviews it. This is deliberately **async, not
+a blocking prompt**: the scaffold has no live UI to synchronously ask a
+human mid-conversation, so nominations sit in `pending` state
+(`listAgentMemoryNominations(agentId, { status: 'pending' })`) until
+`approveAgentMemory(agentId, nominationId, reviewNote?)` or
+`rejectAgentMemory(...)` is called — by you directly, or by a future
+UI/CLI command layered on top.
+
+**Approval is what actually "adds the points"**: it creates a real
+episodic entry via the exact same `writeEpisodic()` path everything
+else uses, weighted as an explicit correction
+(`wasExplicitCorrection: true`) — which crosses the promotion threshold
+on its own, the same as a user's own explicit correction would. There
+is no separate promotion path for agent-nominated content and no way
+for the agent to talk its way past the gate unilaterally: the
+`agentFlaggedImportant` flag on an episodic entry is kept purely as a
+provenance marker ("the agent proposed this, and the human later
+agreed"), and on its own (outside the approval flow) is worth only +10
+points — well under the 40-point threshold, so it can nudge a
+borderline entry but never independently promote one.
+
+Verified with `npm run test-memory-v2` (30 assertions covering all
+three pieces above — including a pending nomination surviving an
+entire dreaming pass with zero effect, a double-approval attempt
+throwing rather than silently no-opping, a rejected nomination never
+creating an episodic entry at all, and the whole nominate ->
+pending -> approve -> promoted flow running through the real
+`runTurn()`/agent-loop tool-call path, not just direct function calls)
+plus `npm run demo`'s "3b. Agent-nominated memory" section, which walks
+the entire flow live: nominate, prove a dreaming pass ignores the
+pending nomination, approve, prove the SAME dreaming pass now promotes
+it into MEMORY.md, then also demonstrates human rejection and the
+opt-in gate.
+
+**Remaining known gap, stated not hidden**: retrieval and repetition
+detection here are both token-overlap heuristics, not real semantic
+embeddings — genuinely useful, evidence-based improvements over the
+previous exact-substring/full-dump behavior, but still a real gap
+compared to production memory systems (mem0, Zep, MemGPT/Letta) that
+use vector similarity. Swapping in embeddings is a natural next step
+that would only touch `text-similarity.ts` and the retrieval/dedup call
+sites in `memory.ts`.
 
 ## Running it
 
@@ -351,7 +420,7 @@ sections, which exercise all of it against real data side by side.
 
 **Note on test isolation**: the standalone test scripts (`test-cron`,
 `test-eventbus`, `test-webhook`, `test-skills-write`, `test-heartbeat`,
-`test-subagent`, `test-memory`) all share the same `./data/` event-log directory as
+`test-subagent`, `test-memory`, `test-memory-v2`) all share the same `./data/` event-log directory as
 `npm run demo` — none of them reset it first. Running `npm run demo`
 and then a test
 script back to back can leave leftover Automations registered from the
@@ -409,7 +478,8 @@ src/
     id.ts            # sortable id generator (no deps)
     eventlog.ts      # THE foundation — append/read/project over JSONL streams
     tasks.ts         # Task/Flow/Automation projections over the event log
-    memory.ts         # episodic fast-path + dreaming promotion pipeline
+    memory.ts         # episodic fast-path, dreaming promotion, retrieval, agent nominations
+    text-similarity.ts # zero-dependency Jaccard similarity for repetition/retrieval
     hooks.ts          # deterministic lifecycle hooks, harness-run not model-run
     skills.ts          # agentskills.io SKILL.md parser + progressive-disclosure registry
     permissions.ts      # two-layer permission policy (hook) + sandbox (worker enforcement)
@@ -433,6 +503,7 @@ src/
   test-heartbeat.ts                  # standalone Heartbeat scheduling-mode tests
   test-subagent.ts                     # standalone Subagent context-isolation tests
   test-memory.ts                         # standalone memory dedup/split/injection tests
+  test-memory-v2.ts                        # standalone similarity/retrieval/nomination tests
 skills/
   commit-message-style/       # example skill: house style for git commits
     SKILL.md

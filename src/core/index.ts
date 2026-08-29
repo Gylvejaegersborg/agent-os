@@ -3,6 +3,7 @@ export * from "./id.js";
 export * from "./eventlog.js";
 export * from "./tasks.js";
 export * from "./memory.js";
+export * from "./text-similarity.js";
 export * from "./hooks.js";
 export * from "./skills.js";
 export * from "./permissions.js";

@@ -53,6 +53,10 @@ export function createStubModel(id = "stub-model"): ModelAdapter {
         const goal = text.replace(/.*delegate\s+to\s+subagent:/i, "").trim();
         return { content: `Delegating to a subagent: ${goal}`, toolCall: { name: "subagent", args: { goal } } };
       }
+      if (/nominate\s+memory:/i.test(text)) {
+        const content = text.replace(/.*nominate\s+memory:/i, "").trim();
+        return { content: `Nominating for memory: ${content}`, toolCall: { name: "nominate-memory", args: { content, kind: "fact" } } };
+      }
       if (/run\s+shell:/i.test(text)) {
         const command = text.replace(/.*run\s+shell:/i, "").trim();
         return { content: `Running: ${command}`, toolCall: { name: "shell", args: { command } } };

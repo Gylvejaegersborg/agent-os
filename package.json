@@ -17,6 +17,7 @@
     "test-heartbeat": "tsc -b && node dist/test-heartbeat.js",
     "test-subagent": "tsc -b && node dist/test-subagent.js",
     "test-memory": "tsc -b && node dist/test-memory.js",
+    "test-memory-v2": "tsc -b && node dist/test-memory-v2.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {

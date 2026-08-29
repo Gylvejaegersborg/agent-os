@@ -10,7 +10,8 @@ import type { Worker } from "./worker.js";
 import { fireHook } from "./hooks.js";
 import { generateId } from "./id.js";
 import { SkillRegistry, renderSkillCatalog } from "./skills.js";
-import { getCuratedMemory } from "./memory.js";
+import { retrieveMemoryContext } from "./memory.js";
+import type { EpisodicKind } from "./types.js";
 
 export interface AgentTurnResult {
   sessionId: string;
@@ -52,6 +53,15 @@ export interface RunTurnOptions {
    *  with no memory context (e.g. testing eligibility scoring in
    *  isolation without it leaking into unrelated assertions). */
   injectMemory?: boolean;
+  /** When provided, the model can call the `nominate-memory` tool to
+   *  propose something worth remembering (see memory.ts's
+   *  nominateAgentMemory). This is a BOUNDED voice, not a bypass: the
+   *  nomination sits in "pending" state with zero effect on curated
+   *  memory until a human explicitly calls approveAgentMemory() or
+   *  rejectAgentMemory() — async, since this scaffold has no
+   *  synchronous "ask the user right now" mechanism. Omit to disable
+   *  nomination for this turn, same opt-in pattern as enableSubagents. */
+  enableMemoryNominations?: boolean;
 }
 
 function sessionStream(sessionId: string): string {
@@ -67,18 +77,29 @@ export async function getSessionHistory(sessionId: string): Promise<ModelMessage
   });
 }
 
-/** Renders curated memory (MEMORY.md + USER.md) as system-prompt text.
- *  Empty documents produce empty sections rather than empty-but-labeled
- *  ones, so a fresh agent with no promoted memories yet doesn't inject a
+/** Renders curated memory (MEMORY.md + USER.md) as system-prompt text —
+ *  via RETRIEVAL (memory.ts's retrieveMemoryContext), not a full dump.
+ *  Below RETRIEVAL_LINE_THRESHOLD lines, everything is still included
+ *  (no point filtering a handful of lines, and this keeps a
+ *  freshly-started agent's behavior unchanged); above it, only the
+ *  lines most relevant to the CURRENT user message are injected. Empty
+ *  documents produce empty sections rather than empty-but-labeled ones,
+ *  so a fresh agent with no promoted memories yet doesn't inject a
  *  confusing "MEMORY.md: (nothing here)" block into every turn. */
-async function renderMemoryContext(agentId: string): Promise<string> {
-  const curated = await getCuratedMemory(agentId);
+async function renderMemoryContext(agentId: string, queryText: string): Promise<string> {
+  const retrieved = await retrieveMemoryContext(agentId, queryText);
   const parts: string[] = [];
-  if (curated.content.trim()) {
-    parts.push(`# MEMORY.md (durable facts/procedures learned about this work)\n${curated.content.trim()}`);
+  if (retrieved.memoryLines.length > 0) {
+    const note = retrieved.usedRetrieval
+      ? ` (showing ${retrieved.memoryLines.length} of ${retrieved.memoryTotalLines} most relevant lines)`
+      : "";
+    parts.push(`# MEMORY.md (durable facts/procedures learned about this work)${note}\n${retrieved.memoryLines.join("\n")}`);
   }
-  if (curated.userProfile.trim()) {
-    parts.push(`# USER.md (user profile/preferences learned over time)\n${curated.userProfile.trim()}`);
+  if (retrieved.userProfileLines.length > 0) {
+    const note = retrieved.usedRetrieval
+      ? ` (showing ${retrieved.userProfileLines.length} of ${retrieved.userProfileTotalLines} most relevant lines)`
+      : "";
+    parts.push(`# USER.md (user profile/preferences learned over time)${note}\n${retrieved.userProfileLines.join("\n")}`);
   }
   return parts.join("\n\n");
 }
@@ -91,7 +112,15 @@ interface ToolDispatchResult {
 
 async function dispatchTool(
   toolCall: { name: string; args: Record<string, unknown> },
-  ctx: { worker: Worker; skills?: SkillRegistry; agentId: string; sessionId: string; model: ModelAdapter; enableSubagents?: boolean },
+  ctx: {
+    worker: Worker;
+    skills?: SkillRegistry;
+    agentId: string;
+    sessionId: string;
+    model: ModelAdapter;
+    enableSubagents?: boolean;
+    enableMemoryNominations?: boolean;
+  },
 ): Promise<ToolDispatchResult> {
   if (toolCall.name === "shell") {
     return ctx.worker.run(String(toolCall.args.command));
@@ -126,11 +155,28 @@ async function dispatchTool(
     });
     return { ok: true, output: result.finalContent };
   }
+  if (toolCall.name === "nominate-memory") {
+    if (!ctx.enableMemoryNominations) {
+      return { ok: false, output: "", error: "memory nomination is not enabled for this session" };
+    }
+    const content = String(toolCall.args.content ?? "");
+    const kind = String(toolCall.args.kind ?? "fact") as EpisodicKind;
+    if (!content) return { ok: false, output: "", error: "nominate-memory tool call missing required 'content' argument" };
+    // Dynamic import mirrors the subagent.js pattern above — avoids
+    // pulling memory.js's full surface into this file's top-level
+    // imports beyond what's already needed for retrieval.
+    const { nominateAgentMemory } = await import("./memory.js");
+    const nomination = await nominateAgentMemory({ agentId: ctx.agentId, content, kind, sourceSessionId: ctx.sessionId });
+    return {
+      ok: true,
+      output: `Nomination ${nomination.id} recorded as PENDING — it has no effect on memory until a human explicitly approves it.`,
+    };
+  }
   return { ok: false, output: "", error: `unknown tool: ${toolCall.name}` };
 }
 
 export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
-  const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents } = opts;
+  const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents, enableMemoryNominations } = opts;
   const injectMemory = opts.injectMemory ?? true;
   const maxHops = opts.maxToolHops ?? 3;
 
@@ -149,12 +195,15 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     const subagentText = enableSubagents
       ? "You can delegate a focused sub-task to an isolated subagent by calling the `subagent` tool with {goal}. The subagent runs independently and only its final result returns to you — its own reasoning and tool calls stay isolated."
       : "";
+    const nominationText = enableMemoryNominations
+      ? "You can propose something worth remembering long-term by calling the `nominate-memory` tool with {content, kind}. This does NOT write to memory directly — it creates a pending nomination that a human must explicitly approve before it can ever influence curated memory."
+      : "";
     // Re-read fresh every turn (not cached) — see injectMemory's own doc
     // comment for why. Only ever populated by the dreaming pass
     // (memory.ts), never by this turn's own conversation, so a chatty
     // session cannot inject its own unvetted "memory" into itself.
-    const memoryText = injectMemory ? await renderMemoryContext(agentId) : "";
-    const systemParts = [memoryText, catalogText, subagentText].filter(Boolean);
+    const memoryText = injectMemory ? await renderMemoryContext(agentId, userMessage) : "";
+    const systemParts = [memoryText, catalogText, subagentText, nominationText].filter(Boolean);
     const messages: ModelMessage[] = systemParts.length
       ? [{ role: "system", content: systemParts.join("\n\n") }, ...history]
       : history;
@@ -177,7 +226,15 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       }
 
       await appendEvent(sessionStream(sessionId), "tool.call.start", response.toolCall);
-      const result = await dispatchTool(response.toolCall, { worker, skills, agentId, sessionId, model, enableSubagents });
+      const result = await dispatchTool(response.toolCall, {
+        worker,
+        skills,
+        agentId,
+        sessionId,
+        model,
+        enableSubagents,
+        enableMemoryNominations,
+      });
       await appendEvent(sessionStream(sessionId), "tool.call.end", { ...response.toolCall, result });
       await fireHook("tool.after", { agentId, sessionId, payload: { ...response.toolCall, result } });
 
