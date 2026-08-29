@@ -37,6 +37,13 @@ export interface Task {
   input: Record<string, unknown>;
   output?: Record<string, unknown>;
   notifyPolicy: "immediate" | "digest" | "silent";
+  /** Optional configurable duration (ms) a Task may spend in status
+   *  'running' before checkTaskTimeouts() (tasks.ts) transitions it to
+   *  'timed_out'. Undefined means no timeout is enforced for this Task —
+   *  the timeout sweep simply skips it. Measured from `startedAt`, not
+   *  `createdAt` (a Task can sit 'queued' indefinitely without penalty;
+   *  the clock starts only once real work begins). */
+  timeoutMs?: number;
 }
 
 /** "How multiple steps are coordinated" — orchestration OVER several Tasks.

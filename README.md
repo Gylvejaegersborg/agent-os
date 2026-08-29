@@ -35,7 +35,7 @@ independently — see `docs/architecture.md §0`.
 | Agent loop (turn = LLM call + tool calls, event-sourced) | ✅ working | `src/core/agent-loop.ts` |
 | Model abstraction (swappable adapter interface) | ✅ working — stub + real Anthropic/OpenAI/Ollama adapters | `src/core/model.ts`, `src/core/models/real.ts` |
 | Worker abstraction (execution environment, separate from Agent identity) | ✅ working (local-shell + stub) | `src/core/worker.ts` |
-| Task / Flow (OpenClaw's ledger + orchestration split, with optimistic-concurrency revisioning) | ✅ working | `src/core/tasks.ts` |
+| Task / Flow (OpenClaw's ledger + orchestration split, with optimistic-concurrency revisioning) — **timeout + 'lost' enforcement, real notifyPolicy wiring, and Flow.kind:'mirrored' now implemented** | ✅ working | `src/core/tasks.ts` |
 | Subagent delegation (in-process, isolated context, same harness) | ✅ working — cross-harness delegation (Claude Code/Codex as a child process) is planned, not built | `src/core/subagent.ts` |
 | Automation registry + scheduler (cron tick loop + event bus + webhooks) | ✅ working — all three trigger kinds fire for real | `src/core/scheduler.ts`, `src/core/eventbus.ts`, `src/core/webhook.ts` |
 | Heartbeat (imprecise timing, full main-session context, no Task created) | ✅ working | `src/core/heartbeat.ts` |
@@ -352,6 +352,136 @@ first and called the shell tool directly instead of delegating —
 caught immediately by the demo section showing an unexpected shell call
 instead of a subagent call; fixed by checking the more specific pattern
 first.
+
+## Task lifecycle — timeout, 'lost' detection, real notifyPolicy, mirrored Flow
+
+`types.ts`'s `TaskStatus` always included `'timed_out'` and `'lost'`, and
+`Flow.kind` was always typed `'managed' | 'mirrored'` — but until now
+nothing ever produced those statuses or that Flow kind, and
+`notifyPolicy` was stored on every `Task` and read by nothing. This
+section closes all four gaps, entirely inside `src/core/tasks.ts`, using
+the same event-sourced pattern as everything else here: new behavior is
+new event types appended to the existing `tasks`/`flows` streams, reduced
+by `projectTasks()`/`projectFlows()` — no new mutable store, no database.
+
+**1. Timeout enforcement.** A `Task` can carry an optional
+`timeoutMs` (set at `createTask()` time). `checkTaskTimeouts()` is a
+**sweep** — not a per-task `setTimeout` — that walks every currently
+`'running'` Task, compares `now - startedAt` against `timeoutMs` (or an
+optional sweep-wide `defaultTimeoutMs` for Tasks with none configured),
+and transitions any that are over budget to `'timed_out'` via the
+existing `transitionTask()`. Deliberately a sweep, not a timer armed at
+`createTask()` time: a `setTimeout` armed in one process is silently lost
+if that process crashes before it fires; a sweep re-derived from
+`startedAt` in the event log gives the correct answer regardless of which
+process runs it or how long it was down. Every sweep appends a
+`task.timeout.checked` audit event (which Tasks were even eligible, which
+were found over budget) before driving any actual status change, so "why
+did this time out" is always answerable from the log alone.
+`startTaskTimeoutSweeper()` wraps this in a real `setInterval` loop
+(unref'd, `stop()` handle), matching `scheduler.ts`'s `startScheduler()`
+and `heartbeat.ts`'s `startHeartbeat()` in shape; call it once at process
+startup if you want continuous enforcement instead of only calling
+`checkTaskTimeouts()` manually/on demand.
+
+**2. 'lost' detection — the honest version.** This scaffold has no
+process supervisor, container runtime, or distributed lease store, so
+"lost" detection here is a documented, correctly-scoped approximation,
+not a claim of true multi-process crash detection:
+`transitionTask()` maintains an in-memory `liveTaskIds` Set — every Task
+id the CURRENT process has itself moved into `'running'` and not yet
+moved out of. `reconcileLostTasks()` is meant to run once, early, at
+process startup: any Task the event log still says is `'running'` at that
+moment cannot possibly be live in a just-started process (nothing has run
+yet), so if it isn't in `liveTaskIds` either, the process that was
+actually executing it is gone and never got to append a terminal status
+change — it's marked `'lost'`. `simulateProcessRestart()` clears
+`liveTaskIds` without touching the event log, modeling exactly what a
+real crash+restart does to that registry, which is what lets the test
+suite exercise this deterministically. **What this deliberately does
+NOT do**: distinguish "genuinely crashed" from "alive in some other
+still-running process that hasn't registered here" in a true
+multi-process deployment — that needs a shared lease/heartbeat registry
+(e.g. a periodic `task.liveness.renewed` event with a TTL, checked
+instead of local Set membership). The Set-based approach here is the
+honestly-scoped, zero-dependency version of that idea for a scaffold
+where only one process talks to the log at a time. Like timeout
+enforcement, every sweep appends a `task.reconciliation.swept` audit
+event (which Tasks were running, which were found orphaned) before
+marking anything `'lost'`.
+
+**3. `notifyPolicy` wired to something real.** Every `transitionTask()`
+call — no matter which primitive triggered it (`subagent.ts`,
+`scheduler.ts`'s `fireAutomation`, the timeout sweep, the reconciliation
+sweep) — now routes through `notifyTaskStatus()`, so all three policies
+apply uniformly everywhere a Task's status changes, not just in one
+call site:
+- **`'immediate'`** appends a `task.notification.sent` audit event
+  (`batched: false`) AND publishes a real `task.notification` event on
+  the in-process event bus (`eventbus.ts`) synchronously, once per status
+  change. Any `subscribeToEvent("task.notification", ...)` handler hears
+  it inside that same `publishEvent()` call.
+- **`'digest'`** queues into an in-memory `digestQueue` and publishes
+  nothing yet. `flushDigest()` (called manually, or on an interval via
+  `startNotificationDigestFlusher()`, same shape as the other
+  `start*()` handles in this codebase) drains the WHOLE queue into one
+  `task.notification.sent` audit event (`batched: true`, carrying every
+  queued item) and one `task.notification.digest` bus publish — genuinely
+  batched, not fired per task. Flushing an empty queue is a safe no-op
+  (`flushDigest()` returns `null`, appends/publishes nothing).
+- **`'silent'`** appends a `task.notification.suppressed` audit event
+  (so the silence itself is provable from the log — nothing was "lost",
+  it was deliberately never sent) and publishes NOTHING on the event bus.
+  No subscriber ever sees it.
+
+**4. `Flow.kind: 'mirrored'`.** The existing `'managed'` path is
+unchanged: the caller explicitly drives every `FlowStep` via
+`updateFlowStep()`, and `projectFlows()` aggregates step statuses into
+the Flow's own status. `createMirroredFlow()` is the new contrast case: it
+creates a Flow with **exactly one** `FlowStep`, wrapping a single new
+`Task` (bound via that Task's own `flowId`) — a genuine 1:1 wrapper, not
+a `'managed'` Flow with one step that happens to be alone. The defining
+difference is *who* drives the step transitions: for `'managed'`, the
+caller calls `updateFlowStep()` directly; for `'mirrored'`, nobody calls
+it directly at all — `propagateToMirroredFlow()`, invoked from inside
+`transitionTask()` after every status change, automatically mirrors the
+wrapped Task's status onto that one step via the SAME `updateFlowStep()`
+a `'managed'` Flow's caller would use. The Flow's own overall status
+(`running`/`succeeded`/`failed`/`cancelled`) falls out of the exact same
+step-aggregation logic `projectFlows()` already used for `'managed'`
+Flows — no separate status machine for `'mirrored'` — with `'timed_out'`
+and `'lost'` step statuses both counted as `'failed'` at the Flow level,
+since `Flow.status` has no `timed_out`/`lost` value of its own.
+
+**Known scaffold limitation** (documented, not hidden): timeout and
+reconciliation sweeps must be triggered (manually, or via
+`startTaskTimeoutSweeper()`/on process startup) — nothing in this
+scaffold currently wires them into `cli.ts`'s demo/chat startup path
+automatically the way `wireAutomationsToEventBus()` is wired for event
+automations. A real deployment calls `startTaskTimeoutSweeper()`,
+`reconcileLostTasks()` (once, at startup, before resuming any Tasks),
+and `startNotificationDigestFlusher()` explicitly alongside
+`startScheduler()`/`startHeartbeat()`.
+
+Verified with `npm run test-task-lifecycle` (34 assertions covering all
+four pieces end to end against real event-log writes — not just
+typechecking): a Task with a short `timeoutMs` genuinely elapses and
+times out while one with a long `timeoutMs` and one with none are left
+alone; a sweep-wide `defaultTimeoutMs` catches untimed Tasks
+retroactively; `simulateProcessRestart()` + `reconcileLostTasks()`
+correctly marks an orphaned Task `'lost'` while leaving a re-registered
+one `'running'`; all three `notifyPolicy` values are checked against a
+real `subscribeToEvent()` listener on the actual event bus (immediate
+fires 1:1, digest batches N status changes into exactly 1 publish,
+silent publishes 0 but still audits the suppression); and a
+`createMirroredFlow()` Flow's single step and overall status are shown
+tracking its wrapped Task automatically — including through a
+`timed_out` transition — while a sibling `'managed'` Flow stays untouched
+by any of it. `npm run demo`'s existing "4. Task / Flow / Automation"
+section is unchanged and still green (no regression) — the lifecycle
+enforcement pieces are additive and only activate when a Task is given a
+`timeoutMs`, goes through a reconciliation sweep, or is created via
+`createMirroredFlow()`.
 
 ## Scheduler — Automations that actually fire
 
