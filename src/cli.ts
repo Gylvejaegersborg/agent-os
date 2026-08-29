@@ -52,6 +52,8 @@ import {
   getSessionHistory,
   spawnSubagentTask,
   createRecordingModel,
+  detectCliAgent,
+  createClaudeCodeWorker,
 } from "./core/index.js";
 
 const AGENT_ID = "demo-agent";
@@ -190,6 +192,35 @@ async function demoSubagent(): Promise<void> {
   console.log(`Result: "${gatedResult.finalContent}"`);
 }
 
+
+async function demoCrossHarness(): Promise<void> {
+  section("1d. Cross-harness delegation — OPTIONAL, NOT the default (see subagent above)");
+  console.log(
+    "This is a SEPARATE, opt-in mechanism from the in-process Subagent above — it shells\n" +
+      "out to a genuinely different agent PRODUCT (Claude Code CLI / Codex CLI / OpenCode CLI)\n" +
+      "as a child process via a new WorkerKind (`acp:claude` etc.), for the specific case where\n" +
+      "you want that product's own strengths, not a replacement for Subagent as the default\n" +
+      "multiagent primitive. See src/core/cli-agent-worker.ts's header and README.md's\n" +
+      "'Cross-harness delegation (optional, NOT the default)' section.\n",
+  );
+
+  const detected = await detectCliAgent();
+  if (!detected) {
+    console.log(
+      "No external CLI agent (claude / codex / opencode) responded on PATH in this environment —\n" +
+        "skipping the live call, same graceful-degradation pattern as the Ollama model adapter\n" +
+        "('Could not reach Ollama... falling back'). The Worker code itself is fully implemented\n" +
+        "and typechecked; see `npm run test-cross-harness-worker` for unit-level proof of the\n" +
+        "spawn/timeout/exit-code plumbing plus an honest live-availability finding for this machine.",
+    );
+    return;
+  }
+
+  console.log(`Detected: ${detected.name} (\`${detected.command} --version\` -> "${detected.versionOutput}")`);
+  const worker = createClaudeCodeWorker({ timeoutMs: 30_000 });
+  const result = await worker.run("Reply with exactly: CROSS_HARNESS_DEMO_OK");
+  console.log(`worker.kind=${worker.kind} ok=${result.ok} output=${JSON.stringify(result.output.slice(0, 200))}`);
+}
 
 async function demoMemory(sessionId: string): Promise<void> {
   section("2. Memory — fast-path episodic writes (Hermes-style immediacy)");
@@ -745,6 +776,7 @@ async function main(): Promise<void> {
     const { sessionId, skills } = await demoAgentLoop();
     await demoSkills(sessionId, skills);
     await demoSubagent();
+    await demoCrossHarness();
     await demoMemory(sessionId);
     await demoAgentMemoryVoice(sessionId);
     await demoIdentityWiring();

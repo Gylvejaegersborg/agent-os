@@ -18,6 +18,7 @@
     "test-sandbox-hardening": "tsc -b && node dist/test-sandbox-hardening.js",
     "test-subagent": "tsc -b && node dist/test-subagent.js",
     "test-task-lifecycle": "tsc -b && node dist/test-task-lifecycle.js",
+    "test-cross-harness-worker": "tsc -b && node dist/test-cross-harness-worker.js",
     "test-memory": "tsc -b && node dist/test-memory.js",
     "test-memory-v2": "tsc -b && node dist/test-memory-v2.js",
     "test-identity-wiring": "tsc -b && node dist/test-identity-wiring.js",
