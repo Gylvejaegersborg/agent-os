@@ -40,7 +40,7 @@ import type {
   AgentMemoryNomination,
   NominationStatus,
 } from "./types.js";
-import { textSimilarity, SIMILARITY_REPETITION_THRESHOLD } from "./text-similarity.js";
+import { textSimilarity, SIMILARITY_REPETITION_THRESHOLD, type SimilarityProvider } from "./text-similarity.js";
 
 function episodicStream(agentId: string): string {
   return `memory:${agentId}:episodic`;
@@ -65,6 +65,12 @@ export async function writeEpisodic(input: {
   wasExplicitCorrection?: boolean;
   taskOutcome?: "success" | "failure";
   agentFlaggedImportant?: boolean;
+  /** Optional embedding-backed similarity provider (see
+   *  text-similarity.ts's createSimilarityProvider()). When omitted,
+   *  repetition detection uses the synchronous Jaccard textSimilarity()
+   *  exactly as before — this parameter is a pure opt-in upgrade, never
+   *  a requirement, so every existing caller keeps working unchanged. */
+  similarityProvider?: SimilarityProvider;
 }): Promise<EpisodicEntry> {
   const id = generateId();
   const entry: EpisodicEntry = {
@@ -75,7 +81,7 @@ export async function writeEpisodic(input: {
     kind: input.kind,
     sourceSessionId: input.sourceSessionId,
     wasExplicitCorrection: input.wasExplicitCorrection ?? false,
-    repetitionCount: await countSimilar(input.agentId, input.content),
+    repetitionCount: await countSimilar(input.agentId, input.content, input.similarityProvider),
     taskOutcome: input.taskOutcome,
     agentFlaggedImportant: input.agentFlaggedImportant ?? false,
   };
@@ -83,17 +89,33 @@ export async function writeEpisodic(input: {
   return entry;
 }
 
-/** Token-overlap (Jaccard) similarity via text-similarity.ts — a real
- *  improvement over the previous exact-substring match: two paraphrases
- *  of the same fact ("User prefers short answers" vs "User likes brief
- *  replies") now DO count as repetitions of each other, without needing
- *  embeddings, a network call, or a model. Still not semantic
- *  understanding (see text-similarity.ts's own header for the honest
- *  limitation versus real embeddings) — a genuine, evidence-based step
- *  up, not a claim of solving repetition detection completely. */
-async function countSimilar(agentId: string, content: string): Promise<number> {
+/** Token-overlap (Jaccard) similarity via text-similarity.ts by default
+ *  — a real improvement over the previous exact-substring match: two
+ *  paraphrases of the same fact ("User prefers short answers" vs "User
+ *  likes brief replies") now DO count as repetitions of each other,
+ *  without needing embeddings, a network call, or a model. Still not
+ *  semantic understanding (see text-similarity.ts's own header for the
+ *  honest limitation versus real embeddings) — a genuine,
+ *  evidence-based step up, not a claim of solving repetition detection
+ *  completely.
+ *
+ *  Passing a `similarityProvider` (see text-similarity.ts's
+ *  createSimilarityProvider()) transparently upgrades this to
+ *  embedding-based cosine similarity when a local Ollama server is
+ *  reachable, with automatic fallback to the same Jaccard behavior
+ *  otherwise — this function doesn't need to know or care which
+ *  backend actually served a given comparison. */
+async function countSimilar(agentId: string, content: string, similarityProvider?: SimilarityProvider): Promise<number> {
   const entries = await listEpisodic(agentId);
-  return entries.filter((e) => textSimilarity(e.content, content) >= SIMILARITY_REPETITION_THRESHOLD).length;
+  if (!similarityProvider) {
+    return entries.filter((e) => textSimilarity(e.content, content) >= SIMILARITY_REPETITION_THRESHOLD).length;
+  }
+  let count = 0;
+  for (const e of entries) {
+    const score = await similarityProvider.similarity(e.content, content);
+    if (score >= SIMILARITY_REPETITION_THRESHOLD) count++;
+  }
+  return count;
 }
 
 export async function listEpisodic(agentId: string): Promise<EpisodicEntry[]> {
@@ -406,7 +428,9 @@ export interface LineRetrievalResult {
 
 /** Pure, synchronous, and independently testable: given a block of text
  *  and a query, returns either everything (small corpus) or the top-N
- *  most relevant lines in original order (large corpus). */
+ *  most relevant lines in original order (large corpus). Always uses
+ *  the zero-dependency Jaccard textSimilarity() — see
+ *  retrieveRelevantLinesAsync() for the embedding-upgradeable variant. */
 export function retrieveRelevantLines(fullText: string, queryText: string, topN = RETRIEVAL_TOP_N): LineRetrievalResult {
   const allLines = fullText
     .split("\n")
@@ -423,6 +447,40 @@ export function retrieveRelevantLines(fullText: string, queryText: string, topN 
   return { lines: top.map((t) => t.line), totalLines: allLines.length, usedRetrieval: true };
 }
 
+/** Same contract as retrieveRelevantLines(), but async and accepts an
+ *  optional embedding-backed SimilarityProvider (see
+ *  text-similarity.ts's createSimilarityProvider()). Omitting
+ *  `similarityProvider` makes this behave IDENTICALLY to the
+ *  synchronous version above (same Jaccard scoring, just awaited) — it
+ *  exists as a separate function specifically so the always-available
+ *  synchronous Jaccard path (retrieveRelevantLines) never has to change
+ *  shape or become async for callers/tests that don't want the
+ *  embedding upgrade. */
+export async function retrieveRelevantLinesAsync(
+  fullText: string,
+  queryText: string,
+  topN = RETRIEVAL_TOP_N,
+  similarityProvider?: SimilarityProvider,
+): Promise<LineRetrievalResult> {
+  if (!similarityProvider) return retrieveRelevantLines(fullText, queryText, topN);
+
+  const allLines = fullText
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+
+  if (allLines.length <= RETRIEVAL_LINE_THRESHOLD) {
+    return { lines: allLines, totalLines: allLines.length, usedRetrieval: false };
+  }
+
+  const scored = await Promise.all(
+    allLines.map(async (line, idx) => ({ line, idx, score: await similarityProvider.similarity(line, queryText) })),
+  );
+  scored.sort((a, b) => b.score - a.score);
+  const top = scored.slice(0, topN).sort((a, b) => a.idx - b.idx); // restore original document order
+  return { lines: top.map((t) => t.line), totalLines: allLines.length, usedRetrieval: true };
+}
+
 export interface MemoryRetrievalResult {
   memoryLines: string[];
   userProfileLines: string[];
@@ -434,11 +492,21 @@ export interface MemoryRetrievalResult {
 /** Retrieves only the relevant subset of curated memory for a given
  *  query (typically the current turn's user message) instead of
  *  dumping the entire MEMORY.md/USER.md every time — the actual
- *  "ekte retrieval i stedet for full-dump" the user asked for. */
-export async function retrieveMemoryContext(agentId: string, queryText: string): Promise<MemoryRetrievalResult> {
+ *  "ekte retrieval i stedet for full-dump" the user asked for.
+ *
+ *  Passing a `similarityProvider` (see text-similarity.ts's
+ *  createSimilarityProvider()) transparently upgrades line scoring to
+ *  embedding-based cosine similarity when a local Ollama server is
+ *  reachable, with automatic fallback to Jaccard otherwise. Omitting
+ *  it keeps the exact same zero-dependency behavior as before. */
+export async function retrieveMemoryContext(
+  agentId: string,
+  queryText: string,
+  similarityProvider?: SimilarityProvider,
+): Promise<MemoryRetrievalResult> {
   const curated = await getCuratedMemory(agentId);
-  const mem = retrieveRelevantLines(curated.content, queryText);
-  const prof = retrieveRelevantLines(curated.userProfile, queryText);
+  const mem = await retrieveRelevantLinesAsync(curated.content, queryText, RETRIEVAL_TOP_N, similarityProvider);
+  const prof = await retrieveRelevantLinesAsync(curated.userProfile, queryText, RETRIEVAL_TOP_N, similarityProvider);
   return {
     memoryLines: mem.lines,
     userProfileLines: prof.lines,
