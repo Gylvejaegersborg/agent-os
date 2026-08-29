@@ -4,6 +4,7 @@
 // end to end rather than just unit-testing fireWebhookAutomations() in
 // isolation. Run with: node dist/test-webhook.js
 
+import "./test-helpers/isolate.js";
 import {
   startWebhookServer,
   registerAutomation,

@@ -5,6 +5,7 @@
 // comment named explicitly ("there's no event bus in this scaffold yet").
 // Run with: node dist/test-eventbus.js
 
+import "./test-helpers/isolate.js";
 import {
   publishEvent,
   subscribeToEvent,

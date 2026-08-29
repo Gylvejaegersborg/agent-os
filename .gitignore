@@ -1,6 +1,7 @@
 dist/
 node_modules/
 data/
+data-test/
 *.log
 *.tsbuildinfo
 .DS_Store

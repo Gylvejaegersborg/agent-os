@@ -5,6 +5,7 @@
 // memory" voice with mandatory async human approval.
 // Run with: node dist/test-memory-v2.js
 
+import "./test-helpers/isolate.js";
 import {
   textSimilarity,
   tokenize,

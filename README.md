@@ -418,17 +418,22 @@ and a non-JSON body doesn't crash the handler), plus `npm run demo`'s
 "5. Scheduler", "5b. Heartbeat", and "5c. Event Bus + Webhooks"
 sections, which exercise all of it against real data side by side.
 
-**Note on test isolation**: the standalone test scripts (`test-cron`,
-`test-eventbus`, `test-webhook`, `test-skills-write`, `test-heartbeat`,
-`test-subagent`, `test-memory`, `test-memory-v2`) all share the same `./data/` event-log directory as
-`npm run demo` — none of them reset it first. Running `npm run demo`
-and then a test
-script back to back can leave leftover Automations registered from the
-demo that make a test's own assertions (e.g. "exactly one automation
-fired") fail with a confusing count mismatch, even though nothing is
-actually broken. `rm -rf data` before running a test script standalone
-avoids this; a proper fix (a scratch `AGENT_OS_DATA_DIR` per test run)
-is a good next step rather than something to silently work around.
+**Note on test isolation**: fixed. Every standalone test script
+(`test-cron`, `test-eventbus`, `test-webhook`, `test-skills-write`,
+`test-heartbeat`, `test-subagent`, `test-memory`, `test-memory-v2`) now
+imports `src/test-helpers/isolate.ts` as its first line, before any
+`./core/*` import. That module sets `AGENT_OS_DATA_DIR` to a
+deterministic `./data-test/<test-name>/` directory (wiped at the start
+of every run) before `eventlog.ts` — which reads that env var once at
+module-load time — ever gets evaluated. Effect: each test file gets its
+own scratch event-log directory, isolated from `npm run demo` (which
+still defaults to `./data/`, untouched) and from every other test file.
+Verified by running `rm -rf data && npm run demo` to populate real demo
+data (registered/fired Automations, Tasks, sessions) and then every
+`test-*` script back to back with **no** `rm -rf data` in between —
+including `test-webhook`'s "exactly one fired automation" assertion,
+the exact case that previously produced a false failure — and all pass.
+`rm -rf data` before a standalone run is no longer necessary.
 
 ## Agent filesystem namespace — the same primitives, addressed as paths
 
