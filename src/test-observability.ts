@@ -10,6 +10,7 @@
 // other agents, matching how demoScheduler()/demoEventBusAndWebhooks()
 // in cli.ts already diff counts across a known operation.
 
+import "./test-helpers/isolate.js";
 import {
   createTask,
   transitionTask,

@@ -784,8 +784,10 @@ data (registered/fired Automations, Tasks, sessions) and then every
 including `test-webhook`'s "exactly one fired automation" assertion,
 the exact case that previously produced a false failure — and all pass.
 `rm -rf data` before a standalone run is no longer necessary
-(including for `test-cross-harness-worker` and `test-memory-embeddings`,
-both added after this fix).
+(including for `test-cross-harness-worker`, `test-memory-embeddings`,
+and `test-observability`, all added after this fix — `test-observability`
+was initially merged without the import, found and fixed during the
+7-way parallel-subagent merge, and re-verified back to back).
 
 ## Agent filesystem namespace — the same primitives, addressed as paths
 
