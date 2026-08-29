@@ -36,7 +36,7 @@ independently — see `docs/architecture.md §0`.
 | Model abstraction (swappable adapter interface) | ✅ working — stub + real Anthropic/OpenAI/Ollama adapters | `src/core/model.ts`, `src/core/models/real.ts` |
 | Worker abstraction (execution environment, separate from Agent identity) | ✅ working (local-shell + stub) | `src/core/worker.ts` |
 | Task / Flow (OpenClaw's ledger + orchestration split, with optimistic-concurrency revisioning) | ✅ working | `src/core/tasks.ts` |
-| Automation registry + scheduler (cron tick loop + manual event dispatch) | ✅ working | `src/core/scheduler.ts` |
+| Automation registry + scheduler (cron tick loop + event bus + webhooks) | ✅ working — all three trigger kinds fire for real | `src/core/scheduler.ts`, `src/core/eventbus.ts`, `src/core/webhook.ts` |
 | Heartbeat (imprecise timing, full main-session context, no Task created) | ✅ working | `src/core/heartbeat.ts` |
 | **Memory: fast-path episodic + gated "dreaming" promotion** | ✅ working | `src/core/memory.ts` |
 | Hooks (deterministic, harness-run, decision vs. observe-only) | ✅ working | `src/core/hooks.ts` |
@@ -216,22 +216,49 @@ warning not to collapse them into one scheduler abstraction:
   independently auditable via `heartbeat.ticked` events in their own
   stream, separate from session content.
 
-`event`-triggered automations are implemented as a manual dispatch
-function (`fireEventAutomations`) rather than a tick, since this
-scaffold has no event bus yet — call it from wherever the real event
-happens. `webhook`-triggered automations are not implemented (would need
-an actual HTTP listener).
+`event`-triggered automations now fire automatically once
+`wireAutomationsToEventBus()` (`src/core/scheduler.ts`) is called at
+startup — it subscribes to the event bus (`src/core/eventbus.ts`, a
+minimal in-process pub/sub, no external broker) and calls
+`fireEventAutomations()` for every published event. The manual
+`fireEventAutomations()` call still works standalone if you'd rather
+trigger it yourself without the bus. `webhook`-triggered automations
+fire via a real local HTTP server (`src/core/webhook.ts`, Node's
+built-in `http` module, no framework) — `startWebhookServer()` matches
+any request whose path equals a registered, enabled webhook
+automation's `path` (any HTTP method — path-only matching), returning
+200 with which automations fired, or 404 if nothing matches (never a
+silent no-op). Deliberately out of scope: no auth/signature
+verification on the webhook endpoint and no HTTPS — add both before
+exposing this beyond localhost.
 
 Verified with `npm run test-cron` (9 assertions: step values, ranges,
 weekday matching, malformed-input error handling), `npm run
 test-heartbeat` (5 assertions: no Task created, context accumulates
 across ticks in the same session, and consecutive tick gaps under a real
 `startHeartbeat` loop are NOT identical — jitter genuinely present, not
-just claimed), plus `npm run demo`'s "5. Scheduler" and "5b. Heartbeat"
-sections, which exercise both against real data side by side so the
-contrast is visible in one run: Automations create a Task and use a
-fresh session per firing; Heartbeat creates zero Tasks and reuses one
-session across ticks.
+just claimed), `npm run test-eventbus` (9 assertions: typed + wildcard
+subscription, unsubscribe, a throwing subscriber does not block other
+subscribers, and `wireAutomationsToEventBus` end-to-end — publishing a
+non-matching event does nothing, a matching one creates a real Task,
+unwiring stops it), `npm run test-webhook` (8 assertions against a REAL
+HTTP server on an ephemeral port: registered path fires and returns 200,
+unregistered path returns 404, a disabled automation's path also
+returns 404 rather than silently succeeding, any HTTP method matches,
+and a non-JSON body doesn't crash the handler), plus `npm run demo`'s
+"5. Scheduler", "5b. Heartbeat", and "5c. Event Bus + Webhooks"
+sections, which exercise all of it against real data side by side.
+
+**Note on test isolation**: the standalone test scripts (`test-cron`,
+`test-eventbus`, `test-webhook`, `test-skills-write`, `test-heartbeat`)
+all share the same `./data/` event-log directory as `npm run demo` —
+none of them reset it first. Running `npm run demo` and then a test
+script back to back can leave leftover Automations registered from the
+demo that make a test's own assertions (e.g. "exactly one automation
+fired") fail with a confusing count mismatch, even though nothing is
+actually broken. `rm -rf data` before running a test script standalone
+avoids this; a proper fix (a scratch `AGENT_OS_DATA_DIR` per test run)
+is a good next step rather than something to silently work around.
 
 ## Agent filesystem namespace — the same primitives, addressed as paths
 
@@ -286,15 +313,22 @@ src/
     skills.ts          # agentskills.io SKILL.md parser + progressive-disclosure registry
     permissions.ts      # two-layer permission policy (hook) + sandbox (worker enforcement)
     identity.ts           # minimal Agent identity store (name + persona), backs /agent/identity
-    agentfs.ts              # read-only /agent/... filesystem projection over everything above
-    scheduler.ts              # cron parser + tick loop that makes Automations actually fire
-    worker.ts                   # execution-environment interface (local-shell, stub, sandboxed wrapper)
+    agentfs.ts              # /agent/... filesystem projection (read all paths, write skills only)
+    scheduler.ts              # cron parser + tick loop + event/webhook dispatch for Automations
+    eventbus.ts                # minimal in-process pub/sub, wires event-triggered Automations
+    webhook.ts                   # real local HTTP listener for webhook-triggered Automations
+    heartbeat.ts                   # the OTHER scheduling mode: imprecise timing, full session context
+    worker.ts                        # execution-environment interface (local-shell, stub, sandboxed wrapper)
     model.ts             # swappable LLM adapter interface (stub adapter shipped)
     models/real.ts        # real Anthropic / OpenAI / Ollama adapters
     agent-loop.ts          # the turn loop binding all of the above together
   cli.ts                    # runnable end-to-end demo of every primitive above
   test-live-model.ts         # calls a real model adapter (not the stub) — see below
   test-cron.ts                # standalone cron parser/matcher regression tests
+  test-eventbus.ts             # standalone event bus pub/sub + Automation-wiring tests
+  test-webhook.ts                # standalone webhook listener tests (real HTTP server)
+  test-skills-write.ts             # standalone skills write/round-trip tests
+  test-heartbeat.ts                  # standalone Heartbeat scheduling-mode tests
 skills/
   commit-message-style/       # example skill: house style for git commits
     SKILL.md

@@ -1,20 +1,17 @@
 // Scheduler — makes Automation (tasks.ts) actually fire, per
-// docs/architecture.md §2's "two scheduling modes" note. This scaffold
-// implements ONE of the two modes explicitly: precise-timing Automations
-// (cron + event triggers). The second mode described in the architecture
-// doc — Heartbeat (imprecise timing, full main-session context, for
-// "check the inbox"-style work) — is NOT implemented here; it's a
-// genuinely different mechanism (a recurring turn in an existing
-// long-lived session, not a spawned isolated Task) and deserves its own
-// pass rather than being half-built alongside this one. Stated explicitly,
-// not hidden — same pattern as the sandbox limitation note in permissions.ts.
+// docs/architecture.md §2's "two scheduling modes" note. This module
+// covers the "Automations" mode (precise timing, isolated context); the
+// other mode, Heartbeat, lives in its own file (heartbeat.ts) — see that
+// file's header for why they're genuinely different mechanisms, not a
+// single scheduler abstraction wearing two hats.
 //
 // Trigger kinds: 'cron' is fully implemented (tick loop + zero-dependency
-// parser below). 'event' is implemented as a manual dispatch function
-// (fireEventAutomations) rather than a tick — there's no event bus in this
-// scaffold yet, so "firing" means "something in your own code calls this
-// when the event happens." 'webhook' is NOT implemented — it needs an
-// actual HTTP listener, out of scope for this scaffold.
+// parser below). 'event' fires automatically once wireAutomationsToEventBus()
+// is called at startup (see eventbus.ts) — before that wiring existed,
+// firing required manually calling fireEventAutomations() from wherever
+// the real event happened; that manual function still works standalone,
+// the bus just makes it the normal path. 'webhook' fires via a real HTTP
+// listener (see webhook.ts), which calls fireWebhookAutomations() below.
 //
 // Every automation firing is itself just event-sourced: a Task is created
 // (type: 'cron'), a real agent-loop turn runs in its own isolated session
@@ -22,13 +19,16 @@
 // "isolated context" from the architecture doc), and an
 // `automation.fired` event records when it last ran — which is also how
 // dedup works (never fire the same cron minute twice), so a scheduler
-// restart never double-fires or loses its place.
+// restart never double-fires or loses its place. Note dedup-by-minute is
+// specific to cron; event/webhook firings are not deduped by this
+// mechanism since there's no natural "minute" to key on for an arbitrary
+// external trigger — each matching event/webhook call fires again.
 
 import { project, appendEvent } from "./eventlog.js";
-import { generateId } from "./id.js";
 import { createTask, transitionTask } from "./tasks.js";
 import { runTurn, newSessionId } from "./agent-loop.js";
 import { fireHook } from "./hooks.js";
+import { subscribeToAllEvents, type Unsubscribe } from "./eventbus.js";
 import type { Automation } from "./types.js";
 import type { ModelAdapter } from "./model.js";
 import type { Worker } from "./worker.js";
@@ -219,6 +219,49 @@ export async function fireEventAutomations(
     if (automation.trigger.eventType !== eventType) continue;
     const filter = automation.trigger.filter;
     if (filter && !Object.entries(filter).every(([k, v]) => payload[k] === v)) continue;
+
+    results.push(await fireAutomation(automation, deps, now));
+  }
+
+  return results;
+}
+
+/** Subscribes to the event bus (eventbus.ts) so every published event
+ *  automatically triggers matching event-type Automations — closing the
+ *  loop that used to require a caller to remember to invoke
+ *  fireEventAutomations() manually. Call this ONCE at process startup
+ *  (see cli.ts's runChat() or your own long-running process); it returns
+ *  an Unsubscribe so tests can tear it down between runs (mirroring
+ *  every other subscription-style API in this codebase — hooks.ts's
+ *  clearHooks(), eventbus.ts's clearEventBusSubscribers()). Firing errors
+ *  are logged by the underlying publishEvent()'s Promise.allSettled
+ *  handling, not thrown back into whatever published the event — a
+ *  broken automation should not be able to take down the publisher. */
+export function wireAutomationsToEventBus(deps: SchedulerDeps): Unsubscribe {
+  return subscribeToAllEvents(async (eventType, payload) => {
+    await fireEventAutomations(eventType, payload, deps);
+  });
+}
+
+/** Fires every enabled webhook-triggered automation whose `path` matches
+ *  the given request path exactly. Intended to be called from webhook.ts's
+ *  HTTP handler — kept as a separate pure function (rather than baking
+ *  HTTP concerns into this module) so it's testable without spinning up
+ *  a real server, matching how fireEventAutomations() is independently
+ *  testable without a real event source. */
+export async function fireWebhookAutomations(
+  requestPath: string,
+  payload: Record<string, unknown>,
+  deps: SchedulerDeps,
+  now: Date = new Date(),
+): Promise<FireResult[]> {
+  const automations = await listAutomations();
+  const results: FireResult[] = [];
+
+  for (const automation of automations) {
+    if (!automation.enabled) continue;
+    if (automation.trigger.kind !== "webhook") continue;
+    if (automation.trigger.path !== requestPath) continue;
 
     results.push(await fireAutomation(automation, deps, now));
   }

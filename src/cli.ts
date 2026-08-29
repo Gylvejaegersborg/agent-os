@@ -39,6 +39,10 @@ import {
   fsWrite,
   registerAgentIdentity,
   runSchedulerTick,
+  wireAutomationsToEventBus,
+  publishEvent,
+  clearEventBusSubscribers,
+  startWebhookServer,
   runHeartbeatTick,
   getSessionHistory,
 } from "./core/index.js";
@@ -304,8 +308,79 @@ async function demoHeartbeat(): Promise<void> {
   console.log(`\nTask ledger count before heartbeat ticks: ${tasksBefore}, after: ${tasksAfter} (expected equal — no Task created).`);
 }
 
+async function demoEventBusAndWebhooks(): Promise<void> {
+  section("5c. Event Bus + Webhooks — the two remaining Automation triggers");
+  console.log(
+    "Closes the gap scheduler.ts's original comment named explicitly:\n" +
+      "'there's no event bus in this scaffold yet.' Now there is (eventbus.ts),\n" +
+      "and it wires directly into event-triggered Automations. Webhook-\n" +
+      "triggered Automations fire via a REAL local HTTP server (webhook.ts,\n" +
+      "Node's built-in http module — no framework).\n",
+  );
+
+  clearEventBusSubscribers(); // isolate this demo section from any other subscribers
+  const deps = { model: createStubModel(), worker: createStubWorker() };
+
+  // --- Event bus ---
+  console.log("Event bus: registering an event-triggered automation with a filter...");
+  await registerAutomation({
+    trigger: { kind: "event", eventType: "inbox.message.received", filter: { important: true } },
+    agentId: AGENT_ID,
+    promptTemplate: "An important inbox message arrived — summarize it.",
+    enabled: true,
+  });
+  const unwire = wireAutomationsToEventBus(deps);
+  console.log("wireAutomationsToEventBus() called — publishing events now auto-fires matching automations.\n");
+
+  const tasksBeforePublish = (await listTasks({ agentId: AGENT_ID })).length;
+  await publishEvent("inbox.message.received", { important: false });
+  const tasksAfterMismatch = (await listTasks({ agentId: AGENT_ID })).length;
+  console.log(
+    `Published a non-matching event (important: false) -> tasks: ${tasksBeforePublish} -> ${tasksAfterMismatch} (expected unchanged, filter didn't match)`,
+  );
+
+  await publishEvent("inbox.message.received", { important: true });
+  const tasksAfterMatch = (await listTasks({ agentId: AGENT_ID })).length;
+  console.log(
+    `Published a matching event (important: true) -> tasks: ${tasksAfterMismatch} -> ${tasksAfterMatch} (expected +1, automation fired automatically)`,
+  );
+  unwire();
+
+  // --- Webhook ---
+  console.log("\nWebhook: starting a real local HTTP server on an ephemeral port...");
+  await registerAutomation({
+    trigger: { kind: "webhook", path: "/hooks/deploy" },
+    agentId: AGENT_ID,
+    promptTemplate: "A deploy webhook fired — summarize it.",
+    enabled: true,
+  });
+  const server = await startWebhookServer(deps, 0);
+  console.log(`Listening on http://127.0.0.1:${server.port}`);
+
+  try {
+    const tasksBeforeWebhook = (await listTasks({ agentId: AGENT_ID })).length;
+    const res = await fetch(`http://127.0.0.1:${server.port}/hooks/deploy`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ commit: "abc123" }),
+    });
+    const body = (await res.json()) as { fired?: Array<{ automationId: string }> };
+    const tasksAfterWebhook = (await listTasks({ agentId: AGENT_ID })).length;
+    console.log(
+      `POST /hooks/deploy -> HTTP ${res.status}, fired ${body.fired?.length ?? 0} automation(s), ` +
+        `tasks: ${tasksBeforeWebhook} -> ${tasksAfterWebhook}`,
+    );
+
+    const res404 = await fetch(`http://127.0.0.1:${server.port}/hooks/does-not-exist`, { method: "POST" });
+    console.log(`POST to an unregistered path -> HTTP ${res404.status} (expected 404, not a silent success)`);
+  } finally {
+    await server.stop();
+    console.log("Webhook server stopped.");
+  }
+}
+
 async function demoEventLogIsTruth(): Promise<void> {
-  section("8. Everything above is just an event log — proof");
+  section("9. Everything above is just an event log — proof");
   const streams = await listStreamIds();
   console.log(`${streams.length} streams on disk under data/streams/:`);
   for (const s of streams) {
@@ -320,7 +395,7 @@ async function demoEventLogIsTruth(): Promise<void> {
 }
 
 async function demoPermissions(): Promise<void> {
-  section("6. Permissions / Sandbox — two separate layers, proven separately");
+  section("7. Permissions / Sandbox — two separate layers, proven separately");
 
   // --- Layer A: PermissionPolicy — pre-execution, model-input-based ---
   console.log("Layer A (PermissionPolicy): a policy that denies 'forbidden-tool' but allows 'shell'.\n");
@@ -374,7 +449,7 @@ async function demoPermissions(): Promise<void> {
 }
 
 async function demoAgentFilesystem(sessionId: string): Promise<void> {
-  section("7. Agent filesystem — the same primitives, addressed as paths");
+  section("8. Agent filesystem — the same primitives, addressed as paths");
   console.log(
     "Projection over everything above, per docs/architecture.md §7 — not a\n" +
       "new storage layer, just a filesystem-shaped VIEW of the same event\n" +
@@ -461,6 +536,7 @@ async function main(): Promise<void> {
     await demoTasksAndFlows();
     await demoScheduler();
     await demoHeartbeat();
+    await demoEventBusAndWebhooks();
     await demoPermissions();
     await demoAgentFilesystem(sessionId);
     await demoEventLogIsTruth();
