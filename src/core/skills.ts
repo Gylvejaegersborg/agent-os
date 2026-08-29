@@ -160,8 +160,24 @@ export async function writeSkill(
   return parsed;
 }
 
-export function parseSkillFile(raw: string, dirPath: string): SkillFull {
-  const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+/** Normalizes CRLF to LF. Pre-existing bug, unrelated to observability:
+ *  on a Windows checkout with core.autocrlf enabled, this repo's
+ *  LF-committed SKILL.md files land on disk as CRLF; the frontmatter
+ *  boundary regex in parseSkillFile already tolerated an optional CR
+ *  before each newline, but parseSimpleYaml's per-line key/value regex
+ *  did not, leaving a trailing CR embedded in parsed values like `name`
+ *  and silently failing the "name" required check below. Normalizing
+ *  once, up front, is simpler than threading CR-tolerance through every
+ *  downstream regex. */
+function normalizeLineEndings(text: string): string {
+  const CR = String.fromCharCode(13);
+  const LF = String.fromCharCode(10);
+  return text.split(CR + LF).join(LF).split(CR).join(LF);
+}
+
+export function parseSkillFile(rawInput: string, dirPath: string): SkillFull {
+  const raw = normalizeLineEndings(rawInput);
+  const match = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
   if (!match) {
     throw new Error(`SKILL.md at ${dirPath} is missing YAML frontmatter (expected --- ... --- header)`);
   }

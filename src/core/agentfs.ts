@@ -34,6 +34,7 @@ import { getTask, listTasks } from "./tasks.js";
 import { getFlow, listFlows } from "./tasks.js";
 import { getAutomation, listAutomations } from "./tasks.js";
 import { getAgentIdentity, listAgentIdentities } from "./identity.js";
+import { computeMetricsSnapshot } from "./observability.js";
 
 export interface FsEntry {
   name: string;
@@ -69,6 +70,7 @@ export async function fsList(virtualPath: string): Promise<FsEntry[]> {
       { name: "tasks", kind: "dir" },
       { name: "flows", kind: "dir" },
       { name: "automations", kind: "dir" },
+      { name: "metrics", kind: "dir" },
     ];
   }
 
@@ -145,6 +147,11 @@ export async function fsList(virtualPath: string): Promise<FsEntry[]> {
     throw new FsNotFoundError(virtualPath);
   }
 
+  if (top === "metrics") {
+    if (rest.length === 0) return [{ name: "summary.json", kind: "file" }];
+    throw new FsNotFoundError(virtualPath);
+  }
+
   throw new FsNotFoundError(virtualPath);
 }
 
@@ -210,6 +217,15 @@ export async function fsRead(virtualPath: string): Promise<string> {
     const automation = await getAutomation(automationId);
     if (!automation) throw new FsNotFoundError(virtualPath);
     return JSON.stringify(automation, null, 2);
+  }
+
+  if (top === "metrics" && rest.length === 1 && rest[0] === "summary.json") {
+    // Whole-system snapshot (no agentId scoping) — a read-only
+    // projection over the same streams every other path in this
+    // namespace already reads, per this file's header. See
+    // observability.ts for exactly what's aggregated and how.
+    const snapshot = await computeMetricsSnapshot();
+    return JSON.stringify(snapshot, null, 2);
   }
 
   throw new FsNotFoundError(virtualPath);
