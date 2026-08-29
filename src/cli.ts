@@ -54,6 +54,7 @@ import {
   createRecordingModel,
   detectCliAgent,
   createClaudeCodeWorker,
+  computeMetricsSnapshot,
 } from "./core/index.js";
 
 const AGENT_ID = "demo-agent";
@@ -622,8 +623,61 @@ async function demoEventBusAndWebhooks(): Promise<void> {
   }
 }
 
+async function demoObservability(): Promise<void> {
+  section("9. Observability — real numbers, computed from the event log");
+  console.log(
+    "computeMetricsSnapshot() (src/core/observability.ts) is a pure read-side\n" +
+      "projection, same pattern as everything else in this scaffold: no new\n" +
+      "database, no counters incremented on write, just readStream()/project()\n" +
+      "replayed fresh over the tasks/automations/memory:*:dreaming/session:*\n" +
+      "streams every other primitive already writes to. It's also readable\n" +
+      "through the agent filesystem at /agent/metrics/summary.json.\n",
+  );
+
+  const snapshot = await computeMetricsSnapshot();
+  console.log(`Snapshot generated at ${snapshot.generatedAt} (scope: whole system, no agentId filter)\n`);
+
+  console.log("Tasks by status:");
+  for (const [status, count] of Object.entries(snapshot.tasks.byStatus)) {
+    console.log(`  ${status.padEnd(10)} ${count}`);
+  }
+  console.log(
+    `  total=${snapshot.tasks.total}  terminal=${snapshot.tasks.terminalTotal}  ` +
+      `successRate=${snapshot.tasks.successRate !== null ? (snapshot.tasks.successRate * 100).toFixed(1) + "%" : "n/a"}  ` +
+      `failureRate=${snapshot.tasks.failureRate !== null ? (snapshot.tasks.failureRate * 100).toFixed(1) + "%" : "n/a"}`,
+  );
+  console.log(`  subagent delegations (Task.type === "subagent"): ${snapshot.tasks.subagentDelegationCount}`);
+
+  console.log("\nAutomation fires by trigger kind:");
+  for (const [kind, count] of Object.entries(snapshot.automations.firesByTriggerKind)) {
+    console.log(`  ${kind.padEnd(10)} ${count}`);
+  }
+  console.log(`  registered=${snapshot.automations.registeredCount}  totalFired=${snapshot.automations.totalFired}`);
+
+  console.log("\nDreaming pass stats (across all agents with a dreaming stream):");
+  console.log(
+    `  passes=${snapshot.dreaming.totalPasses}  episodicEntriesReviewed=${snapshot.dreaming.totalEpisodicEntriesReviewed}  ` +
+      `promoted=${snapshot.dreaming.totalPromoted}  held=${snapshot.dreaming.totalHeld}  discarded=${snapshot.dreaming.totalDiscarded}`,
+  );
+  console.log(`  agents covered: ${snapshot.dreaming.agentsCovered.join(", ") || "(none)"}`);
+
+  console.log("\nAgent-loop turn latency (agent.turn.start -> agent.turn.end, ms):");
+  console.log(
+    `  samples=${snapshot.turnLatency.sampleCount}  ` +
+      `avg=${snapshot.turnLatency.avgMs !== null ? snapshot.turnLatency.avgMs.toFixed(2) + "ms" : "n/a"}  ` +
+      `min=${snapshot.turnLatency.minMs ?? "n/a"}ms  max=${snapshot.turnLatency.maxMs ?? "n/a"}ms`,
+  );
+
+  const viaFs = await fsRead("/agent/metrics/summary.json");
+  const parsed = JSON.parse(viaFs) as typeof snapshot;
+  console.log(
+    `\nSame numbers reachable via the agent filesystem: fsRead("/agent/metrics/summary.json")\n` +
+      `  -> tasks.total=${parsed.tasks.total}, dreaming.totalPasses=${parsed.dreaming.totalPasses} (matches computeMetricsSnapshot() directly above).`,
+  );
+}
+
 async function demoEventLogIsTruth(): Promise<void> {
-  section("9. Everything above is just an event log — proof");
+  section("10. Everything above is just an event log — proof");
   const streams = await listStreamIds();
   console.log(`${streams.length} streams on disk under data/streams/:`);
   for (const s of streams) {
@@ -786,6 +840,7 @@ async function main(): Promise<void> {
     await demoEventBusAndWebhooks();
     await demoPermissions();
     await demoAgentFilesystem(sessionId);
+    await demoObservability();
     await demoEventLogIsTruth();
     console.log("\nDone. Inspect ./data/streams/*.jsonl directly — it's all human-readable.\n");
     return;

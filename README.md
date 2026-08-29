@@ -47,6 +47,7 @@ independently — see `docs/architecture.md §0`.
 | Sandboxing / permission policy (two-layer) | ✅ working — Layer A (policy hook) + Layer B (sandboxed worker) | `src/core/permissions.ts` |
 | Agent filesystem namespace | ✅ working — read/write over paths (write supported for skills only; see below) | `src/core/agentfs.ts` |
 | **Agent identity (persona, defaultModel) actually affecting behavior** | ✅ working — persona injected into every turn's system message; defaultModel consulted during model selection | `src/core/identity.ts`, `src/core/agent-loop.ts`, `src/core/models/real.ts` |
+| Observability (metrics derived from the event log, no new store) | ✅ working — task success/failure rates, automation fires by trigger kind, dreaming pass stats, subagent delegation count, turn latency | `src/core/observability.ts` |
 
 The memory design directly answers "I want the agent to keep getting
 better with me, safely": episodic writes are immediate and ungated (same
@@ -901,6 +902,56 @@ and overwrite (not append) correctly; and `createModelForAgent()`
 resolves to `undefined` when no provider is credentialed regardless of a
 registered preference, matching rule 1 above.
 
+## Observability — metrics derived from the event log
+
+Per this scaffold's core design principle, there is **no separate
+metrics store**. `computeMetricsSnapshot(agentId?)` in
+`src/core/observability.ts` is a pure read-side projection — exactly
+like `getTask`, `getCuratedMemory`, or every other `project()` call in
+this codebase — that replays the SAME event streams every other
+primitive already reads and writes (`tasks`, `automations`,
+`memory:<agentId>:dreaming`, `session:<sessionId>`) and derives numbers
+fresh on every call. Nothing is incremented on write; delete the whole
+snapshot and recompute it from `data/streams/*.jsonl` and you get the
+exact same answer.
+
+Numbers exposed, and exactly how each is computed:
+
+| Field | Computed from |
+|---|---|
+| `tasks.byStatus` (queued/running/succeeded/failed/timed_out/cancelled/lost) | `listTasks()` (tasks.ts) over the `tasks` stream, tallied by current `TaskStatus` |
+| `tasks.successRate` / `tasks.failureRate` | `succeeded` / `failed` divided by the count of tasks that reached ANY terminal status (`null` until at least one task finishes, never a misleading `0`) |
+| `tasks.subagentDelegationCount` | count of `Task.type === "subagent"` — the same Tasks `subagent.ts`'s `spawnSubagentTask()` creates |
+| `automations.firesByTriggerKind` (cron/event/webhook) | every `automation.fired` event in the `automations` stream, joined against each automation's registered `trigger.kind` via `listAutomations()` |
+| `dreaming.totalPasses` / `totalEpisodicEntriesReviewed` / `totalPromoted` / `totalHeld` / `totalDiscarded` | every `memory.dreaming.completed` event across each agent's `memory:<agentId>:dreaming` stream, summing `DreamingPass.promotions[].decision` |
+| `turnLatency.avgMs` / `minMs` / `maxMs` / `sampleCount` | pairing each `agent.turn.start` with its following `agent.turn.end` in every `session:<sessionId>` stream and diffing their ISO timestamps (agent-loop.ts's `runTurn()` appends exactly one of each per call) |
+
+`agentId` is optional everywhere: omit it for a whole-system snapshot,
+or pass one to scope tasks/automations/dreaming/turn-latency to a
+single agent (automation fire counts naturally include only that
+agent's registered automations).
+
+The same snapshot is also reachable through the agent filesystem
+namespace above, read-only, at **`/agent/metrics/summary.json`**
+(`fsList("/agent")` now lists a `metrics/` entry alongside
+`tasks/`/`flows/`/etc.) — following `agentfs.ts`'s existing
+`fsList`/`fsRead` dispatch pattern exactly, no new code path.
+
+Verified end-to-end (not mocked) by `npm run test-observability`: it
+creates real Tasks across every terminal status plus two real
+`spawnSubagentTask()` delegations, registers and fires one real
+automation per trigger kind (`runSchedulerTick`, `fireEventAutomations`,
+`fireWebhookAutomations`), writes real episodic entries and runs two
+real `runDreamingPass()` calls (one promoted, one held, then a second
+pass proving the "reviewed every time, re-appended only once" audit
+behavior still shows up correctly in the aggregate), runs real
+`runTurn()` calls, and asserts `computeMetricsSnapshot()` — both called
+directly and read back through `fsRead("/agent/metrics/summary.json")`
+— reports the exact counts that actually landed in the event log (34
+assertions total). `npm run demo`'s "9. Observability" section then
+prints a live snapshot aggregated over everything the earlier demo
+sections generated.
+
 ## Repo layout
 
 ```
@@ -917,6 +968,7 @@ src/
     permissions.ts      # two-layer permission policy (hook) + sandbox (worker enforcement)
     identity.ts           # Agent identity store (name + persona) — persona now injected into runTurn()'s system message
     agentfs.ts              # /agent/... filesystem projection (read all paths, write skills only)
+    observability.ts          # read-only metrics projection over the event log (no new store)
     scheduler.ts              # cron parser + tick loop + event/webhook dispatch for Automations
     eventbus.ts                # minimal in-process pub/sub, wires event-triggered Automations
     webhook.ts                   # real local HTTP listener for webhook-triggered Automations
@@ -940,6 +992,7 @@ src/
   test-memory-v2.ts                        # standalone similarity/retrieval/nomination tests
   test-identity-wiring.ts                   # standalone persona-injection + defaultModel-wiring tests
   test-memory-embeddings.ts                 # standalone embedding-similarity + fallback tests
+  test-observability.ts                      # standalone end-to-end metrics-projection tests
 skills/
   commit-message-style/       # example skill: house style for git commits
     SKILL.md
