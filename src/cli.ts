@@ -4,8 +4,10 @@
 // API keys and zero external services. This is meant to be read top to
 // bottom as a tour of the architecture, not just executed.
 
+import * as readline from "node:readline";
 import {
   createStubModel,
+  createModelFromEnvOrOllama,
   createLocalShellWorker,
   createSandboxedWorker,
   createStubWorker,
@@ -31,6 +33,9 @@ import {
   installPermissionPolicy,
   DEFAULT_HARD_BLOCKLIST,
   type SandboxPolicy,
+  fsList,
+  fsRead,
+  registerAgentIdentity,
 } from "./core/index.js";
 
 const AGENT_ID = "demo-agent";
@@ -206,7 +211,7 @@ async function demoTasksAndFlows(): Promise<void> {
 }
 
 async function demoEventLogIsTruth(): Promise<void> {
-  section("6. Everything above is just an event log — proof");
+  section("7. Everything above is just an event log — proof");
   const streams = await listStreamIds();
   console.log(`${streams.length} streams on disk under data/streams/:`);
   for (const s of streams) {
@@ -274,6 +279,59 @@ async function demoPermissions(): Promise<void> {
   );
 }
 
+async function demoAgentFilesystem(sessionId: string): Promise<void> {
+  section("6. Agent filesystem — the same primitives, addressed as paths");
+  console.log(
+    "Read-only projection over everything above, per docs/architecture.md §7 —\n" +
+      "not a new storage layer, just a filesystem-shaped VIEW of the same event\n" +
+      "streams and skill files.\n",
+  );
+
+  const root = await fsList("/agent");
+  console.log(`ls /agent -> ${root.map((e) => e.name + (e.kind === "dir" ? "/" : "")).join("  ")}`);
+
+  await registerAgentIdentity({ id: AGENT_ID, name: "Demo Agent", persona: "A minimal demo agent for agent-os." });
+  const identityFiles = await fsList("/agent/identity");
+  console.log(`ls /agent/identity -> ${identityFiles.map((e) => e.name).join(", ")}`);
+  const identityJson = await fsRead(`/agent/identity/${AGENT_ID}.json`);
+  console.log(`cat /agent/identity/${AGENT_ID}.json -> ${identityJson.replace(/\s+/g, " ").slice(0, 100)}...`);
+
+  const skillDirs = await fsList("/agent/skills");
+  console.log(`ls /agent/skills -> ${skillDirs.map((e) => e.name).join(", ")}`);
+
+  const skillBody = await fsRead("/agent/skills/commit-message-style/SKILL.md");
+  console.log(`cat /agent/skills/commit-message-style/SKILL.md -> starts with: "${skillBody.slice(0, 60)}..."`);
+
+  const curated = await fsRead(`/agent/memory/${AGENT_ID}/curated/MEMORY.md`);
+  console.log(`\ncat /agent/memory/${AGENT_ID}/curated/MEMORY.md ->\n${curated.split("\n").slice(0, 4).join("\n")}`);
+
+  const episodicFiles = await fsList(`/agent/memory/${AGENT_ID}/episodic`);
+  console.log(`\nls /agent/memory/${AGENT_ID}/episodic -> ${episodicFiles.length} entries`);
+  if (episodicFiles[0]) {
+    const entry = await fsRead(`/agent/memory/${AGENT_ID}/episodic/${episodicFiles[0].name}`);
+    console.log(`cat .../episodic/${episodicFiles[0].name} -> ${entry.slice(0, 80)}...`);
+  }
+
+  const sessionFiles = await fsList("/agent/sessions");
+  console.log(`\nls /agent/sessions -> ${sessionFiles.length} session stream(s) on disk`);
+  const thisSessionFile = `session_${sessionId}.jsonl`;
+  const hasThisSession = sessionFiles.some((f) => f.name === thisSessionFile);
+  console.log(`  contains this run's session (${thisSessionFile})? ${hasThisSession}`);
+
+  const taskDirs = await fsList("/agent/tasks");
+  console.log(`\nls /agent/tasks -> ${taskDirs.length} task(s)`);
+  if (taskDirs[0]) {
+    const state = await fsRead(`/agent/tasks/${taskDirs[0].name}/state.json`);
+    console.log(`cat /agent/tasks/${taskDirs[0].name}/state.json -> ${state.replace(/\s+/g, " ").slice(0, 100)}...`);
+  }
+
+  try {
+    await fsRead("/agent/skills/does-not-exist/SKILL.md");
+  } catch (err) {
+    console.log(`\nReading a nonexistent path correctly throws: ${(err as Error).message}`);
+  }
+}
+
 async function main(): Promise<void> {
   const cmd = process.argv[2] ?? "demo";
 
@@ -283,13 +341,82 @@ async function main(): Promise<void> {
     await demoMemory(sessionId);
     await demoTasksAndFlows();
     await demoPermissions();
+    await demoAgentFilesystem(sessionId);
     await demoEventLogIsTruth();
     console.log("\nDone. Inspect ./data/streams/*.jsonl directly — it's all human-readable.\n");
     return;
   }
 
-  console.log(`Unknown command: ${cmd}. Try: npm run demo`);
+  if (cmd === "chat") {
+    await runChat();
+    return;
+  }
+
+  console.log(`Unknown command: ${cmd}. Try: npm run demo, npm run chat`);
   process.exitCode = 1;
+}
+
+async function runChat(): Promise<void> {
+  const model = (await createModelFromEnvOrOllama()) ?? createStubModel();
+  console.log(`Using model: ${model.id}`);
+  if (model.id === "stub-model") {
+    console.log(
+      "(No ANTHROPIC_TOKEN/ANTHROPIC_API_KEY/OPENAI_API_KEY set and Ollama not reachable —\n" +
+        " falling back to the deterministic stub model. Try phrases like:\n" +
+        "   run shell: echo hello\n" +
+        "   load skill: commit-message-style\n" +
+        " Set an API key or run `ollama serve` for a real model.)",
+    );
+  }
+
+  const skills = await SkillRegistry.fromDirectory("skills");
+  const rawWorker = createLocalShellWorker();
+  const sandboxPolicy: SandboxPolicy = {
+    filesystemScope: "workspace-only",
+    workspaceRoot: process.cwd(),
+    hardBlocklist: DEFAULT_HARD_BLOCKLIST,
+  };
+  const worker = createSandboxedWorker(rawWorker, sandboxPolicy);
+
+  const sessionId = newSessionId();
+  console.log(`Session: ${sessionId}`);
+  console.log(`Skills loaded: ${skills.listMetadata().map((s) => s.name).join(", ") || "(none)"}`);
+  console.log("Type a message and press Enter. Type 'exit' or Ctrl+C to quit.\n");
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: "you> " });
+  rl.prompt();
+
+  rl.on("line", async (line) => {
+    const text = line.trim();
+    if (text === "exit" || text === "quit") {
+      rl.close();
+      return;
+    }
+    if (text.length === 0) {
+      rl.prompt();
+      return;
+    }
+    try {
+      const result = await runTurn({
+        sessionId,
+        agentId: AGENT_ID,
+        userMessage: text,
+        model,
+        worker,
+        skills,
+      });
+      console.log(`agent> ${result.finalContent}`);
+      if (result.toolCalled) console.log(`  (used tool: ${result.toolCalled})`);
+    } catch (err) {
+      console.error("error:", err instanceof Error ? err.message : err);
+    }
+    rl.prompt();
+  });
+
+  rl.on("close", () => {
+    console.log(`\nSession ended. Inspect ./data/streams/session_${sessionId}.jsonl for the full transcript.`);
+    process.exit(0);
+  });
 }
 
 main().catch((err) => {

@@ -42,7 +42,7 @@ independently — see `docs/architecture.md §0`.
 | Standing Order (deliberately NOT a data object) | 📝 documented only | `docs/architecture.md §2` |
 | Skills (agentskills.io-compatible format) | ✅ working — parser, discovery, progressive disclosure | `src/core/skills.ts`, `skills/*/SKILL.md` |
 | Sandboxing / permission policy (two-layer) | ✅ working — Layer A (policy hook) + Layer B (sandboxed worker) | `src/core/permissions.ts` |
-| Agent filesystem namespace | ⬜ not started | — |
+| Agent filesystem namespace | ✅ working — read-only projection over paths (skills/memory/sessions/tasks/flows/automations) | `src/core/agentfs.ts` |
 
 The memory design directly answers "I want the agent to keep getting
 better with me, safely": episodic writes are immediate and ungated (same
@@ -81,7 +81,21 @@ Other commands:
 ```bash
 npm run typecheck   # tsc --noEmit
 npm run build        # tsc -b -> dist/
+npm run chat          # interactive REPL — talk to a real agent-loop session
 ```
+
+## Interactive chat (`npm run chat`)
+
+The demo above is scripted and non-interactive. `npm run chat` starts a
+real interactive session against a real agent loop — same code path,
+same skills, same sandboxed worker, just driven by you instead of a
+script. It picks a model with the same priority order as
+`test-live-model` (Anthropic/OpenAI env var, then local Ollama, then the
+deterministic stub as a last resort) and runs every message through the
+sandboxed local-shell worker with the hard blocklist active. Set
+`OLLAMA_MODEL` to override the default if you have something other than
+`llama3.2` pulled locally. Every turn is written to that session's event
+stream under `data/streams/`, same as the demo.
 
 ## Testing a real model adapter (not the stub)
 
@@ -169,6 +183,31 @@ real container). That's an intentional "prove the layer separation first"
 choice — see `docs/architecture.md §6` for what a production sandbox
 needs on top of this.
 
+## Agent filesystem namespace — the same primitives, addressed as paths
+
+Per `docs/architecture.md §7`: a read-only projection that exposes
+everything above as a virtual `/agent/...` filesystem, e.g.
+`/agent/identity/<agentId>.json`, `/agent/skills/<name>/SKILL.md`,
+`/agent/memory/<agentId>/curated/MEMORY.md`,
+`/agent/sessions/<sessionId>.jsonl`, `/agent/tasks/<taskId>/state.json`.
+This is deliberately **not a new storage layer** — every path is a VIEW
+over the exact same event-log streams and skill files the rest of this
+scaffold already writes, using the same "everything is a projection"
+principle from the top of this README, just applied to a filesystem-
+shaped API (`fsList`/`fsRead` in `agentfs.ts`) instead of an event-log-
+shaped one.
+
+Write operations through this namespace are intentionally NOT
+implemented — mapping a raw file write back onto event-log semantics
+(an appended event? a new event type?) is a real design question, not
+something to paper over with a fake write that doesn't actually persist
+correctly.
+
+`npm run demo`'s "6. Agent filesystem" section walks every path kind
+(skills, curated + episodic memory, sessions, tasks) against the exact
+data the earlier demo sections just wrote, and confirms a nonexistent
+path throws rather than returning something misleading.
+
 ## Repo layout
 
 ```
@@ -182,7 +221,9 @@ src/
     hooks.ts          # deterministic lifecycle hooks, harness-run not model-run
     skills.ts          # agentskills.io SKILL.md parser + progressive-disclosure registry
     permissions.ts      # two-layer permission policy (hook) + sandbox (worker enforcement)
-    worker.ts             # execution-environment interface (local-shell, stub, sandboxed wrapper)
+    identity.ts           # minimal Agent identity store (name + persona), backs /agent/identity
+    agentfs.ts              # read-only /agent/... filesystem projection over everything above
+    worker.ts                 # execution-environment interface (local-shell, stub, sandboxed wrapper)
     model.ts             # swappable LLM adapter interface (stub adapter shipped)
     models/real.ts        # real Anthropic / OpenAI / Ollama adapters
     agent-loop.ts          # the turn loop binding all of the above together
