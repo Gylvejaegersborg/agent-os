@@ -18,6 +18,7 @@
     "test-subagent": "tsc -b && node dist/test-subagent.js",
     "test-memory": "tsc -b && node dist/test-memory.js",
     "test-memory-v2": "tsc -b && node dist/test-memory-v2.js",
+    "test-memory-embeddings": "tsc -b && node dist/test-memory-embeddings.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {
