@@ -36,6 +36,7 @@ independently — see `docs/architecture.md §0`.
 | Model abstraction (swappable adapter interface) | ✅ working — stub + real Anthropic/OpenAI/Ollama adapters | `src/core/model.ts`, `src/core/models/real.ts` |
 | Worker abstraction (execution environment, separate from Agent identity) | ✅ working (local-shell + stub) | `src/core/worker.ts` |
 | Task / Flow (OpenClaw's ledger + orchestration split, with optimistic-concurrency revisioning) | ✅ working | `src/core/tasks.ts` |
+| Subagent delegation (in-process, isolated context, same harness) | ✅ working — cross-harness delegation (Claude Code/Codex as a child process) is planned, not built | `src/core/subagent.ts` |
 | Automation registry + scheduler (cron tick loop + event bus + webhooks) | ✅ working — all three trigger kinds fire for real | `src/core/scheduler.ts`, `src/core/eventbus.ts`, `src/core/webhook.ts` |
 | Heartbeat (imprecise timing, full main-session context, no Task created) | ✅ working | `src/core/heartbeat.ts` |
 | **Memory: fast-path episodic + gated "dreaming" promotion** | ✅ working | `src/core/memory.ts` |
@@ -184,6 +185,73 @@ real container). That's an intentional "prove the layer separation first"
 choice — see `docs/architecture.md §6` for what a production sandbox
 needs on top of this.
 
+## Subagent — delegating within the same harness
+
+A NEW isolated agent-loop run inside the SAME process, using this
+harness's own tools/model/skills/permissions — not a call to a
+different product. This is the Claude Code model of delegation, not
+the DeepSeek Harness model: `spawnSubagentTask()` (`src/core/subagent.ts`)
+just calls this scaffold's own `runTurn()` again with a fresh
+`newSessionId()`. No second application, no external process, no extra
+install — the parent and the subagent are the exact same running
+program.
+
+**The defining property (matching Claude Code's own "context
+isolation" design)**: the parent never sees the subagent's own tool-call
+noise, intermediate reasoning, or session history — only the final
+result crosses back. This is why `spawnSubagentTask()` gives the
+subagent its own `sessionId` rather than reusing the parent's; dumping
+the child's full transcript into the parent's context would defeat the
+entire point.
+
+Every subagent run creates a real `Task` (`type: "subagent"`,
+`parentTaskId` set) in the exact same ledger every other Task-creating
+primitive in this scaffold uses — `listTasks({ parentTaskId })` answers
+"what did my subagents do" the same way it would for any other Task
+relationship, no bespoke tracking structure needed.
+
+Delegation is exposed to the model itself as a real tool: pass
+`enableSubagents: true` to `runTurn()` and the model can call the
+`subagent` tool with `{ goal }` mid-conversation. It's opt-in per call
+(not a global default) specifically to avoid uncontrolled fan-out —
+a subagent run itself does not automatically get `enableSubagents`
+passed through, so subagents don't recursively spawn further subagents
+unless you deliberately wire that up.
+
+**What this is NOT (yet)**: a way to shell out to a *different* agent
+product (Claude Code, Codex, etc.) as a child process. That's a
+separate, genuinely optional primitive — cross-harness delegation,
+modeled on DeepSeek Harness's proof that "spawn a different harness
+entirely as the child" is trivial once delegation is a protocol
+boundary rather than an internal function call. It would mean a new
+`WorkerKind` (e.g. `"acp:claude-code"`) that shells out to an installed
+CLI and adapts its output back into this scaffold's `WorkerResult`
+shape — useful for "use Codex specifically for this coding task because
+it's better at it," but it requires the other CLI to be installed and
+runnable, adds subprocess overhead, and is NOT a prerequisite for
+subagents to work at all. Planned, not built — see
+`docs/architecture.md`'s Worker section for the design intent.
+
+Verified with `npm run test-subagent` (9 assertions: the spawned Task
+has `type: "subagent"` and the right `parentTaskId`, `listTasks({
+parentTaskId })` finds it, the parent session sees the subagent's
+result but has no direct handle into the child's own session, and
+`enableSubagents` is genuinely opt-in — omitting it rejects the
+`subagent` tool call rather than silently working) plus `npm run
+demo`'s "1c. Subagent" section, which runs the delegation through the
+real agent loop end to end (not just calling `spawnSubagentTask()`
+directly) and prints the resulting Task id, parent session message
+count, and the gated-rejection case side by side.
+
+Found and fixed a real bug while building this: the deterministic stub
+model's pattern matching checked `run shell:` before `delegate to
+subagent:`, and since both are unanchored substring tests, a message
+like `"delegate to subagent: run shell: echo hi"` matched `run shell:`
+first and called the shell tool directly instead of delegating —
+caught immediately by the demo section showing an unexpected shell call
+instead of a subagent call; fixed by checking the more specific pattern
+first.
+
 ## Scheduler — Automations that actually fire
 
 Per `docs/architecture.md §2`'s "two scheduling modes" note. Both modes
@@ -250,9 +318,10 @@ and a non-JSON body doesn't crash the handler), plus `npm run demo`'s
 sections, which exercise all of it against real data side by side.
 
 **Note on test isolation**: the standalone test scripts (`test-cron`,
-`test-eventbus`, `test-webhook`, `test-skills-write`, `test-heartbeat`)
-all share the same `./data/` event-log directory as `npm run demo` —
-none of them reset it first. Running `npm run demo` and then a test
+`test-eventbus`, `test-webhook`, `test-skills-write`, `test-heartbeat`,
+`test-subagent`) all share the same `./data/` event-log directory as
+`npm run demo` — none of them reset it first. Running `npm run demo`
+and then a test
 script back to back can leave leftover Automations registered from the
 demo that make a test's own assertions (e.g. "exactly one automation
 fired") fail with a confusing count mismatch, even though nothing is
@@ -318,7 +387,8 @@ src/
     eventbus.ts                # minimal in-process pub/sub, wires event-triggered Automations
     webhook.ts                   # real local HTTP listener for webhook-triggered Automations
     heartbeat.ts                   # the OTHER scheduling mode: imprecise timing, full session context
-    worker.ts                        # execution-environment interface (local-shell, stub, sandboxed wrapper)
+    subagent.ts                      # in-process delegation to a fresh, isolated agent-loop run
+    worker.ts                          # execution-environment interface (local-shell, stub, sandboxed wrapper)
     model.ts             # swappable LLM adapter interface (stub adapter shipped)
     models/real.ts        # real Anthropic / OpenAI / Ollama adapters
     agent-loop.ts          # the turn loop binding all of the above together
@@ -329,6 +399,7 @@ src/
   test-webhook.ts                # standalone webhook listener tests (real HTTP server)
   test-skills-write.ts             # standalone skills write/round-trip tests
   test-heartbeat.ts                  # standalone Heartbeat scheduling-mode tests
+  test-subagent.ts                     # standalone Subagent context-isolation tests
 skills/
   commit-message-style/       # example skill: house style for git commits
     SKILL.md

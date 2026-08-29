@@ -40,6 +40,19 @@ export function createStubModel(id = "stub-model"): ModelAdapter {
       const lastUser = [...messages].reverse().find((m) => m.role === "user");
       const text = lastUser?.content ?? "";
 
+      // Order matters here: check the MOST SPECIFIC/prefixed patterns
+      // first, since these are unanchored substring tests (text.test()),
+      // not "starts with" checks. "delegate to subagent: run shell: ..."
+      // contains BOTH "run shell:" and "delegate to subagent:" as
+      // substrings — checking "run shell:" first would wrongly match a
+      // delegation message and call the shell tool directly instead of
+      // delegating. This exact bug was caught by the "1c. Subagent" demo
+      // section showing an unexpected shell tool call instead of a
+      // subagent call — fixed by moving the more specific pattern first.
+      if (/delegate\s+to\s+subagent:/i.test(text)) {
+        const goal = text.replace(/.*delegate\s+to\s+subagent:/i, "").trim();
+        return { content: `Delegating to a subagent: ${goal}`, toolCall: { name: "subagent", args: { goal } } };
+      }
       if (/run\s+shell:/i.test(text)) {
         const command = text.replace(/.*run\s+shell:/i, "").trim();
         return { content: `Running: ${command}`, toolCall: { name: "shell", args: { command } } };

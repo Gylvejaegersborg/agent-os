@@ -45,6 +45,7 @@ import {
   startWebhookServer,
   runHeartbeatTick,
   getSessionHistory,
+  spawnSubagentTask,
 } from "./core/index.js";
 
 const AGENT_ID = "demo-agent";
@@ -120,6 +121,67 @@ async function demoSkills(sessionId: string, skills: SkillRegistry): Promise<voi
     .find((e) => e.type === "session.message" && (e.payload as any).role === "tool");
   const bodyPreview = String((toolResult?.payload as any)?.content ?? "").slice(0, 90);
   console.log(`Full SKILL.md body was loaded on demand (layer 2), starts with:\n  "${bodyPreview}..."`);
+}
+
+async function demoSubagent(): Promise<void> {
+  section("1c. Subagent — delegating a focused sub-task, same harness");
+  console.log(
+    "In-process delegation, NOT a call to another product (Claude Code, Codex,\n" +
+      "etc.) — see docs/architecture.md and subagent.ts's header for why that's a\n" +
+      "deliberately separate, still-optional primitive. The defining property\n" +
+      "(matching Claude Code's own 'context isolation' design): the PARENT never\n" +
+      "sees the subagent's own tool-call noise, only its final result.\n",
+  );
+
+  const model = createStubModel();
+  const worker = createStubWorker();
+  const parentSessionId = newSessionId();
+
+  console.log("Parent does its own work first...");
+  await runTurn({
+    sessionId: parentSessionId,
+    agentId: AGENT_ID,
+    userMessage: "run shell: echo parent doing its own work",
+    model,
+    worker,
+    enableSubagents: true,
+  });
+
+  console.log("...then delegates a focused sub-task to an isolated subagent:");
+  const delegateResult = await runTurn({
+    sessionId: parentSessionId,
+    agentId: AGENT_ID,
+    userMessage: "delegate to subagent: run shell: echo hello from an isolated child",
+    model,
+    worker,
+    enableSubagents: true,
+  });
+  console.log(`Parent's turn result: "${delegateResult.finalContent}"`);
+
+  const subagentTasks = (await listTasks({ agentId: AGENT_ID, status: "succeeded" })).filter((t) => t.type === "subagent");
+  const latestSubagentTask = subagentTasks[subagentTasks.length - 1];
+  console.log(
+    `\nA real Task was created for the delegation: id=${latestSubagentTask?.id}, ` +
+      `type="${latestSubagentTask?.type}" — same ledger every other Task-creating\nprimitive in this scaffold uses (listTasks({ parentTaskId }) would find its children).`,
+  );
+
+  const parentHistory = await getSessionHistory(parentSessionId);
+  console.log(
+    `\nParent session has ${parentHistory.length} messages total — it sees the subagent's\n` +
+      "RESULT (above) but never touched the child's own isolated session stream directly.",
+  );
+
+  console.log("\nWithout enableSubagents, delegation is rejected rather than silently working:");
+  const gatedSessionId = newSessionId();
+  const gatedResult = await runTurn({
+    sessionId: gatedSessionId,
+    agentId: AGENT_ID,
+    userMessage: "delegate to subagent: this should be rejected",
+    model,
+    worker,
+    // enableSubagents intentionally omitted
+  });
+  console.log(`Result: "${gatedResult.finalContent}"`);
 }
 
 
@@ -532,6 +594,7 @@ async function main(): Promise<void> {
   if (cmd === "demo") {
     const { sessionId, skills } = await demoAgentLoop();
     await demoSkills(sessionId, skills);
+    await demoSubagent();
     await demoMemory(sessionId);
     await demoTasksAndFlows();
     await demoScheduler();

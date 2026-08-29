@@ -32,6 +32,14 @@ export interface RunTurnOptions {
    *  then request the `skill` tool to load a specific skill's full body
    *  (layer 2). */
   skills?: SkillRegistry;
+  /** When provided, the model can call the `subagent` tool to delegate a
+   *  focused sub-task to a fresh, isolated agent-loop session — same
+   *  harness, same tools, own context window (see subagent.ts). Omit to
+   *  disable delegation for this turn (e.g. a subagent run itself
+   *  typically shouldn't recursively spawn more subagents unless you
+   *  specifically want that — pass it through deliberately, not by
+   *  default, to avoid uncontrolled fan-out). */
+  enableSubagents?: boolean;
 }
 
 function sessionStream(sessionId: string): string {
@@ -55,7 +63,7 @@ interface ToolDispatchResult {
 
 async function dispatchTool(
   toolCall: { name: string; args: Record<string, unknown> },
-  ctx: { worker: Worker; skills?: SkillRegistry; agentId: string; sessionId: string },
+  ctx: { worker: Worker; skills?: SkillRegistry; agentId: string; sessionId: string; model: ModelAdapter; enableSubagents?: boolean },
 ): Promise<ToolDispatchResult> {
   if (toolCall.name === "shell") {
     return ctx.worker.run(String(toolCall.args.command));
@@ -68,11 +76,33 @@ async function dispatchTool(
       ? { ok: true, output: body }
       : { ok: false, output: "", error: `no such skill: ${skillName}` };
   }
+  if (toolCall.name === "subagent") {
+    if (!ctx.enableSubagents) {
+      return { ok: false, output: "", error: "subagent delegation is not enabled for this session" };
+    }
+    // Dynamic import avoids a circular top-level import: subagent.ts
+    // itself imports runTurn from this file. Since this is only resolved
+    // at call time (not module-init time), the cycle never actually
+    // matters at runtime.
+    const { spawnSubagentTask } = await import("./subagent.js");
+    const goal = String(toolCall.args.goal ?? "");
+    if (!goal) return { ok: false, output: "", error: "subagent tool call missing required 'goal' argument" };
+    const result = await spawnSubagentTask({
+      agentId: ctx.agentId,
+      goal,
+      model: ctx.model,
+      worker: ctx.worker,
+      skills: ctx.skills,
+      // Subagents don't recursively spawn further subagents by default —
+      // see enableSubagents's own doc comment for why.
+    });
+    return { ok: true, output: result.finalContent };
+  }
   return { ok: false, output: "", error: `unknown tool: ${toolCall.name}` };
 }
 
 export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
-  const { sessionId, agentId, userMessage, model, worker, skills } = opts;
+  const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents } = opts;
   const maxHops = opts.maxToolHops ?? 3;
 
   await appendEvent(sessionStream(sessionId), "agent.turn.start", { agentId, userMessage });
@@ -87,8 +117,12 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   while (hops < maxHops) {
     const history = await getSessionHistory(sessionId);
     const catalogText = skills ? renderSkillCatalog(skills.listMetadata()) : "";
-    const messages: ModelMessage[] = catalogText
-      ? [{ role: "system", content: catalogText }, ...history]
+    const subagentText = enableSubagents
+      ? "You can delegate a focused sub-task to an isolated subagent by calling the `subagent` tool with {goal}. The subagent runs independently and only its final result returns to you — its own reasoning and tool calls stay isolated."
+      : "";
+    const systemParts = [catalogText, subagentText].filter(Boolean);
+    const messages: ModelMessage[] = systemParts.length
+      ? [{ role: "system", content: systemParts.join("\n\n") }, ...history]
       : history;
     const response = await model.complete(messages);
 
@@ -109,7 +143,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       }
 
       await appendEvent(sessionStream(sessionId), "tool.call.start", response.toolCall);
-      const result = await dispatchTool(response.toolCall, { worker, skills, agentId, sessionId });
+      const result = await dispatchTool(response.toolCall, { worker, skills, agentId, sessionId, model, enableSubagents });
       await appendEvent(sessionStream(sessionId), "tool.call.end", { ...response.toolCall, result });
       await fireHook("tool.after", { agentId, sessionId, payload: { ...response.toolCall, result } });
 

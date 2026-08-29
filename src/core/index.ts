@@ -12,6 +12,7 @@ export * from "./scheduler.js";
 export * from "./eventbus.js";
 export * from "./webhook.js";
 export * from "./heartbeat.js";
+export * from "./subagent.js";
 export * from "./worker.js";
 export * from "./model.js";
 export * from "./models/real.js";

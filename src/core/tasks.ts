@@ -79,11 +79,12 @@ export async function getTask(taskId: string): Promise<Task | undefined> {
   return tasks.get(taskId);
 }
 
-export async function listTasks(filter?: { agentId?: string; status?: TaskStatus }): Promise<Task[]> {
+export async function listTasks(filter?: { agentId?: string; status?: TaskStatus; parentTaskId?: string }): Promise<Task[]> {
   const { tasks } = await projectTasks();
   let list = [...tasks.values()];
   if (filter?.agentId) list = list.filter((t) => t.agentId === filter.agentId);
   if (filter?.status) list = list.filter((t) => t.status === filter.status);
+  if (filter?.parentTaskId) list = list.filter((t) => t.parentTaskId === filter.parentTaskId);
   return list.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
