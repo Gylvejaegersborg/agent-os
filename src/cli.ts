@@ -7,6 +7,8 @@
 import {
   createStubModel,
   createLocalShellWorker,
+  createSandboxedWorker,
+  createStubWorker,
   runTurn,
   newSessionId,
   writeEpisodic,
@@ -26,6 +28,9 @@ import {
   listStreamIds,
   readStream,
   SkillRegistry,
+  installPermissionPolicy,
+  DEFAULT_HARD_BLOCKLIST,
+  type SandboxPolicy,
 } from "./core/index.js";
 
 const AGENT_ID = "demo-agent";
@@ -201,7 +206,7 @@ async function demoTasksAndFlows(): Promise<void> {
 }
 
 async function demoEventLogIsTruth(): Promise<void> {
-  section("5. Everything above is just an event log — proof");
+  section("6. Everything above is just an event log — proof");
   const streams = await listStreamIds();
   console.log(`${streams.length} streams on disk under data/streams/:`);
   for (const s of streams) {
@@ -215,6 +220,60 @@ async function demoEventLogIsTruth(): Promise<void> {
   );
 }
 
+async function demoPermissions(): Promise<void> {
+  section("5. Permissions / Sandbox — two separate layers, proven separately");
+
+  // --- Layer A: PermissionPolicy — pre-execution, model-input-based ---
+  console.log("Layer A (PermissionPolicy): a policy that denies 'forbidden-tool' but allows 'shell'.\n");
+  const policyAgentId = "permissions-demo-agent";
+  installPermissionPolicy({
+    agentId: policyAgentId,
+    rules: [
+      { tool: "forbidden-tool", decision: "deny" },
+      { tool: "shell", decision: "allow" },
+      { tool: "skill", decision: "allow" },
+    ],
+  });
+
+  const sessionA = newSessionId();
+  const rA = await runTurn({
+    sessionId: sessionA,
+    agentId: policyAgentId,
+    userMessage: "use forbidden-tool",
+    model: createStubModel(),
+    worker: createStubWorker(),
+  });
+  console.log(`Attempted a denied tool -> result: "${rA.finalContent}"`);
+  console.log("(The model's request never reached the Worker at all — blocked at the hook layer.)");
+
+  // --- Layer B: SandboxPolicy — enforced by the Worker itself ---
+  console.log(
+    "\nLayer B (SandboxPolicy): a hard blocklist that holds regardless of what the\n" +
+      "model claims — even if a permission policy would have allowed it.",
+  );
+  const sandboxPolicy: SandboxPolicy = {
+    filesystemScope: "workspace-only",
+    workspaceRoot: process.cwd(),
+    hardBlocklist: DEFAULT_HARD_BLOCKLIST,
+  };
+  const dangerousWorker = createSandboxedWorker(createLocalShellWorker(), sandboxPolicy);
+
+  const dangerousResult = await dangerousWorker.run("rm -rf /");
+  console.log(`Attempted 'rm -rf /' directly against the sandboxed worker:`);
+  console.log(`  ok=${dangerousResult.ok}  error="${dangerousResult.error}"`);
+
+  const safeResult = await dangerousWorker.run("echo this command is fine");
+  console.log(`\nA harmless command through the same sandboxed worker still works:`);
+  console.log(`  ok=${safeResult.ok}  output="${safeResult.output.trim()}"`);
+
+  console.log(
+    "\nNote the distinction: Layer A stopped a NAMED tool the model asked for.\n" +
+      "Layer B stopped a DANGEROUS COMMAND regardless of which tool or policy\n" +
+      "was involved — this is what 'holds regardless of what the model chose\n" +
+      "to run' means in practice (see docs/architecture.md §6).",
+  );
+}
+
 async function main(): Promise<void> {
   const cmd = process.argv[2] ?? "demo";
 
@@ -223,6 +282,7 @@ async function main(): Promise<void> {
     await demoSkills(sessionId, skills);
     await demoMemory(sessionId);
     await demoTasksAndFlows();
+    await demoPermissions();
     await demoEventLogIsTruth();
     console.log("\nDone. Inspect ./data/streams/*.jsonl directly — it's all human-readable.\n");
     return;

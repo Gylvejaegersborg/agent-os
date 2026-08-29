@@ -41,7 +41,7 @@ independently — see `docs/architecture.md §0`.
 | Hooks (deterministic, harness-run, decision vs. observe-only) | ✅ working | `src/core/hooks.ts` |
 | Standing Order (deliberately NOT a data object) | 📝 documented only | `docs/architecture.md §2` |
 | Skills (agentskills.io-compatible format) | ✅ working — parser, discovery, progressive disclosure | `src/core/skills.ts`, `skills/*/SKILL.md` |
-| Sandboxing / permission policy (two-layer) | ⬜ not started | — |
+| Sandboxing / permission policy (two-layer) | ✅ working — Layer A (policy hook) + Layer B (sandboxed worker) | `src/core/permissions.ts` |
 | Agent filesystem namespace | ⬜ not started | — |
 
 The memory design directly answers "I want the agent to keep getting
@@ -136,6 +136,39 @@ Two example skills ship in `./skills/` and are loaded automatically by
 `description`, etc.) are skipped with a warning rather than failing
 discovery for the whole catalog.
 
+## Permissions & Sandboxing — two deliberately separate layers
+
+Per `docs/architecture.md §6` (Claude Code's own articulation of this is
+the clearest across every harness studied): **permission rules can be
+circumvented by a misleading command string, but a sandbox boundary holds
+regardless of what the model chose to run.** This scaffold keeps the two
+genuinely separate rather than conflating them into one "safety" concept:
+
+- **Layer A — `PermissionPolicy`** (`installPermissionPolicy` in
+  `permissions.ts`): pre-execution, model-input-based. Evaluated as a
+  `tool.before` hook — decides allow/ask/deny from the tool *name* the
+  model requested. Gameable by design: a model that names a tool
+  correctly but sends malicious args can still slip past this layer alone.
+- **Layer B — `SandboxPolicy`** (`createSandboxedWorker` in `worker.ts`):
+  enforced by the Worker itself, at the point of actual execution,
+  independent of any upstream policy decision. Ships with a small
+  hardline blocklist (`DEFAULT_HARD_BLOCKLIST`) mirroring Hermes' own
+  non-overridable blocklist floor — patterns like a root filesystem wipe
+  are rejected no matter what tool or policy was involved.
+
+`npm run demo`'s "5. Permissions / Sandbox" section proves both layers
+independently: a named tool denied at the hook layer (never reaches the
+Worker at all), and a dangerous command rejected at the Worker layer even
+when called directly with no permission policy in the way — while a
+harmless command through that same sandboxed Worker still succeeds.
+
+**Known scaffold limitation** (documented, not hidden): the current
+`checkSandbox` filesystem-scope check is a simple pattern match (`../`
+detection), not an OS-level enforcement boundary (Landlock, Seatbelt, a
+real container). That's an intentional "prove the layer separation first"
+choice — see `docs/architecture.md §6` for what a production sandbox
+needs on top of this.
+
 ## Repo layout
 
 ```
@@ -148,7 +181,8 @@ src/
     memory.ts         # episodic fast-path + dreaming promotion pipeline
     hooks.ts          # deterministic lifecycle hooks, harness-run not model-run
     skills.ts          # agentskills.io SKILL.md parser + progressive-disclosure registry
-    worker.ts           # execution-environment interface (local-shell, stub)
+    permissions.ts      # two-layer permission policy (hook) + sandbox (worker enforcement)
+    worker.ts             # execution-environment interface (local-shell, stub, sandboxed wrapper)
     model.ts             # swappable LLM adapter interface (stub adapter shipped)
     models/real.ts        # real Anthropic / OpenAI / Ollama adapters
     agent-loop.ts          # the turn loop binding all of the above together

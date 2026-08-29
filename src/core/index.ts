@@ -5,6 +5,7 @@ export * from "./tasks.js";
 export * from "./memory.js";
 export * from "./hooks.js";
 export * from "./skills.js";
+export * from "./permissions.js";
 export * from "./worker.js";
 export * from "./model.js";
 export * from "./models/real.js";

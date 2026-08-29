@@ -6,6 +6,8 @@
 // future WorkerKind can be "acp:claude-code" or "acp:codex" without
 // touching anything that calls run().
 
+import { checkSandbox, type SandboxPolicy } from "./permissions.js";
+
 export interface WorkerResult {
   ok: boolean;
   output: string;
@@ -47,6 +49,28 @@ export function createStubWorker(id = "stub", canned: WorkerResult = { ok: true,
     kind: "stub",
     async run(_command: string): Promise<WorkerResult> {
       return canned;
+    },
+  };
+}
+
+/** The Layer-B enforcement point: wraps a real (or stub) Worker so every
+ *  command is checked against a SandboxPolicy BEFORE execution, regardless
+ *  of what any upstream permission policy (Layer A, permissions.ts)
+ *  already decided. This is deliberately a separate wrapper rather than
+ *  logic baked into createLocalShellWorker — sandboxing should hold no
+ *  matter which underlying Worker kind you're wrapping (local shell,
+ *  docker, ssh, ...), and wrapping makes that composability explicit
+ *  instead of duplicating the check into every Worker implementation. */
+export function createSandboxedWorker(inner: Worker, policy: SandboxPolicy): Worker {
+  return {
+    id: `sandboxed:${inner.id}`,
+    kind: `sandboxed:${inner.kind}`,
+    async run(command: string): Promise<WorkerResult> {
+      const check = checkSandbox(policy, command);
+      if (!check.allowed) {
+        return { ok: false, output: "", error: `sandbox rejected command: ${check.reason}` };
+      }
+      return inner.run(command);
     },
   };
 }

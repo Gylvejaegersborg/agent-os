@@ -48,6 +48,9 @@ export function createStubModel(id = "stub-model"): ModelAdapter {
         const name = text.replace(/.*load\s+skill:/i, "").trim();
         return { content: `Loading skill: ${name}`, toolCall: { name: "skill", args: { name } } };
       }
+      if (/use\s+forbidden-tool/i.test(text)) {
+        return { content: "Attempting forbidden-tool", toolCall: { name: "forbidden-tool", args: {} } };
+      }
       return { content: `[stub-model] acknowledged: ${text.slice(0, 120)}` };
     },
   };
