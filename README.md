@@ -36,7 +36,8 @@ independently — see `docs/architecture.md §0`.
 | Model abstraction (swappable adapter interface) | ✅ working — stub + real Anthropic/OpenAI/Ollama adapters | `src/core/model.ts`, `src/core/models/real.ts` |
 | Worker abstraction (execution environment, separate from Agent identity) | ✅ working (local-shell + stub) | `src/core/worker.ts` |
 | Task / Flow (OpenClaw's ledger + orchestration split, with optimistic-concurrency revisioning) | ✅ working | `src/core/tasks.ts` |
-| Subagent delegation (in-process, isolated context, same harness) | ✅ working — cross-harness delegation (Claude Code/Codex as a child process) is planned, not built | `src/core/subagent.ts` |
+| Subagent delegation (in-process, isolated context, same harness) | ✅ working — PRIMARY/default multiagent mechanism | `src/core/subagent.ts` |
+| Cross-harness delegation (shell out to Claude Code/Codex/OpenCode CLI as a child process) | ✅ implemented — OPTIONAL, opt-in, NOT the default; live-verification status varies by machine (see below) | `src/core/cli-agent-worker.ts` |
 | Automation registry + scheduler (cron tick loop + event bus + webhooks) | ✅ working — all three trigger kinds fire for real | `src/core/scheduler.ts`, `src/core/eventbus.ts`, `src/core/webhook.ts` |
 | Heartbeat (imprecise timing, full main-session context, no Task created) | ✅ working | `src/core/heartbeat.ts` |
 | **Memory: fast-path episodic + gated "dreaming" promotion, MEMORY.md/USER.md split, dedup, and real injection into the agent loop** | ✅ working | `src/core/memory.ts`, `src/core/agent-loop.ts` |
@@ -321,17 +322,10 @@ unless you deliberately wire that up.
 
 **What this is NOT (yet)**: a way to shell out to a *different* agent
 product (Claude Code, Codex, etc.) as a child process. That's a
-separate, genuinely optional primitive — cross-harness delegation,
-modeled on DeepSeek Harness's proof that "spawn a different harness
-entirely as the child" is trivial once delegation is a protocol
-boundary rather than an internal function call. It would mean a new
-`WorkerKind` (e.g. `"acp:claude-code"`) that shells out to an installed
-CLI and adapts its output back into this scaffold's `WorkerResult`
-shape — useful for "use Codex specifically for this coding task because
-it's better at it," but it requires the other CLI to be installed and
-runnable, adds subprocess overhead, and is NOT a prerequisite for
-subagents to work at all. Planned, not built — see
-`docs/architecture.md`'s Worker section for the design intent.
+separate, genuinely optional primitive — see the "Cross-harness
+delegation (optional, NOT the default)" section below, which IS now
+built (`src/core/cli-agent-worker.ts`), sitting right alongside this
+Subagent primitive without replacing it as the default.
 
 Verified with `npm run test-subagent` (9 assertions: the spawned Task
 has `type: "subagent"` and the right `parentTaskId`, `listTasks({
@@ -352,6 +346,97 @@ first and called the shell tool directly instead of delegating —
 caught immediately by the demo section showing an unexpected shell call
 instead of a subagent call; fixed by checking the more specific pattern
 first.
+
+## Cross-harness delegation (optional, NOT the default)
+
+**Read this before using `cli-agent-worker.ts`.** The in-process
+Subagent above (`spawnSubagentTask()`, `src/core/subagent.ts`) is the
+PRIMARY multiagent mechanism in this scaffold and remains the default:
+zero extra install, zero subprocess overhead, same harness, same
+tools/model/skills/permissions. **Nothing below replaces it.**
+
+Cross-harness delegation is a genuinely SEPARATE, explicitly opt-in
+capability for one specific case: you want a *different agent product*
+to do the work — e.g. "use the real Claude Code CLI for this because
+its coding tool loop is what I actually want" — not "I need another
+subagent." It's modeled on DeepSeek Harness's proof that "spawn a
+different harness entirely as the child" is trivial once delegation is
+a protocol boundary (a `Worker`) rather than an internal function call,
+and on the `"acp:claude-code"` / `"acp:codex"` `WorkerKind` sketched in
+`docs/architecture.md §1`.
+
+`src/core/cli-agent-worker.ts` implements:
+
+- `createCliAgentWorker(cliCommand, buildArgs, opts)` — the generic
+  factory: spawns `cliCommand` as a child process via
+  `node:child_process`'s `spawn`, captures stdout/stderr, and maps the
+  exit code into the exact same `WorkerResult` shape (`{ ok, output,
+  error }`) every other Worker in this scaffold produces. `kind` is
+  reported as `"acp:<name>"`, matching the architecture doc's naming.
+- `createClaudeCodeWorker(opts)` — pre-filled for the Claude Code CLI's
+  documented non-interactive invocation: `claude -p "<task>"
+  --output-format text` (`-p`/`--print`: "Print response and exit,
+  useful for non-interactive mode", straight from `claude --help`).
+- `createCodexWorker(opts)` — pre-filled for OpenAI Codex CLI's
+  documented exec mode: `codex exec "<task>"` (plus `--sandbox
+  workspace-write` by default so a delegated coding task can actually
+  edit files, matching Codex's own documented automation flags).
+- `createOpenCodeWorker(opts)` — pre-filled for OpenCode CLI's
+  documented run mode: `opencode run "<task>"`.
+- `detectCliAgent()` — probes `claude` / `codex` / `opencode` on PATH
+  via `--version` (short timeout, no crash if none respond), the same
+  "try everything available, admit clearly if nothing is" pattern
+  `createModelFromEnvOrOllama` already uses in `models/real.ts`.
+
+**Graceful degradation, matching the Ollama adapter's pattern exactly**:
+if the target CLI isn't installed, `spawn` fails with `ENOENT`, which is
+caught and turned into a clear `WorkerResult.error` ("... is not
+installed or not resolvable on PATH ... the in-process Subagent
+primitive remains fully usable without any external CLI") — never an
+uncaught crash. A configurable timeout (`timeoutMs`, default 120s —
+higher than `createLocalShellWorker`'s 30s since a full coding agent run
+can legitimately take minutes) kills a hung child and returns a timeout
+`WorkerResult` rather than hanging forever. `npm run demo`'s "1d.
+Cross-harness delegation" section calls `detectCliAgent()` first and
+prints a one-line skip message (not a failure) if nothing responds,
+exactly like the demo already degrades gracefully around Ollama.
+
+### Live-verification status on the machine this was built on
+
+**Found**: Claude Code CLI (`claude.exe`, v2.1.247) is genuinely
+installed on this machine, but under a version-numbered AppData folder
+that is **not on PATH** (`where claude` fails; Windows desktop installs
+don't add themselves to PATH the way the standalone CLI installer does).
+`src/test-cross-harness-worker.ts` includes a documented, Windows-
+specific fallback (`findClaudeExeOffPath()`) that locates it directly so
+the live test isn't skipped just because PATH resolution fails.
+
+**Live-tested**: the Worker's spawn/argument-construction/stdout-stderr-
+capture/exit-code-mapping plumbing is fully verified — `claude.exe -p
+"<task>" --output-format text` was actually spawned as a real child
+process and its real output was correctly adapted into `WorkerResult`.
+
+**NOT live-verified as a successful task delegation**: the installed
+Claude Code CLI is not logged in in this non-interactive environment
+(`claude.exe` returns `"Not logged in · Please run /login"`, exit code
+1), which the Worker correctly reports as `WorkerResult.ok = false`
+with that exact message in `error`/`output` — an honest finding, not a
+fabricated pass. Interactive `/login` can't be scripted here. On a
+machine with an authenticated Claude Code CLI (or `ANTHROPIC_API_KEY`
+wired through `--settings`/env), the exact same code path would
+complete the task and return `ok: true`.
+
+Run `npm run test-cross-harness-worker` yourself to see the current
+finding on your machine — it reports live-tested, not-installed, or
+installed-but-not-authenticated distinctly rather than collapsing them
+into one pass/fail bit. Unit-level tests (not dependent on any CLI being
+installed) cover: a nonexistent binary resolves as a graceful
+`WorkerResult.ok = false` rather than throwing, a hung child process is
+killed by the timeout and returns promptly, and exit code 0 vs. nonzero
+correctly map to `ok: true` vs. `ok: false` with stdout/stderr captured
+into `output`/`error`.
+
+
 
 ## Scheduler — Automations that actually fire
 
@@ -420,7 +505,7 @@ sections, which exercise all of it against real data side by side.
 
 **Note on test isolation**: the standalone test scripts (`test-cron`,
 `test-eventbus`, `test-webhook`, `test-skills-write`, `test-heartbeat`,
-`test-subagent`, `test-memory`, `test-memory-v2`) all share the same `./data/` event-log directory as
+`test-subagent`, `test-cross-harness-worker`, `test-memory`, `test-memory-v2`) all share the same `./data/` event-log directory as
 `npm run demo` — none of them reset it first. Running `npm run demo`
 and then a test
 script back to back can leave leftover Automations registered from the
@@ -491,6 +576,7 @@ src/
     heartbeat.ts                   # the OTHER scheduling mode: imprecise timing, full session context
     subagent.ts                      # in-process delegation to a fresh, isolated agent-loop run
     worker.ts                          # execution-environment interface (local-shell, stub, sandboxed wrapper)
+    cli-agent-worker.ts                  # OPTIONAL cross-harness Worker: shells out to claude/codex/opencode CLI
     model.ts             # swappable LLM adapter interface (stub adapter shipped)
     models/real.ts        # real Anthropic / OpenAI / Ollama adapters
     agent-loop.ts          # the turn loop binding all of the above together
@@ -502,6 +588,7 @@ src/
   test-skills-write.ts             # standalone skills write/round-trip tests
   test-heartbeat.ts                  # standalone Heartbeat scheduling-mode tests
   test-subagent.ts                     # standalone Subagent context-isolation tests
+  test-cross-harness-worker.ts           # standalone cross-harness (external CLI) Worker tests — OPTIONAL primitive
   test-memory.ts                         # standalone memory dedup/split/injection tests
   test-memory-v2.ts                        # standalone similarity/retrieval/nomination tests
 skills/

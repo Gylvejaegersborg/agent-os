@@ -16,6 +16,7 @@
     "test-skills-write": "tsc -b && node dist/test-skills-write.js",
     "test-heartbeat": "tsc -b && node dist/test-heartbeat.js",
     "test-subagent": "tsc -b && node dist/test-subagent.js",
+    "test-cross-harness-worker": "tsc -b && node dist/test-cross-harness-worker.js",
     "test-memory": "tsc -b && node dist/test-memory.js",
     "test-memory-v2": "tsc -b && node dist/test-memory-v2.js",
     "typecheck": "tsc -b --noEmit"
