@@ -4,3 +4,5 @@
 // only — no transport/runtime logic yet.
 
 export * from "./protocol.js";
+export * from "./sessions.js";
+export * from "./gateway.js";

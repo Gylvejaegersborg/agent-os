@@ -25,10 +25,15 @@
     "test-memory-embeddings": "tsc -b && node dist/test-memory-embeddings.js",
     "test-observability": "tsc -b && node dist/test-observability.js",
     "test-harness-protocol": "tsc -b && node dist/test-harness-protocol.js",
+    "test-harness-gateway": "tsc -b && node dist/test-harness-gateway.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
     "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "@types/ws": "^8.18.1",
+    "ws": "^8.21.3"
   }
 }

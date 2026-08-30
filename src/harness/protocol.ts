@@ -55,7 +55,11 @@ export type AgentRuntimeStatus =
 // the single unified message stream, distinct from ModelMessage (which
 // is what actually goes to the model). A UI mapper (harnessEventToConversationItem,
 // built client-side in BaseOS per plan §74) turns HarnessServerEvents into
-// these; this file just defines the shape both sides agree on. ----
+// these; a server-side mapper (sessions.ts's buildSessionState) turns
+// session-stream events into these for session.sync snapshots. Both sides
+// converge on the SAME per-kind shapes below so a message rendered from a
+// live stream and one rehydrated after reload/reconnect look identical to
+// the UI. ----
 
 export type ConversationItemKind =
   | "user-message"
@@ -66,13 +70,60 @@ export type ConversationItemKind =
   | "task-update"
   | "system-event";
 
-export interface ConversationItemBase {
+interface ConversationItemBase {
   id: string;
-  kind: ConversationItemKind;
   timestamp: string;
   sessionId: string;
   agentId?: string;
 }
+
+export interface UserMessageItem extends ConversationItemBase {
+  kind: "user-message";
+  text: string;
+}
+
+export interface AgentMessageItem extends ConversationItemBase {
+  kind: "agent-message";
+  text: string;
+}
+
+export interface ToolCallItem extends ConversationItemBase {
+  kind: "tool-call";
+  tool: string;
+  args: Record<string, unknown>;
+}
+
+export interface ToolResultItem extends ConversationItemBase {
+  kind: "tool-result";
+  tool?: string;
+  ok: boolean;
+  output: string;
+  error?: string;
+}
+
+export interface PermissionItem extends ConversationItemBase {
+  kind: "permission-request";
+  request: PermissionRequestPayload;
+}
+
+export interface TaskItem extends ConversationItemBase {
+  kind: "task-update";
+  task: Task;
+}
+
+export interface SystemEventItem extends ConversationItemBase {
+  kind: "system-event";
+  text: string;
+}
+
+export type ConversationItem =
+  | UserMessageItem
+  | AgentMessageItem
+  | ToolCallItem
+  | ToolResultItem
+  | PermissionItem
+  | TaskItem
+  | SystemEventItem;
 
 // ---- Tool rendering vocabulary (plan §41) ----
 
@@ -118,7 +169,7 @@ export interface SessionStateEvent extends HarnessEventBase {
   type: "session.state";
   sessionId: string;
   payload: {
-    messages: ConversationItemBase[];
+    messages: ConversationItem[];
     tasks: Task[];
     pendingPermissions: PermissionRequestPayload[];
   };
@@ -233,6 +284,18 @@ export interface AutomationEvent extends HarnessEventBase {
   };
 }
 
+/** Sent in response to automations.list — the full current catalog in one
+ *  event, distinct from automation.started/completed/failed (which are
+ *  per-firing lifecycle events, not a listing mechanism). Mirrors how
+ *  session.state is a snapshot distinct from the per-message stream
+ *  events. */
+export interface AutomationsSnapshotEvent extends HarnessEventBase {
+  type: "automations.snapshot";
+  payload: {
+    automations: Automation[];
+  };
+}
+
 export interface WorkspaceEvent extends HarnessEventBase {
   type: "workspace.document.created" | "workspace.document.updated" | "workspace.document.deleted" | "workspace.conflict";
   payload: {
@@ -290,6 +353,7 @@ export type HarnessServerEvent =
   | PermissionResolvedEvent
   | TaskEvent
   | AutomationEvent
+  | AutomationsSnapshotEvent
   | WorkspaceEvent
   | TerminalOutputEvent
   | TerminalClosedEvent

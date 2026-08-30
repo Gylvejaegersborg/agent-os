@@ -273,6 +273,22 @@ export interface SchedulerHandle {
   stop: () => void;
 }
 
+/** Fires ONE specific automation immediately, regardless of its trigger
+ *  kind or whether it's currently "due" — used by the Harness Gateway's
+ *  `automations.run` command (manual "run now" from the UI), which has
+ *  no natural cron-tick/event/webhook context of its own. Reuses the
+ *  exact same fireAutomation() every other trigger path goes through, so
+ *  a manual run creates a real Task/session and appends the same
+ *  `automation.fired` audit event — it is not a separate, parallel
+ *  execution path. Throws if the automation doesn't exist or is
+ *  disabled, rather than silently no-opping. */
+export async function runAutomationNow(automationId: string, deps: SchedulerDeps, now: Date = new Date()): Promise<FireResult> {
+  const automation = (await listAutomations()).find((a) => a.id === automationId);
+  if (!automation) throw new Error(`no such automation: ${automationId}`);
+  if (!automation.enabled) throw new Error(`automation ${automationId} is disabled — enable it before running manually`);
+  return fireAutomation(automation, deps, now);
+}
+
 /** Starts a real background tick loop — the actual "run this as a
  *  service" scheduler, not just a proof-of-concept single check. Ticks
  *  every `intervalMs` (default 30s, comfortably under the 1-minute cron

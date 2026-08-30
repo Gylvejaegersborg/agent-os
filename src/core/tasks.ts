@@ -613,3 +613,17 @@ export async function getAutomation(id: string): Promise<Automation | undefined>
 export async function listAutomations(): Promise<Automation[]> {
   return [...(await projectAutomations()).values()];
 }
+
+/** Enables/disables an existing Automation via the `automation.toggled`
+ *  event the projection above already understands (previously nothing
+ *  appended this event type — only the reducer branch existed). Throws
+ *  if the automation doesn't exist rather than silently appending an
+ *  event that would never project to anything. */
+export async function setAutomationEnabled(id: string, enabled: boolean): Promise<Automation> {
+  const existing = await getAutomation(id);
+  if (!existing) throw new Error(`no such automation: ${id}`);
+  await appendEvent(AUTOMATIONS_STREAM, "automation.toggled", { automationId: id, enabled });
+  const updated = await getAutomation(id);
+  if (!updated) throw new Error("automation.toggled event did not project");
+  return updated;
+}
