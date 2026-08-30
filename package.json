@@ -26,6 +26,7 @@
     "test-observability": "tsc -b && node dist/test-observability.js",
     "test-harness-protocol": "tsc -b && node dist/test-harness-protocol.js",
     "test-harness-gateway": "tsc -b && node dist/test-harness-gateway.js",
+    "test-harness-streaming": "tsc -b && node dist/test-harness-streaming.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {

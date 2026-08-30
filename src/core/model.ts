@@ -15,9 +15,58 @@ export interface ModelResponse {
   toolCall?: { name: string; args: Record<string, unknown> };
 }
 
+/** One chunk of a streamed response. 'delta' carries incremental text (the
+ *  UI appends each one as it arrives); 'tool-call' carries a complete tool
+ *  call once the model has finished emitting it (tool calls are not
+ *  streamed token-by-token by any provider studied — they arrive whole);
+ *  'done' always terminates the stream exactly once, carrying the same
+ *  {content, toolCall} shape complete() would have returned, so a caller
+ *  that only cares about the final result can ignore every delta and just
+ *  await the 'done' event. */
+export type ModelStreamEvent =
+  | { type: "delta"; delta: string }
+  | { type: "tool-call"; toolCall: { name: string; args: Record<string, unknown> } }
+  | { type: "done"; content: string; toolCall?: { name: string; args: Record<string, unknown> } };
+
 export interface ModelAdapter {
   id: string;
   complete(messages: ModelMessage[]): Promise<ModelResponse>;
+  /** Optional real streaming. When absent, callers should use
+   *  streamFromComplete() (below) to get the same event SEQUENCE from any
+   *  adapter — the wire protocol and UI never need to know which case
+   *  they're in. */
+  stream?(messages: ModelMessage[]): AsyncIterable<ModelStreamEvent>;
+}
+
+/** Turns ANY ModelAdapter into a stream by calling complete() once and
+ *  chunking the result — real network latency and a real full response,
+ *  but not real token-by-token arrival. This is what makes streaming work
+ *  uniformly for the stub model and for any adapter that hasn't
+ *  implemented a real stream() yet: the EVENT SEQUENCE (delta*, then
+ *  done) is identical to a genuinely-streamed adapter, so gateway.ts and
+ *  every downstream consumer of ModelStreamEvent never need a special
+ *  case for "this adapter doesn't really stream." Chunked on whitespace
+ *  boundaries (not arbitrary byte counts) so partial words never render
+ *  mid-token in the UI. */
+export async function* streamFromComplete(adapter: ModelAdapter, messages: ModelMessage[]): AsyncIterable<ModelStreamEvent> {
+  const response = await adapter.complete(messages);
+  const words = response.content.split(/(?<=\s)/); // keep trailing whitespace attached to each chunk
+  for (const word of words) {
+    if (word.length === 0) continue;
+    yield { type: "delta", delta: word };
+  }
+  if (response.toolCall) {
+    yield { type: "tool-call", toolCall: response.toolCall };
+  }
+  yield { type: "done", content: response.content, toolCall: response.toolCall };
+}
+
+/** The canonical entry point every caller (gateway.ts included) should
+ *  use instead of choosing between adapter.stream() and
+ *  streamFromComplete() itself — picks real streaming when the adapter
+ *  provides it, falls back otherwise. */
+export function streamModel(adapter: ModelAdapter, messages: ModelMessage[]): AsyncIterable<ModelStreamEvent> {
+  return adapter.stream ? adapter.stream(messages) : streamFromComplete(adapter, messages);
 }
 
 /** Deterministic stub adapter: no network calls, no API key, fully

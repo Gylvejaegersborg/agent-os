@@ -45,6 +45,7 @@ independently — see `docs/architecture.md §0`.
 | Standing Order (deliberately NOT a data object) | 📝 documented only | `docs/architecture.md §2` |
 | Skills (agentskills.io-compatible format) | ✅ working — parser, discovery, progressive disclosure, write support | `src/core/skills.ts`, `skills/*/SKILL.md` |
 | Sandboxing / permission policy (two-layer) | ✅ working — Layer A (policy hook) + Layer B (sandboxed worker) | `src/core/permissions.ts` |
+| **Harness Gateway (WebSocket protocol + real-time server) for a UI frontend (e.g. BaseOS) to drive this OS live** | ✅ working — real streaming, sessions, tasks, automations; permissions/terminal/workspace are stubbed with honest `NOT_IMPLEMENTED` errors | `src/harness/protocol.ts`, `src/harness/gateway.ts`, `src/harness/sessions.ts` |
 | Agent filesystem namespace | ✅ working — read/write over paths (write supported for skills only; see below) | `src/core/agentfs.ts` |
 | **Agent identity (persona, defaultModel) actually affecting behavior** | ✅ working — persona injected into every turn's system message; defaultModel consulted during model selection | `src/core/identity.ts`, `src/core/agent-loop.ts`, `src/core/models/real.ts` |
 | Observability (metrics derived from the event log, no new store) | ✅ working — task success/failure rates, automation fires by trigger kind, dreaming pass stats, subagent delegation count, turn latency | `src/core/observability.ts` |
@@ -698,7 +699,108 @@ installed) cover: a nonexistent binary resolves as a graceful
 `WorkerResult.ok = false` rather than throwing, a hung child process is
 killed by the timeout and returns promptly, and exit code 0 vs. nonzero
 correctly map to `ok: true` vs. `ok: false` with stdout/stderr captured
-into `output`/`error`.
+`output`/`error`.
+
+
+
+## Harness — a real-time protocol for a UI frontend to drive this OS
+
+Per `AGENT-HARNESS-IMPLEMENTATION-PLAN.md` (the locked plan for wiring a
+BaseOS-style dashboard frontend to this scaffold): this scaffold is the
+**sole runtime**, reached over a single WebSocket connection — the UI
+never talks to a model provider directly, never holds API keys, and never
+re-implements any part of the agent loop. Four phases done so far:
+
+**Phase 1 — protocol contract** (`src/harness/protocol.ts`): two
+discriminated unions define the entire wire format. `HarnessServerEvent`
+(this scaffold -> UI): `harness.ready`, `session.created`/`session.state`,
+`agent.status`, `agent.message.start`/`delta`/`end`, `tool.started`/
+`output`/`ended`, `permission.request`/`resolved`, `task.created`/
+`updated`, `automation.started`/`completed`/`failed`,
+`automations.snapshot`, `workspace.document.*`/`conflict`,
+`terminal.output`/`closed`, `harness.error`. `HarnessClientEvent` (UI ->
+this scaffold): `hello`, `session.create`/`subscribe`/`sync`,
+`send.message`, `turn.cancel`, `permission.resolve`, `task.create`/
+`cancel`/`retry`, `automations.list`/`create`/`setEnabled`/`run`,
+`terminal.create`/`input`/`resize`/`close`, `workspace.update`,
+`agent.set`. Every payload reuses this scaffold's OWN `Task`/`Automation`/
+`AgentIdentity`/`WorkerResult` types directly — no parallel DTOs that
+could silently drift from the real shape.
+
+**Phase 2 — Gateway** (`src/harness/gateway.ts`, `src/harness/sessions.ts`):
+a real WebSocket server (the `ws` library), bound to `127.0.0.1` only —
+never `0.0.0.0` — since this process eventually holds shell/PTY access
+and must never be reachable off-box without a deliberate opt-in. Every
+command dispatches straight to this scaffold's existing primitives
+(`createTask`/`transitionTask`, `listAutomations`/`registerAutomation`,
+etc.) — there is no separate "harness runtime" underneath it.
+`sessions.ts` binds a sessionId to an agentId via a
+`harness.session.created` event on the SAME `session:<id>` stream
+`agent-loop.ts` already writes to (no side channel to drift out of sync),
+and `buildSessionState()` maps a session's history into the wire
+protocol's `ConversationItem[]` shape for `session.sync` — the mechanism
+that makes reload/reconnect actually rehydrate real history rather than
+trusting stale client-side state.
+
+**Phase 3 — real agent execution**: not a separate step in practice — the
+Gateway was built directly against `runTurn()`/`createModelForAgent()`/
+`Worker` from the start, so `send.message` runs a genuine agent-loop turn
+(model call, tool dispatch, session persistence), not a mocked response.
+
+**Phase 4 — real streaming** (`src/core/model.ts`,
+`src/core/models/real.ts`): `ModelAdapter` gained an optional
+`stream(messages): AsyncIterable<ModelStreamEvent>` method alongside the
+original `complete()`. `streamModel()` picks real streaming when an
+adapter provides it and falls back to `streamFromComplete()` (word-chunks
+a `complete()` response) otherwise — a caller like the Gateway never
+needs to know which case it's in. **Anthropic's adapter parses the real
+Server-Sent Events wire format** (`content_block_delta` for text,
+`input_json_delta` accumulated across chunks for tool-call arguments,
+`content_block_start` for the tool's name — the only place it appears).
+**Ollama's adapter parses its OpenAI-compatible streaming format**
+(`data: {...}\n\n` chunks terminated by `data: [DONE]`), live-verified end
+to end against a real local model. `runTurn()` gained an optional
+`onStreamEvent` callback — a pure observer that lets `gateway.ts`
+broadcast every real delta to a session's WebSocket subscribers AS IT
+ARRIVES (`agent.message.delta` per chunk), without `runTurn()` itself
+knowing anything about WebSockets.
+
+**What's honestly NOT built yet** (each reports `harness.error` with code
+`NOT_IMPLEMENTED` rather than silently no-opping or pretending to work):
+`terminal.*` commands (Phase 9 — real PTY via `node-pty`),
+`permission.resolve` (Phase 10 — async approval flow; `permissions.ts`'s
+`onAsk` is still a synchronous callback, not a wire round-trip),
+`workspace.update` (Phase 14 — shared workspace with optimistic
+concurrency), `turn.cancel` (no abort hook exists anywhere in
+`runTurn()`/`model.complete()`/`worker.run()` yet), and `agent.set`
+(switching an existing session's agent mid-conversation).
+
+Verified with three new standalone test suites, all against REAL
+transports (no mocked WebSocket, no mocked HTTP — same posture as
+`test-webhook.ts`'s real local HTTP server):
+
+- `npm run test-harness-protocol` (6 assertions): every server event and
+  client command constructs correctly, narrows through `switch(.type)` to
+  its own payload shape (proving the discriminated union actually
+  discriminates), and survives a JSON round-trip.
+- `npm run test-harness-gateway` (25 assertions, against a REAL
+  `WebSocketServer` on an ephemeral port and REAL client sockets): the
+  literal Phase 2/3 "done when" criteria (connect -> create session ->
+  send message -> receive stream; hello -> real model response),
+  multi-chunk streaming (not one big delta), `session.sync` round-tripping
+  real message history, unknown-session rejection, real Task/Automation
+  ledger effects (not just events with no backing state), and multi-client
+  broadcast (a second socket subscribed to the same session sees the same
+  live events — the mechanism Right Rail live-updates will depend on).
+- `npm run test-harness-streaming` (18 assertions): `streamModel()`'s
+  fallback chunking reconstructs byte-for-byte; Anthropic's real SSE
+  parser is proven against a REAL local HTTP server speaking the actual
+  Anthropic streaming wire format (not a live Anthropic account — the
+  same "real transport, fake upstream" pattern `test-webhook.ts` uses),
+  covering both plain-text and tool-call streaming; and — when Ollama is
+  reachable on the test machine — a genuinely live end-to-end streamed
+  response from a real local model, auto-detecting whichever model is
+  actually pulled rather than assuming a specific one is installed.
 
 
 
@@ -978,9 +1080,14 @@ src/
     subagent.ts                      # in-process delegation to a fresh, isolated agent-loop run
     worker.ts                          # execution-environment interface (local-shell, stub, sandboxed wrapper)
     cli-agent-worker.ts                  # OPTIONAL cross-harness Worker: shells out to claude/codex/opencode CLI
-    model.ts             # swappable LLM adapter interface (stub adapter shipped)
-    models/real.ts        # real Anthropic / OpenAI / Ollama adapters + per-agent defaultModel preference wiring
-    agent-loop.ts          # the turn loop binding all of the above together (persona + memory + skills + tools)
+    model.ts             # swappable LLM adapter interface (stub adapter shipped) + streamModel()/streamFromComplete()
+    models/real.ts        # real Anthropic / OpenAI / Ollama adapters (with real SSE stream() parsers) + per-agent defaultModel preference wiring
+    agent-loop.ts          # the turn loop binding all of the above together (persona + memory + skills + tools + onStreamEvent)
+  harness/
+    protocol.ts             # Harness wire contract: HarnessServerEvent/HarnessClientEvent discriminated unions
+    gateway.ts                # real WebSocket server — dispatches every command to the primitives above
+    sessions.ts                # session<->agentId binding + session.sync snapshot for reload/reconnect
+    index.ts                     # barrel export
   cli.ts                    # runnable end-to-end demo of every primitive above
   test-live-model.ts         # calls a real model adapter (not the stub) — see below
   test-cron.ts                # standalone cron parser/matcher regression tests
@@ -995,6 +1102,9 @@ src/
   test-identity-wiring.ts                   # standalone persona-injection + defaultModel-wiring tests
   test-memory-embeddings.ts                 # standalone embedding-similarity + fallback tests
   test-observability.ts                      # standalone end-to-end metrics-projection tests
+  test-harness-protocol.ts                    # standalone protocol discriminated-union tests
+  test-harness-gateway.ts                      # standalone Gateway tests against a REAL WebSocketServer
+  test-harness-streaming.ts                     # standalone stream()/SSE-parser tests (real HTTP + live Ollama)
 skills/
   commit-message-style/       # example skill: house style for git commits
     SKILL.md

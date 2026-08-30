@@ -21,11 +21,14 @@
 //     conversation is open (every connected socket is a global
 //     subscriber; there's no opt-out today since nothing here yet needs
 //     one).
-//   - Streaming (Phase 4) is NOT implemented yet: send.message emits
-//     message.start, ONE message.delta carrying the entire final
-//     content, then message.end — proving the event sequence and wire
-//     format work end-to-end before model.stream()'s async-iterator
-//     upgrade replaces the single big delta with real per-token chunks.
+//   - Streaming is REAL (Phase 4): send.message wires runTurn()'s
+//     onStreamEvent callback to broadcast every model.stream() delta to
+//     the session's subscribers as it arrives — one agent.message.delta
+//     per token/chunk, not one big delta after the whole response is
+//     ready. Works uniformly for adapters with genuine streaming
+//     (Anthropic/Ollama, see core/models/real.ts) and the stub model
+//     (falls back to word-chunking via model.ts's streamFromComplete()),
+//     since this file only ever consumes ModelStreamEvent.
 
 import { WebSocketServer, type WebSocket, type RawData } from "ws";
 import { generateId } from "../core/id.js";
@@ -145,6 +148,25 @@ export function startHarnessGateway(deps: GatewayDeps, opts: GatewayOptions = {}
         model: deps.model,
         worker: deps.worker,
         skills: deps.skills,
+        // Real per-token/per-chunk streaming (Phase 4): every delta the
+        // model produces is broadcast to the session's subscribers AS IT
+        // ARRIVES, not batched into one big chunk after the turn
+        // completes. Works uniformly whether the underlying adapter has
+        // a real stream() (Anthropic/Ollama, see models/real.ts) or falls
+        // back to word-chunking via streamFromComplete() (the stub model,
+        // and any adapter without a real stream() implementation) — this
+        // callback only ever sees ModelStreamEvent, never which case
+        // produced it.
+        onStreamEvent: (event) => {
+          if (event.type === "delta") {
+            broadcastToSession(sessionId, {
+              ...baseFields("agent.message.delta", { sessionId, agentId }),
+              sessionId,
+              agentId,
+              payload: { messageId, delta: event.delta },
+            } as HarnessServerEvent);
+          }
+        },
       });
     } catch (err) {
       broadcastToSession(sessionId, {
@@ -155,16 +177,6 @@ export function startHarnessGateway(deps: GatewayDeps, opts: GatewayOptions = {}
       throw err;
     }
 
-    // No real streaming yet (Phase 4 upgrades model.complete() to
-    // model.stream()) — the whole response arrives as one delta so the
-    // event SEQUENCE (start -> delta -> end) is already correct for
-    // whenever real per-token chunks replace this single chunk.
-    broadcastToSession(sessionId, {
-      ...baseFields("agent.message.delta", { sessionId, agentId }),
-      sessionId,
-      agentId,
-      payload: { messageId, delta: result.finalContent },
-    } as HarnessServerEvent);
     broadcastToSession(sessionId, {
       ...baseFields("agent.message.end", { sessionId, agentId }),
       sessionId,

@@ -10,7 +10,7 @@
 // carry multiple tool calls — that's a deliberate scaffold limitation, not
 // an oversight.
 
-import type { ModelAdapter, ModelMessage, ModelResponse } from "../model.js";
+import type { ModelAdapter, ModelMessage, ModelResponse, ModelStreamEvent } from "../model.js";
 import { appendEvent, project } from "../eventlog.js";
 
 export interface ToolSpec {
@@ -103,6 +103,111 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
         content: textBlock?.text ?? "",
         ...(toolBlock ? { toolCall: { name: toolBlock.name, args: toolBlock.input } } : {}),
       };
+    },
+    async *stream(messages: ModelMessage[]): AsyncIterable<ModelStreamEvent> {
+      const { system, messages: anthropicMessages } = toAnthropicMessages(messages);
+
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01",
+      };
+      if (authStyle === "api-key") {
+        headers["x-api-key"] = opts.apiKey;
+      } else {
+        headers["authorization"] = `Bearer ${opts.apiKey}`;
+        headers["anthropic-beta"] = "oauth-2025-04-20";
+      }
+
+      const body: Record<string, unknown> = {
+        model,
+        max_tokens: opts.maxTokens ?? 1024,
+        messages: anthropicMessages,
+        stream: true,
+        ...(system ? { system } : {}),
+      };
+      if (opts.tools?.length) {
+        body.tools = opts.tools.map((t) => ({
+          name: t.name,
+          description: t.description,
+          input_schema: t.parameters,
+        }));
+      }
+
+      const res = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(body) });
+      if (!res.ok || !res.body) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`Anthropic API error ${res.status}: ${errText.slice(0, 500)}`);
+      }
+
+      // Anthropic's Messages streaming API sends Server-Sent Events: each
+      // event is an "event: <name>\ndata: <json>\n\n" block. We only need
+      // three event types to reconstruct {content, toolCall}: text deltas
+      // (content_block_delta with delta.type "text_delta"), tool-input
+      // deltas (delta.type "input_json_delta", accumulated as a partial
+      // JSON string and parsed only once the block closes since a partial
+      // JSON string is not valid JSON mid-stream), and content_block_start
+      // for tool_use blocks (which carries the tool's NAME — the only
+      // place it appears in the stream).
+      let content = "";
+      let toolName: string | undefined;
+      let toolInputJson = "";
+      let buffer = "";
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // SSE events are separated by a blank line; process every
+        // complete event currently in the buffer, leaving any trailing
+        // partial event for the next chunk.
+        let sepIndex: number;
+        while ((sepIndex = buffer.indexOf("\n\n")) !== -1) {
+          const rawEvent = buffer.slice(0, sepIndex);
+          buffer = buffer.slice(sepIndex + 2);
+
+          const dataLine = rawEvent.split("\n").find((line) => line.startsWith("data:"));
+          if (!dataLine) continue;
+          let payload: any;
+          try {
+            payload = JSON.parse(dataLine.slice(5).trim());
+          } catch {
+            continue; // malformed/partial data line — skip rather than crash the stream
+          }
+
+          if (payload.type === "content_block_start" && payload.content_block?.type === "tool_use") {
+            toolName = payload.content_block.name;
+          } else if (payload.type === "content_block_delta") {
+            if (payload.delta?.type === "text_delta") {
+              const delta = payload.delta.text as string;
+              content += delta;
+              yield { type: "delta", delta };
+            } else if (payload.delta?.type === "input_json_delta") {
+              toolInputJson += payload.delta.partial_json ?? "";
+            }
+          }
+          // message_stop / message_delta (stop_reason) carry no content
+          // this adapter needs — ignored deliberately, not by oversight.
+        }
+      }
+
+      let toolCall: { name: string; args: Record<string, unknown> } | undefined;
+      if (toolName) {
+        let args: Record<string, unknown> = {};
+        try {
+          args = toolInputJson ? JSON.parse(toolInputJson) : {};
+        } catch {
+          // A malformed tool-input JSON stream is reported as a proper
+          // ModelResponse-shaped error rather than crashing the whole
+          // turn — the agent loop already handles a tool call with
+          // empty/wrong args as a normal tool-dispatch failure.
+        }
+        toolCall = { name: toolName, args };
+        yield { type: "tool-call", toolCall };
+      }
+      yield { type: "done", content, toolCall };
     },
   };
 }
@@ -237,6 +342,99 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
           ? { toolCall: { name: toolCall.function.name, args: JSON.parse(toolCall.function.arguments || "{}") } }
           : {}),
       };
+    },
+    async *stream(messages: ModelMessage[]): AsyncIterable<ModelStreamEvent> {
+      const ollamaMessages = messages.map((m) => ({
+        role: m.role === "tool" ? "user" : m.role,
+        content: m.content,
+      }));
+
+      const body: Record<string, unknown> = { model, messages: ollamaMessages, stream: true };
+      if (opts.tools?.length) {
+        body.tools = opts.tools.map((t) => ({
+          type: "function",
+          function: { name: t.name, description: t.description, parameters: t.parameters },
+        }));
+      }
+
+      let res: Response;
+      try {
+        res = await fetch(baseUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      } catch (err) {
+        throw new Error(
+          `Could not reach Ollama at ${baseUrl} — is it running? ('ollama serve', or 'ollama pull ${model}' if the model isn't installed yet). Original error: ${err}`,
+        );
+      }
+      if (!res.ok || !res.body) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`Ollama API error ${res.status}: ${errText.slice(0, 500)}`);
+      }
+
+      // Ollama's OpenAI-compatible streaming endpoint sends
+      // "data: <json>\n\n" chunks (identical framing to OpenAI's own SSE
+      // format), terminated by a literal "data: [DONE]" line. Each chunk
+      // carries a delta object matching OpenAI's chat.completion.chunk
+      // shape — accumulate delta.content into the running text, and (if
+      // present) accumulate delta.tool_calls[0].function.arguments as a
+      // partial JSON string the same way the Anthropic adapter above
+      // accumulates input_json_delta, since tool-call arguments also
+      // arrive incrementally here rather than in one piece.
+      let content = "";
+      let toolName: string | undefined;
+      let toolArgsJson = "";
+      let buffer = "";
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        let newlineIndex: number;
+        while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
+          const line = buffer.slice(0, newlineIndex).trim();
+          buffer = buffer.slice(newlineIndex + 1);
+          if (!line.startsWith("data:")) continue;
+          const raw = line.slice(5).trim();
+          if (raw === "[DONE]") continue;
+          let chunk: any;
+          try {
+            chunk = JSON.parse(raw);
+          } catch {
+            continue; // malformed/partial line — skip rather than crash the stream
+          }
+
+          const delta = chunk.choices?.[0]?.delta;
+          if (delta?.content) {
+            content += delta.content;
+            yield { type: "delta", delta: delta.content };
+          }
+          const toolCallDelta = delta?.tool_calls?.[0];
+          if (toolCallDelta?.function?.name) toolName = toolCallDelta.function.name;
+          if (toolCallDelta?.function?.arguments) toolArgsJson += toolCallDelta.function.arguments;
+        }
+      }
+
+      let toolCall: { name: string; args: Record<string, unknown> } | undefined;
+      if (toolName) {
+        let args: Record<string, unknown> = {};
+        try {
+          args = toolArgsJson ? JSON.parse(toolArgsJson) : {};
+        } catch {
+          // Same posture as the Anthropic adapter: a malformed tool-args
+          // stream falls through to an empty-args tool call rather than
+          // throwing, letting the agent loop's normal tool-dispatch
+          // error path handle it.
+        }
+        toolCall = { name: toolName, args };
+        yield { type: "tool-call", toolCall };
+      }
+      yield { type: "done", content, toolCall };
     },
   };
 }

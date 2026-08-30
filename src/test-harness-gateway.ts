@@ -98,33 +98,56 @@ async function main() {
   const sessionId = created.type === "session.created" ? created.sessionId! : "";
   ok("session.created carries a real sessionId", sessionId.length > 0);
 
-  // ---- send.message -> message.start -> message.delta -> message.end
+  // ---- send.message -> message.start -> message.delta* -> message.end
   // (Phase 2's literal "connect -> create session -> send message ->
-  // receive stream" criterion) ----
+  // receive stream" criterion, now proving REAL multi-chunk streaming
+  // per Phase 4 rather than one big delta) ----
   const startEventP = waitFor(ws, (e) => e.type === "agent.message.start");
-  const deltaEventP = waitFor(ws, (e) => e.type === "agent.message.delta");
-  const endEventP = waitFor(ws, (e) => e.type === "agent.message.end");
   send(ws, { type: "send.message", sessionId, agentId: "claude", text: "Hello" });
 
   const startEvent = await startEventP;
   ok("send.message triggers agent.message.start", startEvent.type === "agent.message.start");
 
-  const deltaEvent = await deltaEventP;
-  ok("send.message triggers agent.message.delta", deltaEvent.type === "agent.message.delta");
+  // Collect every delta AND the end event on the same listener so no
+  // delta arriving between separate waitFor() calls is ever missed —
+  // this is exactly the multi-chunk case Phase 4 introduced (the stub
+  // model's response now arrives as several word-chunked deltas via
+  // model.ts's streamFromComplete(), not a single big one).
+  const deltas: string[] = [];
+  const endEvent = await new Promise<HarnessServerEvent>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("timed out waiting for message.end")), 5000);
+    const handler = (raw: Buffer) => {
+      const evt = JSON.parse(raw.toString()) as HarnessServerEvent;
+      if (evt.type === "agent.message.delta") deltas.push(evt.payload.delta);
+      if (evt.type === "agent.message.end") {
+        clearTimeout(timer);
+        ws.off("message", handler);
+        resolve(evt);
+      }
+    };
+    ws.on("message", handler);
+  });
+
+  ok("send.message triggers at least one agent.message.delta", deltas.length > 0);
   ok(
-    "the delta carries the stub model's real response content",
-    deltaEvent.type === "agent.message.delta" && deltaEvent.payload.delta.includes("Hello"),
+    "the deltas concatenate into the stub model's real response content",
+    deltas.join("").includes("Hello"),
+  );
+  ok(
+    "streaming produced MORE THAN ONE delta chunk (real multi-chunk streaming, not one big blob)",
+    deltas.length > 1,
   );
 
-  const endEvent = await endEventP;
   ok("send.message triggers agent.message.end", endEvent.type === "agent.message.end");
   ok(
-    "message.start/delta/end all share the same messageId",
+    "message.start and message.end share the same messageId",
     startEvent.type === "agent.message.start" &&
-      deltaEvent.type === "agent.message.delta" &&
       endEvent.type === "agent.message.end" &&
-      startEvent.payload.messageId === deltaEvent.payload.messageId &&
-      deltaEvent.payload.messageId === endEvent.payload.messageId,
+      startEvent.payload.messageId === endEvent.payload.messageId,
+  );
+  ok(
+    "message.end's finalContent matches the concatenated deltas",
+    endEvent.type === "agent.message.end" && endEvent.payload.finalContent === deltas.join(""),
   );
 
   // ---- session.sync round-trip: proves the message we just sent is

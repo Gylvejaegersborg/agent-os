@@ -5,7 +5,8 @@
 // observability for free (see eventlog.ts).
 
 import { appendEvent, project } from "./eventlog.js";
-import type { ModelAdapter, ModelMessage } from "./model.js";
+import type { ModelAdapter, ModelMessage, ModelStreamEvent } from "./model.js";
+import { streamModel } from "./model.js";
 import type { Worker } from "./worker.js";
 import { fireHook } from "./hooks.js";
 import { generateId } from "./id.js";
@@ -63,6 +64,21 @@ export interface RunTurnOptions {
    *  synchronous "ask the user right now" mechanism. Omit to disable
    *  nomination for this turn, same opt-in pattern as enableSubagents. */
   enableMemoryNominations?: boolean;
+  /** Optional callback fired for every ModelStreamEvent as the turn's
+   *  model call(s) produce them — this is what makes real streaming
+   *  observable to a caller like the Harness Gateway (gateway.ts) without
+   *  runTurn() itself knowing anything about WebSockets or wire events.
+   *  Uses streamModel() (model.ts) internally, so this fires real
+   *  per-token deltas for adapters with a real stream() implementation,
+   *  and word-chunked deltas (via streamFromComplete()) for adapters that
+   *  don't — the caller never needs to know which case it's in. Fired for
+   *  EVERY model call within the turn, including intermediate tool-call
+   *  hops (which typically produce zero/near-zero delta events before
+   *  their 'done', since a model emitting a tool call usually returns
+   *  little or no accompanying text) — omit this if you only care about
+   *  the turn's final return value, exactly as before this option
+   *  existed. */
+  onStreamEvent?: (event: ModelStreamEvent) => void;
 }
 
 function sessionStream(sessionId: string): string {
@@ -193,7 +209,7 @@ async function dispatchTool(
 }
 
 export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
-  const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents, enableMemoryNominations } = opts;
+  const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents, enableMemoryNominations, onStreamEvent } = opts;
   const injectMemory = opts.injectMemory ?? true;
   const maxHops = opts.maxToolHops ?? 3;
 
@@ -232,7 +248,23 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     const messages: ModelMessage[] = systemParts.length
       ? [{ role: "system", content: systemParts.join("\n\n") }, ...history]
       : history;
-    const response = await model.complete(messages);
+
+    // Drain the stream fully before proceeding — runTurn()'s own control
+    // flow (tool dispatch, session persistence) is still fundamentally
+    // request/response per hop, same as before this option existed.
+    // onStreamEvent is a pure OBSERVER: it lets a caller like the Harness
+    // Gateway watch deltas arrive in real time without runTurn() itself
+    // becoming a generator or changing its return shape.
+    let content = "";
+    let toolCall: { name: string; args: Record<string, unknown> } | undefined;
+    for await (const event of streamModel(model, messages)) {
+      onStreamEvent?.(event);
+      if (event.type === "done") {
+        content = event.content;
+        toolCall = event.toolCall;
+      }
+    }
+    const response = { content, toolCall };
 
     if (response.toolCall) {
       toolCalled = response.toolCall.name;
