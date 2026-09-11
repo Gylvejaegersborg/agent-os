@@ -106,6 +106,28 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
+/** Wide-open CORS on every response — a deliberate choice, not an
+ *  oversight: this gateway's ONLY intended client today is a browser-side
+ *  BaseOS instance running on an arbitrary localhost/LAN port during dev
+ *  (Vite's dev server port changes across projects/machines), and there is
+ *  no auth layer yet for an origin allowlist to meaningfully gate (see
+ *  this file's own "HONEST LIMITATIONS" header — the whole gateway is
+ *  already fully trusted-network-only). Tightening this to a specific
+ *  origin is straightforward once real auth exists; doing so now would
+ *  only add friction without adding real security. Handles the browser's
+ *  OPTIONS preflight directly (204, no body) before any route matching. */
+function withCors(req: IncomingMessage, res: ServerResponse): boolean {
+  res.setHeader("access-control-allow-origin", "*");
+  res.setHeader("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.setHeader("access-control-allow-headers", "content-type");
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return true;
+  }
+  return false;
+}
+
 /** Starts the gateway's HTTP server. Every route is JSON in/out except
  *  GET /events, which upgrades to a Server-Sent Events stream. Returns a
  *  handle whose stop() closes the server, same shape as every other
@@ -114,6 +136,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 export function startGateway(deps: GatewayDeps, port = 0): Promise<GatewayHandle> {
   return new Promise((resolve) => {
     const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+      if (withCors(req, res)) return;
       try {
         await route(req, res, deps);
       } catch (err) {
