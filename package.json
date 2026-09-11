@@ -23,6 +23,7 @@
     "gateway": "tsc -b && node dist/gateway/cli.js",
     "test-gateway": "tsc -b && node dist/test-gateway.js",
     "test-agents": "tsc -b && node dist/test-agents.js",
+    "test-artifacts": "tsc -b && node dist/test-artifacts.js",
     "test-subagent": "tsc -b && node dist/test-subagent.js",
     "test-task-lifecycle": "tsc -b && node dist/test-task-lifecycle.js",
     "test-cross-harness-worker": "tsc -b && node dist/test-cross-harness-worker.js",

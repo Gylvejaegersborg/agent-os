@@ -13,8 +13,9 @@ import { generateId } from "./id.js";
 import { SkillRegistry, renderSkillCatalog } from "./skills.js";
 import { retrieveMemoryContext } from "./memory.js";
 import { getAgentIdentity } from "./identity.js";
-import { ensureSession, isSessionCancelled } from "./session.js";
+import { ensureSession, isSessionCancelled, getSession } from "./session.js";
 import { getToolDefinition, withTimeout } from "./tool-registry.js";
+import type { ArtifactType } from "./artifacts.js";
 import type { EpisodicKind } from "./types.js";
 
 export interface AgentTurnResult {
@@ -70,6 +71,16 @@ export interface RunTurnOptions {
    *  synchronous "ask the user right now" mechanism. Omit to disable
    *  nomination for this turn, same opt-in pattern as enableSubagents. */
   enableMemoryNominations?: boolean;
+  /** When provided, the model can call the `record-artifact` tool to
+   *  attach a produced output (a file it wrote via the shell tool, a
+   *  report, a plan, ...) to this Task/Session — see artifacts.ts. The
+   *  artifact itself is just a pointer (type + location + metadata);
+   *  this scaffold doesn't manage blob storage, so the model is
+   *  expected to have already produced the actual content some other
+   *  way (typically via the shell tool) before recording it. Omit to
+   *  disable artifact recording for this turn, same opt-in pattern as
+   *  enableSubagents/enableMemoryNominations. */
+  enableArtifacts?: boolean;
 }
 
 function sessionStream(sessionId: string): string {
@@ -144,6 +155,7 @@ async function dispatchTool(
     model: ModelAdapter;
     enableSubagents?: boolean;
     enableMemoryNominations?: boolean;
+    enableArtifacts?: boolean;
   },
 ): Promise<ToolDispatchResult> {
   if (toolCall.name === "shell") {
@@ -196,11 +208,32 @@ async function dispatchTool(
       output: `Nomination ${nomination.id} recorded as PENDING — it has no effect on memory until a human explicitly approves it.`,
     };
   }
+  if (toolCall.name === "record-artifact") {
+    if (!ctx.enableArtifacts) {
+      return { ok: false, output: "", error: "artifact recording is not enabled for this session" };
+    }
+    const type = String(toolCall.args.type ?? "other") as ArtifactType;
+    const location = String(toolCall.args.location ?? "");
+    if (!location) return { ok: false, output: "", error: "record-artifact tool call missing required 'location' argument" };
+    const description = typeof toolCall.args.description === "string" ? toolCall.args.description : undefined;
+    // Dynamic import mirrors the subagent.js/memory.js pattern above.
+    const { createArtifact } = await import("./artifacts.js");
+    const session = await getSession(ctx.sessionId);
+    const artifact = await createArtifact({
+      type,
+      location,
+      producer: ctx.agentId,
+      sessionId: ctx.sessionId,
+      taskId: session?.taskId,
+      metadata: description ? { description } : {},
+    });
+    return { ok: true, output: `Artifact ${artifact.id} (${type}) recorded at "${location}".` };
+  }
   return { ok: false, output: "", error: `unknown tool: ${toolCall.name}` };
 }
 
 export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
-  const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents, enableMemoryNominations } = opts;
+  const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents, enableMemoryNominations, enableArtifacts } = opts;
   const injectMemory = opts.injectMemory ?? true;
   const maxHops = opts.maxToolHops ?? 3;
 
@@ -250,6 +283,9 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     const nominationText = enableMemoryNominations
       ? "You can propose something worth remembering long-term by calling the `nominate-memory` tool with {content, kind}. This does NOT write to memory directly — it creates a pending nomination that a human must explicitly approve before it can ever influence curated memory."
       : "";
+    const artifactText = enableArtifacts
+      ? "When you produce a real output worth attaching to this task (a file you wrote, a report, a plan), call the `record-artifact` tool with {type, location, description?} to register it. This does not create the content itself — produce it first (e.g. via the shell tool), then record where it lives."
+      : "";
     // Re-read fresh every turn (not cached) — see injectMemory's own doc
     // comment for why. Only ever populated by the dreaming pass
     // (memory.ts), never by this turn's own conversation, so a chatty
@@ -258,7 +294,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     // personaText first — "who you are" precedes "what you remember/can do"
     // in the assembled system message, matching how a human-written system
     // prompt would order identity before capability context.
-    const systemParts = [personaText, memoryText, catalogText, subagentText, nominationText].filter(Boolean);
+    const systemParts = [personaText, memoryText, catalogText, subagentText, nominationText, artifactText].filter(Boolean);
     const messages: ModelMessage[] = systemParts.length
       ? [{ role: "system", content: systemParts.join("\n\n") }, ...history]
       : history;
@@ -299,6 +335,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
           model,
           enableSubagents,
           enableMemoryNominations,
+          enableArtifacts,
         }),
         toolDef?.timeoutMs,
         () => ({

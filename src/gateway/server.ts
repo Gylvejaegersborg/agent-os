@@ -62,8 +62,11 @@ import {
   getAgentRecord,
   registerAgent,
   updateAgent,
+  listArtifacts,
+  getArtifact,
 } from "../core/index.js";
 import type { SessionStatus, ApprovalStatus, TaskStatus } from "../core/types.js";
+import type { ArtifactType } from "../core/artifacts.js";
 
 export interface GatewayDeps {
   model: ModelAdapter;
@@ -71,6 +74,7 @@ export interface GatewayDeps {
   skills?: SkillRegistry;
   enableSubagents?: boolean;
   enableMemoryNominations?: boolean;
+  enableArtifacts?: boolean;
   maxToolHops?: number;
 }
 
@@ -174,6 +178,32 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
   if (method === "GET" && segments.length === 1 && segments[0] === "tools") {
     sendJson(res, 200, { tools: listToolDefinitions() });
     return;
+  }
+
+  // ---- Artifacts (artifacts.ts) — produced outputs attached to a
+  // Task/Session/Flow, so a client can list/open what an agent actually
+  // made without scraping raw tool-call output for it. ----
+  if (segments[0] === "artifacts") {
+    if (method === "GET" && segments.length === 1) {
+      const artifacts = await listArtifacts({
+        taskId: url.searchParams.get("taskId") ?? undefined,
+        sessionId: url.searchParams.get("sessionId") ?? undefined,
+        flowId: url.searchParams.get("flowId") ?? undefined,
+        producer: url.searchParams.get("producer") ?? undefined,
+        type: (url.searchParams.get("type") as ArtifactType | null) ?? undefined,
+      });
+      sendJson(res, 200, { artifacts });
+      return;
+    }
+    if (method === "GET" && segments.length === 2) {
+      const artifact = await getArtifact(segments[1]!);
+      if (!artifact) {
+        sendJson(res, 404, { error: `no such artifact: ${segments[1]}` });
+        return;
+      }
+      sendJson(res, 200, artifact);
+      return;
+    }
   }
 
   // ---- Agents — the authoritative registry (agents.ts). This is what
@@ -307,6 +337,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         skills: deps.skills,
         enableSubagents: deps.enableSubagents,
         enableMemoryNominations: deps.enableMemoryNominations,
+        enableArtifacts: deps.enableArtifacts,
         maxToolHops: deps.maxToolHops,
       });
       sendJson(res, 200, result);

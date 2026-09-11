@@ -10,7 +10,7 @@
 
 import "./test-helpers/isolate.js";
 import { startGateway } from "./gateway/server.js";
-import { createStubModel, createStubWorker, installPermissionPolicy } from "./core/index.js";
+import { createStubModel, createStubWorker, installPermissionPolicy, createArtifact } from "./core/index.js";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) {
@@ -230,7 +230,24 @@ async function main(): Promise<void> {
       "GET /agents includes the created agent",
     );
 
-    console.log("\n-- 9. Unknown routes return 404, not a crash --");
+    console.log("\n-- 9. Artifact endpoints over real HTTP --");
+    const artifact = await createArtifact({ type: "report", location: "/workspace/report.md", producer: "claude" });
+    const getArtifactRes = await fetch(`${base}/artifacts/${artifact.id}`);
+    assert(getArtifactRes.status === 200, "GET /artifacts/:id returns 200 for a real artifact");
+    const fetchedArtifact = (await getArtifactRes.json()) as any;
+    assert(fetchedArtifact.location === "/workspace/report.md", "the fetched artifact's location matches what was created");
+
+    const missingArtifactRes = await fetch(`${base}/artifacts/no-such-artifact`);
+    assert(missingArtifactRes.status === 404, "GET /artifacts/:id returns 404 for an unknown id");
+
+    const listArtifactsRes = await fetch(`${base}/artifacts?type=report`);
+    const listedArtifacts = (await listArtifactsRes.json()) as any;
+    assert(
+      listedArtifacts.artifacts.some((a: any) => a.id === artifact.id),
+      "GET /artifacts?type= includes the created artifact",
+    );
+
+    console.log("\n-- 10. Unknown routes return 404, not a crash --");
     const notFoundRes = await fetch(`${base}/no-such-route`);
     assert(notFoundRes.status === 404, "an unknown route returns 404");
   } finally {

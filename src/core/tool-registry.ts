@@ -94,6 +94,15 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
       kind: { type: "string", description: "One of the EpisodicKind values (fact, preference, correction, outcome, skill-candidate)." },
     },
   },
+  {
+    name: "record-artifact",
+    description: "Attaches a produced output (a file, report, plan, ...) to the current Task/Session — does not create the content itself.",
+    inputSchema: {
+      type: { type: "string", required: true, description: "One of the ArtifactType values (code, file, report, image, dataset, plan, draft, other)." },
+      location: { type: "string", required: true, description: "Where the content lives (a path, a URL)." },
+      description: { type: "string", description: "Optional human-readable description of the artifact." },
+    },
+  },
 ];
 
 for (const def of BUILTIN_TOOL_DEFINITIONS) registerTool(def);
