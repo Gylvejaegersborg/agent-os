@@ -217,13 +217,33 @@ function looksLikePath(token: string): boolean {
   return /[\\/]/.test(token) || /^[A-Za-z]:/.test(token);
 }
 
+/** Matches a Windows drive-absolute path ("C:\...", "C:/...") regardless
+ *  of the HOST platform this check itself is running on. This is
+ *  deliberately NOT gated on IS_WIN32: a sandboxed Worker enforcing a
+ *  Linux-hosted deployment can still receive a command string containing
+ *  a Windows-style path (a model can emit any string it likes), and
+ *  Node's path.resolve() only treats "C:\..." as absolute when the
+ *  PROCESS itself is running on win32 — on POSIX it silently treats the
+ *  drive letter as an ordinary relative path segment, which resolves
+ *  *inside* `root` instead of being rejected. That was a live bypass:
+ *  see the regression tests in test-sandbox-hardening.ts for (b)/(d).
+ */
+const WINDOWS_DRIVE_PATH = /^[A-Za-z]:[\\/]/;
+
 /** Resolves a path-like token to an absolute path, first normalizing any
  *  MSYS-style drive prefix. Relative tokens resolve against `root`;
  *  absolute tokens (Windows drive paths, UNC paths, POSIX-rooted paths)
  *  resolve to themselves regardless of `root` — which is exactly the case
- *  the old "../"-only check missed entirely. */
+ *  the old "../"-only check missed entirely. Windows drive-absolute paths
+ *  are resolved via posix rules on purpose (see WINDOWS_DRIVE_PATH) so the
+ *  check is host-platform-independent instead of only correct when this
+ *  process itself happens to run on win32. */
 function resolveCandidate(root: string, token: string): string {
-  return path.resolve(root, normalizeMsysPath(token));
+  const normalized = normalizeMsysPath(token);
+  if (WINDOWS_DRIVE_PATH.test(normalized)) {
+    return path.posix.resolve("/" + normalized.replace(/\\/g, "/"));
+  }
+  return path.resolve(root, normalized);
 }
 
 /** Resolves symlinks via fs.realpathSync where the path (or the nearest
