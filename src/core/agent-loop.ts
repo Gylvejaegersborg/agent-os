@@ -13,6 +13,7 @@ import { SkillRegistry, renderSkillCatalog } from "./skills.js";
 import { retrieveMemoryContext } from "./memory.js";
 import { getAgentIdentity } from "./identity.js";
 import { ensureSession, isSessionCancelled } from "./session.js";
+import { getToolDefinition, withTimeout } from "./tool-registry.js";
 import type { EpisodicKind } from "./types.js";
 
 export interface AgentTurnResult {
@@ -273,15 +274,31 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       }
 
       await appendEvent(sessionStream(sessionId), "tool.call.start", response.toolCall);
-      const result = await dispatchTool(response.toolCall, {
-        worker,
-        skills,
-        agentId,
-        sessionId,
-        model,
-        enableSubagents,
-        enableMemoryNominations,
-      });
+      // A registered ToolDefinition's timeoutMs (tool-registry.ts) is
+      // enforced HERE, at the one call site every tool call passes
+      // through — not inside dispatchTool()'s individual branches — so
+      // it applies uniformly regardless of which tool ran. Every
+      // built-in tool ships with no timeoutMs by default (see
+      // BUILTIN_TOOL_DEFINITIONS), so withTimeout() is a true no-op for
+      // existing behavior unless a caller explicitly registers one.
+      const toolDef = getToolDefinition(response.toolCall.name);
+      const result = await withTimeout(
+        dispatchTool(response.toolCall, {
+          worker,
+          skills,
+          agentId,
+          sessionId,
+          model,
+          enableSubagents,
+          enableMemoryNominations,
+        }),
+        toolDef?.timeoutMs,
+        () => ({
+          ok: false,
+          output: "",
+          error: `tool "${response.toolCall!.name}" timed out after ${toolDef?.timeoutMs}ms`,
+        }),
+      );
       await appendEvent(sessionStream(sessionId), "tool.call.end", { ...response.toolCall, result });
       await fireHook("tool.after", { agentId, sessionId, payload: { ...response.toolCall, result } });
 
