@@ -82,6 +82,39 @@ export interface Automation {
 // STANDING_ORDERS_FILE), interpreted by the agent at runtime. This is a
 // conscious choice mirroring OpenClaw's design, not an oversight.
 
+export type ApprovalStatus = "pending" | "approved" | "rejected";
+
+/** A durable "approval required" record — what a dangerous tool call (or
+ *  any other configured-dangerous operation) becomes when Layer A's
+ *  PermissionPolicy (permissions.ts) evaluates a rule as "ask" with no
+ *  synchronous onAsk callback wired up. Unlike a synchronous onAsk
+ *  callback (which can only ever say yes/no in the moment, in the SAME
+ *  process, and defaults to deny so nothing hangs), this is a real event-
+ *  sourced record: it survives process restart, is independently
+ *  listable/queryable, and can be approved or rejected by a human from an
+ *  entirely different process — hours or days later — which is exactly
+ *  what a gateway-fronted runtime needs (see approvals.ts). */
+export interface ApprovalRequest {
+  id: string;
+  agentId: string;
+  sessionId: string;
+  toolName: string;
+  args: Record<string, unknown>;
+  /** Why approval was required — e.g. the PermissionPolicy rule/reason
+   *  that produced the "ask" decision, so a human reviewing the queue
+   *  doesn't have to reverse-engineer it. */
+  reason: string;
+  status: ApprovalStatus;
+  requestedAt: string;
+  resolvedAt?: string;
+  /** Free-text identifier of who resolved it (e.g. a user id/email) —
+   *  deliberately untyped/unauthenticated at this layer, same as every
+   *  other "who did this" field in this scaffold (see docs/architecture.md
+   *  for where real auth is expected to live, once a gateway exists). */
+  resolvedBy?: string;
+  resolutionNote?: string;
+}
+
 export type SessionStatus = "active" | "paused" | "cancelled" | "completed" | "error";
 
 /** "Who is talking to whom, and is it still going" — a first-class,

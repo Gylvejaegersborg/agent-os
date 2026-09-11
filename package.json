@@ -17,6 +17,7 @@
     "test-heartbeat": "tsc -b && node dist/test-heartbeat.js",
     "test-sandbox-hardening": "tsc -b && node dist/test-sandbox-hardening.js",
     "test-session": "tsc -b && node dist/test-session.js",
+    "test-approvals": "tsc -b && node dist/test-approvals.js",
     "test-subagent": "tsc -b && node dist/test-subagent.js",
     "test-task-lifecycle": "tsc -b && node dist/test-task-lifecycle.js",
     "test-cross-harness-worker": "tsc -b && node dist/test-cross-harness-worker.js",
