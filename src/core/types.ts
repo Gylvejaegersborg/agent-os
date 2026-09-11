@@ -115,6 +115,28 @@ export interface ApprovalRequest {
   resolutionNote?: string;
 }
 
+export type WorkerLifecycleStatus = "starting" | "running" | "stopped" | "error";
+
+/** A registry entry ABOUT a Worker (worker.ts) — deliberately separate
+ *  from the Worker interface itself (which is just `{id, kind, run()}`,
+ *  a behavioral contract, not a data shape that fits alongside the rest
+ *  of types.ts). worker.ts's Workers are stateless from the runtime's own
+ *  point of view: createLocalShellWorker() returns an object with a
+ *  run() method and nothing else remembers it exists. This record is
+ *  what lets "list active workers" / "is this worker still running" be
+ *  answered without threading worker lifecycle through every call site
+ *  that happens to construct one — a caller opts in by registering it. */
+export interface WorkerRecord {
+  id: string;
+  kind: string;
+  status: WorkerLifecycleStatus;
+  registeredAt: string;
+  startedAt?: string;
+  stoppedAt?: string;
+  lastError?: string;
+  metadata: Record<string, unknown>;
+}
+
 export type SessionStatus = "active" | "paused" | "cancelled" | "completed" | "error";
 
 /** "Who is talking to whom, and is it still going" — a first-class,
