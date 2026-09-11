@@ -25,6 +25,7 @@
     "test-agents": "tsc -b && node dist/test-agents.js",
     "test-artifacts": "tsc -b && node dist/test-artifacts.js",
     "test-flow-engine": "tsc -b && node dist/test-flow-engine.js",
+    "test-streaming": "tsc -b && node dist/test-streaming.js",
     "test-subagent": "tsc -b && node dist/test-subagent.js",
     "test-task-lifecycle": "tsc -b && node dist/test-task-lifecycle.js",
     "test-cross-harness-worker": "tsc -b && node dist/test-cross-harness-worker.js",

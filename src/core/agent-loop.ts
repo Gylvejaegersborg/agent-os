@@ -298,7 +298,22 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     const messages: ModelMessage[] = systemParts.length
       ? [{ role: "system", content: systemParts.join("\n\n") }, ...history]
       : history;
-    const response = await model.complete(messages);
+    // Prefer real incremental streaming when this model adapter supports
+    // it (model.ts's ModelAdapter.completeStream) — publishes each chunk
+    // on the real event bus AS IT ARRIVES, not just the final assembled
+    // text once the whole call finishes. A model without completeStream
+    // behaves exactly as before this existed (plain model.complete()).
+    // Deltas are deliberately NOT appended to the durable session stream
+    // — they're ephemeral live-progress signal; the one final assembled
+    // "session.message" event below remains the durable record, same as
+    // always, so the event log doesn't balloon with one entry per token.
+    const response = model.completeStream
+      ? await model.completeStream(messages, (delta) => {
+          publishEvent("agent.turn.delta", { sessionId, agentId, delta }).catch((err) => {
+            console.error("[agent-loop] failed to publish turn delta:", err instanceof Error ? err.message : err);
+          });
+        })
+      : await model.complete(messages);
 
     if (response.toolCall) {
       toolCalled = response.toolCall.name;
