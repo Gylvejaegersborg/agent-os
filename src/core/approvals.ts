@@ -13,6 +13,7 @@
 // status enforcement.
 
 import { project, appendEvent } from "./eventlog.js";
+import { publishEvent } from "./eventbus.js";
 import { generateId } from "./id.js";
 import type { ApprovalRequest, ApprovalStatus } from "./types.js";
 
@@ -31,6 +32,9 @@ export async function requestApproval(input: RequestApprovalInput): Promise<Appr
   await appendEvent(APPROVALS_STREAM, "approval.requested", { approvalId: id, ...input });
   const request = await getApproval(id);
   if (!request) throw new Error("approval.requested event did not project to an approval request");
+  // Published live so a gateway can surface "approval needed" the moment
+  // it happens — see agent-loop.ts's runTurn() for the same pattern.
+  await publishEvent("approval.requested", { approvalId: id, ...input });
   return request;
 }
 
@@ -98,6 +102,7 @@ async function resolveApproval(
   await appendEvent(APPROVALS_STREAM, "approval.resolved", { approvalId: id, status, ...extra });
   const updated = await getApproval(id);
   if (!updated) throw new Error("approval.resolved event did not project to an approval request");
+  await publishEvent("approval.resolved", { approvalId: id, status, ...extra });
   return updated;
 }
 

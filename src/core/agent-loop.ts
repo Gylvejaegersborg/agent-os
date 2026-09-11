@@ -5,6 +5,7 @@
 // observability for free (see eventlog.ts).
 
 import { appendEvent, project } from "./eventlog.js";
+import { publishEvent } from "./eventbus.js";
 import type { ModelAdapter, ModelMessage } from "./model.js";
 import type { Worker } from "./worker.js";
 import { fireHook } from "./hooks.js";
@@ -211,6 +212,12 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
 
   await appendEvent(sessionStream(sessionId), "agent.turn.start", { agentId, userMessage });
   await fireHook("agent.turn.start", { agentId, sessionId, payload: { userMessage } });
+  // Published on the real event bus (eventbus.ts), NOT a second/parallel
+  // event system — this is what lets an external transport (the gateway,
+  // still to be built) expose live runtime activity by subscribing to
+  // the SAME event types already recorded in the session stream above,
+  // rather than polling the filesystem for changes.
+  await publishEvent("agent.turn.start", { sessionId, agentId, userMessage });
 
   await appendEvent(sessionStream(sessionId), "session.message", { role: "user", content: userMessage });
 
@@ -274,6 +281,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       }
 
       await appendEvent(sessionStream(sessionId), "tool.call.start", response.toolCall);
+      await publishEvent("tool.call.start", { sessionId, agentId, ...response.toolCall });
       // A registered ToolDefinition's timeoutMs (tool-registry.ts) is
       // enforced HERE, at the one call site every tool call passes
       // through — not inside dispatchTool()'s individual branches — so
@@ -300,6 +308,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
         }),
       );
       await appendEvent(sessionStream(sessionId), "tool.call.end", { ...response.toolCall, result });
+      await publishEvent("tool.call.end", { sessionId, agentId, ...response.toolCall, result });
       await fireHook("tool.after", { agentId, sessionId, payload: { ...response.toolCall, result } });
 
       await appendEvent(sessionStream(sessionId), "session.message", {
@@ -334,6 +343,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
 
   await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled });
   await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled } });
+  await publishEvent("agent.turn.end", { sessionId, agentId, finalContent, toolCalled, cancelled });
 
   return { sessionId, finalContent, toolCalled, cancelled: cancelled || undefined };
 }

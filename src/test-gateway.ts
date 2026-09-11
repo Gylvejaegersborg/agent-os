@@ -1,0 +1,204 @@
+// Integration test for the Agent-OS Gateway (gateway/server.ts) — proves
+// the full external-client path the architecture audit called out as
+// missing: a real HTTP client (not an in-process function call) can
+// create a session, send a message, see it run, cancel a session, list
+// tasks/flows/workers/tools, and go through the request/resolve approval
+// flow end to end, purely via fetch() against a real listening server.
+// Also proves GET /events (SSE) actually delivers live events published
+// during a real runTurn() call.
+// Run with: node dist/test-gateway.js
+
+import "./test-helpers/isolate.js";
+import { startGateway } from "./gateway/server.js";
+import { createStubModel, createStubWorker, installPermissionPolicy } from "./core/index.js";
+
+function assert(cond: boolean, msg: string): void {
+  if (!cond) {
+    console.error(`FAIL: ${msg}`);
+    process.exitCode = 1;
+  } else {
+    console.log(`ok: ${msg}`);
+  }
+}
+
+async function main(): Promise<void> {
+  const gateway = await startGateway({
+    model: createStubModel(),
+    worker: createStubWorker(),
+  });
+  const base = `http://127.0.0.1:${gateway.port}`;
+
+  try {
+    console.log("\n-- 1. Health check --");
+    const health = await fetch(`${base}/health`);
+    assert(health.status === 200, "GET /health returns 200");
+    assert((await health.json() as any).ok === true, "GET /health body is {ok:true}");
+
+    console.log("\n-- 2. Session lifecycle over real HTTP --");
+    const createRes = await fetch(`${base}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agentId: "gateway-test-agent", title: "integration test" }),
+    });
+    assert(createRes.status === 201, "POST /sessions returns 201");
+    const session = (await createRes.json()) as any;
+    assert(session.status === "active", "the created session starts 'active'");
+    assert(session.title === "integration test", "title round-trips through the API");
+
+    const getRes = await fetch(`${base}/sessions/${session.id}`);
+    assert(getRes.status === 200, "GET /sessions/:id returns 200 for a real session");
+    const fetched = (await getRes.json()) as any;
+    assert(fetched.id === session.id, "GET /sessions/:id returns the same session");
+
+    const missingRes = await fetch(`${base}/sessions/no-such-session`);
+    assert(missingRes.status === 404, "GET /sessions/:id returns 404 for an unknown id");
+
+    const listRes = await fetch(`${base}/sessions?agentId=gateway-test-agent`);
+    const listed = (await listRes.json()) as any;
+    assert(
+      listed.sessions.some((s: any) => s.id === session.id),
+      "GET /sessions?agentId= includes the created session",
+    );
+
+    console.log("\n-- 3. Sending a turn over real HTTP --");
+    const turnRes = await fetch(`${base}/sessions/${session.id}/turns`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ userMessage: "hello from an HTTP client" }),
+    });
+    assert(turnRes.status === 200, "POST /sessions/:id/turns returns 200");
+    const turnResult = (await turnRes.json()) as any;
+    assert(
+      /acknowledged/.test(turnResult.finalContent),
+      `the turn actually ran through the real agent loop (got: "${turnResult.finalContent}")`,
+    );
+
+    const historyRes = await fetch(`${base}/sessions/${session.id}/history`);
+    const history = (await historyRes.json()) as any;
+    assert(
+      history.history.some((m: any) => m.role === "user" && m.content === "hello from an HTTP client"),
+      "GET /sessions/:id/history reflects the message that was actually sent",
+    );
+
+    console.log("\n-- 4. Cancelling a session over real HTTP --");
+    const cancelRes = await fetch(`${base}/sessions/${session.id}/cancel`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ reason: "integration test cancellation" }),
+    });
+    assert(cancelRes.status === 200, "POST /sessions/:id/cancel returns 200");
+    assert(((await cancelRes.json()) as any).status === "cancelled", "the session's status is 'cancelled' in the response");
+
+    const cancelAgainRes = await fetch(`${base}/sessions/${session.id}/cancel`, { method: "POST" });
+    assert(cancelAgainRes.status === 409, "cancelling an already-cancelled session returns 409, not 500");
+
+    console.log("\n-- 5. Tasks/flows/workers/tools listing endpoints --");
+    const tasksRes = await fetch(`${base}/tasks`);
+    assert(tasksRes.status === 200, "GET /tasks returns 200 (even with zero tasks)");
+    const flowsRes = await fetch(`${base}/flows`);
+    assert(flowsRes.status === 200, "GET /flows returns 200");
+    const workersRes = await fetch(`${base}/workers`);
+    assert(workersRes.status === 200, "GET /workers returns 200");
+    const toolsRes = await fetch(`${base}/tools`);
+    const tools = (await toolsRes.json()) as any;
+    assert(
+      tools.tools.some((t: any) => t.name === "shell"),
+      "GET /tools lists the built-in 'shell' tool definition",
+    );
+
+    console.log("\n-- 6. Approval request/resolve flow over real HTTP --");
+    const approvalAgentId = "gateway-approval-agent";
+    installPermissionPolicy({ agentId: approvalAgentId, rules: [{ tool: "shell", decision: "ask" }] });
+    const approvalSessionRes = await fetch(`${base}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agentId: approvalAgentId }),
+    });
+    const approvalSession = (await approvalSessionRes.json()) as any;
+    await fetch(`${base}/sessions/${approvalSession.id}/turns`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ userMessage: "run shell: echo hi" }),
+    });
+
+    const pendingRes = await fetch(`${base}/approvals?status=pending&sessionId=${approvalSession.id}`);
+    const pending = (await pendingRes.json()) as any;
+    assert(pending.approvals.length === 1, `exactly one pending approval was created (got ${pending.approvals.length})`);
+    const approvalId = pending.approvals[0].id;
+
+    const approveRes = await fetch(`${base}/approvals/${approvalId}/approve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ resolvedBy: "integration-test-human", note: "looks fine" }),
+    });
+    assert(approveRes.status === 200, "POST /approvals/:id/approve returns 200");
+    const approved = (await approveRes.json()) as any;
+    assert(approved.status === "approved", "the approval's status is 'approved' in the response");
+
+    const reApproveRes = await fetch(`${base}/approvals/${approvalId}/approve`, { method: "POST" });
+    assert(reApproveRes.status === 409, "re-approving an already-resolved request returns 409, not 500");
+
+    console.log("\n-- 7. Live events over SSE actually stream real activity --");
+    const sseSessionRes = await fetch(`${base}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agentId: "gateway-sse-agent" }),
+    });
+    const sseSession = (await sseSessionRes.json()) as any;
+
+    const sseController = new AbortController();
+    const sseResponse = await fetch(`${base}/events?types=agent.turn.start,agent.turn.end`, {
+      signal: sseController.signal,
+    });
+    assert(sseResponse.status === 200, "GET /events returns 200");
+    assert(
+      sseResponse.headers.get("content-type")?.includes("text/event-stream") ?? false,
+      "GET /events responds with text/event-stream",
+    );
+
+    const reader = sseResponse.body!.getReader();
+    const decoder = new TextDecoder();
+    let received = "";
+    const collectEvents = (async () => {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        received += decoder.decode(value, { stream: true });
+        if (received.includes("agent.turn.end")) break;
+      }
+    })();
+
+    // Give the SSE connection a moment to actually register its
+    // subscription before the event that should trigger it fires.
+    await new Promise((r) => setTimeout(r, 50));
+    await fetch(`${base}/sessions/${sseSession.id}/turns`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ userMessage: "trigger some live events" }),
+    });
+
+    await Promise.race([collectEvents, new Promise((r) => setTimeout(r, 3000))]);
+    sseController.abort();
+
+    assert(received.includes("event: agent.turn.start"), "the SSE stream delivered a real 'agent.turn.start' event");
+    assert(received.includes("event: agent.turn.end"), "the SSE stream delivered a real 'agent.turn.end' event");
+    assert(received.includes(sseSession.id), "the delivered event payload references the actual session id");
+
+    console.log("\n-- 8. Unknown routes return 404, not a crash --");
+    const notFoundRes = await fetch(`${base}/no-such-route`);
+    assert(notFoundRes.status === 404, "an unknown route returns 404");
+  } finally {
+    await gateway.stop();
+  }
+
+  if (process.exitCode === 1) {
+    console.error("\nSome gateway tests FAILED.");
+  } else {
+    console.log("\nAll gateway tests passed.");
+  }
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

@@ -15,6 +15,7 @@
 // disk to do it.
 
 import { project, appendEvent } from "./eventlog.js";
+import { publishEvent } from "./eventbus.js";
 import { generateId } from "./id.js";
 import type { Session, SessionStatus } from "./types.js";
 
@@ -142,6 +143,11 @@ export async function setSessionStatus(
   await appendEvent(SESSIONS_STREAM, "session.status.changed", { sessionId: id, status, reason: extra.reason });
   const updated = await getSession(id);
   if (!updated) throw new Error("session.status.changed event did not project to a session");
+  // Published on the real event bus — see agent-loop.ts's runTurn() for
+  // the same pattern applied to turn/tool lifecycle. This is what lets a
+  // gateway surface "session cancelled"/"session completed" live rather
+  // than a client having to poll getSession() to notice.
+  await publishEvent("session.status.changed", { sessionId: id, agentId: updated.agentId, status, reason: extra.reason });
   return updated;
 }
 
