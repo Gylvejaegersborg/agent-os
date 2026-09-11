@@ -52,12 +52,14 @@ export async function transitionTask(
   await appendEvent(TASKS_STREAM, "task.status.changed", { taskId, status, ...extra });
   if (!before) return; // nothing to notify/propagate for an unknown task id
 
-  // Liveness bookkeeping for reconcileLostTasks() — see that function's
-  // header for the full detection-strategy writeup. Kept as simple set
-  // membership: a Task is "live" in THIS process from the moment it enters
-  // 'running' here until it leaves 'running' (any terminal status).
+  // liveTaskIds tracks which Tasks THIS process currently considers its
+  // own — used only to know what startTaskLivenessRenewer() (below)
+  // should renew on a cadence. It is NOT what reconcileLostTasks() itself
+  // consults anymore — see that function's header for why durable renewal
+  // events are the actual liveness signal now.
   if (status === "running") {
     liveTaskIds.add(taskId);
+    await renewTaskLiveness(taskId); // every transition into 'running' — including a re-registration after restart — counts as a fresh heartbeat
   } else {
     liveTaskIds.delete(taskId);
   }
@@ -69,10 +71,16 @@ export async function transitionTask(
 
 interface TaskProjectionState {
   tasks: Map<string, Task>;
+  /** Most recent durable liveness signal per taskId — either an explicit
+   *  task.liveness.renewed event, or (since transitionTask() renews on
+   *  every transition into 'running') the timestamp of the latest such
+   *  transition. See reconcileLostTasks() below for how this replaces
+   *  liveTaskIds as the actual staleness signal. */
+  lastRenewedAt: Map<string, string>;
 }
 
 async function projectTasks(): Promise<TaskProjectionState> {
-  return project<TaskProjectionState>(TASKS_STREAM, { tasks: new Map() }, (state, event) => {
+  return project<TaskProjectionState>(TASKS_STREAM, { tasks: new Map(), lastRenewedAt: new Map() }, (state, event) => {
     if (event.type === "task.created") {
       const p = event.payload as any;
       state.tasks.set(p.taskId, {
@@ -99,6 +107,9 @@ async function projectTasks(): Promise<TaskProjectionState> {
       }
       if (p.output) updated.output = p.output;
       state.tasks.set(p.taskId, updated);
+    } else if (event.type === "task.liveness.renewed") {
+      const p = event.payload as any;
+      state.lastRenewedAt.set(p.taskId, event.timestamp);
     }
     // task.timeout.checked / task.notification.sent / task.notification.suppressed /
     // task.reconciliation.swept are audit-only events — they don't change a
@@ -107,6 +118,19 @@ async function projectTasks(): Promise<TaskProjectionState> {
     // intentionally falls through and leaves state untouched for them.
     return state;
   });
+}
+
+/** Appends a durable liveness heartbeat for a Task — the actual signal
+ *  reconcileLostTasks() (below) uses to decide staleness, replacing the
+ *  old in-memory-only liveTaskIds check. Called automatically by
+ *  transitionTask() on every transition into 'running' (so simply
+ *  re-registering ownership after a restart already counts), and
+ *  periodically by startTaskLivenessRenewer() for as long as a process
+ *  keeps a Task in its own liveTaskIds set. Exported directly too, for a
+ *  Worker/process that wants to renew mid-execution on its own cadence
+ *  without going through transitionTask(). */
+export async function renewTaskLiveness(taskId: string): Promise<void> {
+  await appendEvent(TASKS_STREAM, "task.liveness.renewed", { taskId });
 }
 
 export async function getTask(taskId: string): Promise<Task | undefined> {
@@ -201,82 +225,128 @@ export function startTaskTimeoutSweeper(intervalMs = 30_000, defaultTimeoutMs?: 
 
 // ---- 'lost' detection ----
 //
-// Honest statement of the detection strategy (this is a single-process
-// scaffold with no OS-level process supervision, container runtime, or
-// distributed lease store — a production version needs one of those; see
-// docs/architecture.md and the README section this ships with for what to
-// swap in):
+// DURABLE, multi-process-safe version — this replaced an earlier
+// in-memory-only `liveTaskIds`-membership check (see git history/README
+// for that version's own honest-limitations writeup, which named this
+// exact mechanism as the needed upgrade: "a shared lease/heartbeat
+// registry... a `task.liveness.renewed` event type with a TTL, written
+// periodically by whichever process owns the Task, and
+// reconcileLostTasks() checking 'renewed within the last N seconds'
+// instead of local Set membership").
 //
-//   `liveTaskIds` is an in-memory Set, scoped to the CURRENT process, of
-//   every Task id this process has itself transitioned into 'running' and
-//   not yet transitioned out of it. transitionTask() maintains it as a
-//   side effect (see above). It is NOT persisted and NOT shared across
-//   processes — which is exactly what makes it useful as a liveness
-//   signal: a brand-new process starts with an EMPTY liveTaskIds, on
-//   purpose.
+// How it works now: transitionTask() appends a `task.liveness.renewed`
+// event every time a Task transitions into 'running' (including a FRESH
+// process re-registering ownership after a restart — see
+// testLostDetection's "stillAlive" case), and a process that owns a
+// long-running Task can keep renewing it on a cadence via
+// startTaskLivenessRenewer() (below) or renewTaskLiveness() directly.
+// reconcileLostTasks() — callable from ANY process, including one that
+// has never touched this Task before — reads the MOST RECENT renewal per
+// taskId straight from the durable event log (projectTasks()'s
+// lastRenewedAt map) and compares it against `staleAfterMs`: a 'running'
+// Task with no renewal inside that window (falling back to its
+// `startedAt` if it was never explicitly renewed) is orphaned. This is a
+// genuine cross-process signal — two separate Node processes sharing the
+// same AGENT_OS_DATA_DIR each see the same renewal history — unlike the
+// old per-process Set, which by construction could never be seen by
+// anyone but the process that owned it.
 //
-//   reconcileLostTasks() is meant to be called once, early, at process
-//   startup (before that process creates or resumes any Tasks of its
-//   own) — mirroring how a Kubernetes Job controller or Sidekiq's
-//   orphaned-job sweep reconciles on supervisor restart. At that moment,
-//   ANY Task the event log says is still 'running' cannot possibly be
-//   live in this fresh process (nothing has run yet), so if it's also not
-//   live in any OTHER still-running process, it's orphaned: the process
-//   that was actually executing it is gone (crashed, killed, redeployed)
-//   and never got the chance to append a terminal task.status.changed
-//   event. This scaffold has exactly one process talking to the event
-//   log at a time in every demo/test here, so "not in liveTaskIds at
-//   reconciliation time" is a correct signal in that setting.
-//
-//   What this deliberately does NOT do: distinguish "genuinely crashed"
-//   from "still alive in some OTHER live process that just hasn't
-//   registered here" in a true multi-process deployment — that needs a
-//   shared lease/heartbeat registry (e.g. a `task.liveness.renewed` event
-//   type with a TTL, written periodically by whichever process owns the
-//   Task, and reconcileLostTasks() checking "renewed within the last N
-//   seconds" instead of local Set membership). The Set-based approach
-//   here is the honestly-scoped, zero-dependency version of that idea for
-//   a scaffold that only ever runs one active process against the log.
+// Still-honest remaining limitation: this is a POLLING lease over a flat
+// file, not a real distributed lock — two processes racing to both
+// "claim" the same orphaned Task after reconciliation could both start
+// executing it (no fencing token). A production deployment with genuine
+// concurrent workers needs an actual lease/lock primitive (e.g. a
+// database row lock, or a proper distributed lock service) on top of
+// this; what's here is what makes "is this task's owner even still
+// alive" answerable across processes at all, which the old mechanism
+// could not do.
 
 const liveTaskIds = new Set<string>();
+
+/** How long a 'running' Task may go without a liveness renewal before
+ *  reconcileLostTasks() considers it orphaned. Should comfortably exceed
+ *  whatever interval a real deployment's startTaskLivenessRenewer() (or
+ *  equivalent) renews on — this scaffold's own renewer defaults to a
+ *  10s cadence, so 45s tolerates a couple of missed ticks before
+ *  declaring a Task lost. */
+const DEFAULT_STALE_AFTER_MS = 45_000;
 
 export interface ReconciliationResult {
   checked: number;
   lost: string[];
 }
 
-/** Sweeps every currently-'running' Task and marks any NOT present in this
- *  process's `liveTaskIds` registry as 'lost' (see the strategy writeup
- *  above). Always appends a `task.reconciliation.swept` audit event first,
- *  recording exactly what was running and what was found orphaned, then
- *  drives each orphan through the same transitionTask() path as any other
- *  status change (so notifyPolicy and mirrored-Flow propagation both still
- *  apply to a 'lost' transition, not just to normal completions). */
-export async function reconcileLostTasks(): Promise<ReconciliationResult> {
-  const { tasks } = await projectTasks();
+/** Sweeps every currently-'running' Task and marks any whose most recent
+ *  durable liveness renewal (see the strategy writeup above) is older
+ *  than `staleAfterMs` as 'lost'. Always appends a
+ *  `task.reconciliation.swept` audit event first, recording exactly what
+ *  was running and what was found orphaned, then drives each orphan
+ *  through the same transitionTask() path as any other status change (so
+ *  notifyPolicy and mirrored-Flow propagation both still apply to a
+ *  'lost' transition, not just to normal completions). Safe to call from
+ *  a brand-new process that has never seen these Tasks before — that's
+ *  the whole point. */
+export async function reconcileLostTasks(opts: { staleAfterMs?: number; now?: Date } = {}): Promise<ReconciliationResult> {
+  const staleAfterMs = opts.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+  const now = (opts.now ?? new Date()).getTime();
+  const { tasks, lastRenewedAt } = await projectTasks();
   const running = [...tasks.values()].filter((t) => t.status === "running");
-  const lost = running.filter((t) => !liveTaskIds.has(t.id));
+  const lost = running.filter((t) => {
+    const last = lastRenewedAt.get(t.id) ?? t.startedAt;
+    if (!last) return true; // 'running' with no startedAt at all shouldn't happen, but treat defensively as orphaned rather than trusting it
+    return now - new Date(last).getTime() > staleAfterMs;
+  });
 
   await appendEvent(TASKS_STREAM, "task.reconciliation.swept", {
-    sweptAt: new Date().toISOString(),
+    sweptAt: new Date(now).toISOString(),
+    staleAfterMs,
     runningTaskIds: running.map((t) => t.id),
     lostTaskIds: lost.map((t) => t.id),
   });
 
   for (const t of lost) {
-    await transitionTask(t.id, "lost", { reason: "not registered as live in any process during reconciliation sweep" });
+    await transitionTask(t.id, "lost", { reason: `no liveness renewal within the last ${staleAfterMs}ms` });
   }
 
   return { checked: running.length, lost: lost.map((t) => t.id) };
 }
 
-/** Test/ops hook: clears this process's live-task registry WITHOUT
- *  touching the event log — simulates exactly what a real process crash
- *  + restart does to `liveTaskIds` (see reconcileLostTasks() above),
- *  which is what lets tests exercise "lost" detection deterministically
- *  without actually killing a process. Mirrors the existing
- *  clearHooks()/clearEventBusSubscribers() reset-for-tests pattern used
- *  elsewhere in this codebase. */
+export interface LivenessRenewerHandle {
+  stop: () => void;
+}
+
+/** Starts a real interval loop renewing liveness (renewTaskLiveness())
+ *  for every Task currently in THIS process's `liveTaskIds` — i.e. every
+ *  Task this process has itself transitioned into 'running' and not yet
+ *  out of. Mirrors startTaskTimeoutSweeper()'s shape (unref'd timer,
+ *  stop() handle). A real deployment that keeps long-running Tasks alive
+ *  for longer than DEFAULT_STALE_AFTER_MS should start this once at
+ *  startup, alongside the timeout sweeper — otherwise a Task that's
+ *  genuinely still executing but simply outlives the staleness window
+ *  (because nothing ever renews it) would be wrongly reconciled as
+ *  'lost' by another process. */
+export function startTaskLivenessRenewer(intervalMs = 10_000): LivenessRenewerHandle {
+  const timer = setInterval(() => {
+    for (const taskId of liveTaskIds) {
+      renewTaskLiveness(taskId).catch((err) => {
+        console.error(`[tasks] liveness renewal failed for ${taskId}:`, err instanceof Error ? err.message : err);
+      });
+    }
+  }, intervalMs);
+  if (typeof timer.unref === "function") timer.unref();
+  return { stop: () => clearInterval(timer) };
+}
+
+/** Test/ops hook: clears this process's own-Task-ownership registry
+ *  (`liveTaskIds`) WITHOUT touching the event log — simulates exactly
+ *  what a real process crash does: it simply stops renewing (via
+ *  startTaskLivenessRenewer()) whatever Tasks it used to own, so their
+ *  durable liveness signal goes stale on its own, at whatever
+ *  `staleAfterMs` a later reconcileLostTasks() call uses — no special
+ *  "am I still tracked" check needed anymore, which is the whole point
+ *  of the durable-renewal mechanism over the old Set-membership one.
+ *  Mirrors the existing clearHooks()/clearEventBusSubscribers()
+ *  reset-for-tests pattern used elsewhere in this codebase. */
 export function simulateProcessRestart(): void {
   liveTaskIds.clear();
 }
