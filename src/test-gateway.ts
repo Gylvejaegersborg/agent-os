@@ -247,7 +247,57 @@ async function main(): Promise<void> {
       "GET /artifacts?type= includes the created artifact",
     );
 
-    console.log("\n-- 10. Unknown routes return 404, not a crash --");
+    console.log("\n-- 10. Flow endpoints over real HTTP — real orchestration, not just bookkeeping --");
+    const createFlowRes = await fetch(`${base}/flows`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        steps: [
+          { id: "a", agentId: "claude", goal: "step a" },
+          { id: "b", agentId: "claude", goal: "step b" },
+          { id: "c", agentId: "claude", goal: "step c", dependsOn: ["a", "b"] },
+        ],
+      }),
+    });
+    assert(createFlowRes.status === 201, "POST /flows returns 201 immediately (doesn't block on the whole DAG)");
+    const createdFlow = (await createFlowRes.json()) as any;
+
+    let finishedFlow: any = createdFlow;
+    for (let i = 0; i < 40 && finishedFlow.status === "running"; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      finishedFlow = await (await fetch(`${base}/flows/${createdFlow.id}`)).json();
+    }
+    assert(finishedFlow.status === "succeeded", `the Flow, driven in the background, reaches 'succeeded' (got "${finishedFlow.status}")`);
+    assert(
+      finishedFlow.steps.every((s: any) => s.status === "succeeded"),
+      "every step in the fetched Flow shows 'succeeded'",
+    );
+
+    const cancelFlowSetupRes = await fetch(`${base}/flows`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ steps: [{ id: "only", agentId: "claude", goal: "never should run" }] }),
+    });
+    const flowToCancel = (await cancelFlowSetupRes.json()) as any;
+    const cancelFlowRes = await fetch(`${base}/flows/${flowToCancel.id}/cancel`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ reason: "integration test" }),
+    });
+    assert(cancelFlowRes.status === 200, "POST /flows/:id/cancel returns 200");
+    assert(((await cancelFlowRes.json()) as any).status === "cancelled", "the cancelled flow's status is 'cancelled' in the response");
+
+    const cancelAgainFlowRes = await fetch(`${base}/flows/${flowToCancel.id}/cancel`, { method: "POST" });
+    assert(cancelAgainFlowRes.status === 409, "cancelling an already-cancelled flow returns 409, not 500");
+
+    const badFlowRes = await fetch(`${base}/flows`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ steps: "not an array" }),
+    });
+    assert(badFlowRes.status === 400, "POST /flows with malformed steps returns 400");
+
+    console.log("\n-- 11. Unknown routes return 404, not a crash --");
     const notFoundRes = await fetch(`${base}/no-such-route`);
     assert(notFoundRes.status === 404, "an unknown route returns 404");
   } finally {

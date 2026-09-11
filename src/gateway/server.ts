@@ -50,6 +50,9 @@ import {
   getTask,
   listFlows,
   getFlow,
+  createFlow,
+  cancelFlow,
+  resumeFlow,
   listApprovals,
   getApproval,
   approveRequest,
@@ -67,6 +70,7 @@ import {
 } from "../core/index.js";
 import type { SessionStatus, ApprovalStatus, TaskStatus } from "../core/types.js";
 import type { ArtifactType } from "../core/artifacts.js";
+import type { FlowStepDefinition } from "../core/flow-engine.js";
 
 export interface GatewayDeps {
   model: ModelAdapter;
@@ -108,6 +112,25 @@ function readRequestBody(req: IncomingMessage): Promise<Record<string, unknown>>
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
+}
+
+/** Validates+narrows a POST body's `steps` field into a real
+ *  FlowStepDefinition[], or returns undefined if it's missing/malformed
+ *  — deliberately strict (every step needs at least id/agentId/goal as
+ *  strings) rather than passing a loosely-typed body straight into
+ *  flow-engine.ts, which assumes well-formed input. */
+function parseFlowSteps(raw: unknown): FlowStepDefinition[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const steps: FlowStepDefinition[] = [];
+  for (const s of raw) {
+    if (typeof s !== "object" || s === null) return undefined;
+    const { id, agentId, goal, dependsOn, retries } = s as Record<string, unknown>;
+    if (typeof id !== "string" || typeof agentId !== "string" || typeof goal !== "string") return undefined;
+    if (dependsOn !== undefined && !(Array.isArray(dependsOn) && dependsOn.every((d) => typeof d === "string"))) return undefined;
+    if (retries !== undefined && typeof retries !== "number") return undefined;
+    steps.push({ id, agentId, goal, dependsOn: dependsOn as string[] | undefined, retries: retries as number | undefined });
+  }
+  return steps;
 }
 
 /** Wide-open CORS on every response — a deliberate choice, not an
@@ -380,6 +403,68 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         return;
       }
       sendJson(res, 200, flow);
+      return;
+    }
+    if (method === "POST" && segments.length === 1) {
+      const body = await readRequestBody(req);
+      const steps = parseFlowSteps(body.steps);
+      if (!steps) {
+        sendJson(res, 400, { error: "steps (array of {id, agentId, goal, dependsOn?, retries?}) is required" });
+        return;
+      }
+      const flow = await createFlow(
+        "managed",
+        steps.map((s) => ({ id: s.id, dependsOn: s.dependsOn ?? [] })),
+      );
+      // Fire-and-forget: a Flow can run many real model turns across many
+      // steps, potentially minutes — the HTTP response returns the
+      // CREATED Flow immediately (201) rather than blocking on the whole
+      // DAG. A client watches progress via GET /events
+      // (flow.step.started/flow.step.completed/flow.completed) or polls
+      // GET /flows/:id, same pattern POST /sessions/:id/turns documents
+      // for its own "live activity is a separate concern" limitation.
+      resumeFlow(flow.id, steps, {
+        model: deps.model,
+        worker: deps.worker,
+        skills: deps.skills,
+        maxToolHopsPerStep: deps.maxToolHops,
+      }).catch((err) => {
+        console.error(`[gateway] flow ${flow.id} driving failed:`, err instanceof Error ? err.message : err);
+      });
+      sendJson(res, 201, flow);
+      return;
+    }
+    if (method === "POST" && segments.length === 3 && segments[2] === "resume") {
+      const flow = await getFlow(segments[1]!);
+      if (!flow) {
+        sendJson(res, 404, { error: `no such flow: ${segments[1]}` });
+        return;
+      }
+      const body = await readRequestBody(req);
+      const steps = parseFlowSteps(body.steps);
+      if (!steps) {
+        sendJson(res, 400, { error: "steps (the SAME FlowStepDefinition[] originally used to create this flow) is required to resume it" });
+        return;
+      }
+      resumeFlow(flow.id, steps, {
+        model: deps.model,
+        worker: deps.worker,
+        skills: deps.skills,
+        maxToolHopsPerStep: deps.maxToolHops,
+      }).catch((err) => {
+        console.error(`[gateway] flow ${flow.id} resume failed:`, err instanceof Error ? err.message : err);
+      });
+      sendJson(res, 202, flow);
+      return;
+    }
+    if (method === "POST" && segments.length === 3 && segments[2] === "cancel") {
+      const body = await readRequestBody(req);
+      try {
+        const flow = await cancelFlow(segments[1]!, typeof body.reason === "string" ? body.reason : undefined);
+        sendJson(res, 200, flow);
+      } catch (err) {
+        sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
+      }
       return;
     }
   }

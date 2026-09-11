@@ -138,12 +138,13 @@ export async function getTask(taskId: string): Promise<Task | undefined> {
   return tasks.get(taskId);
 }
 
-export async function listTasks(filter?: { agentId?: string; status?: TaskStatus; parentTaskId?: string }): Promise<Task[]> {
+export async function listTasks(filter?: { agentId?: string; status?: TaskStatus; parentTaskId?: string; flowId?: string }): Promise<Task[]> {
   const { tasks } = await projectTasks();
   let list = [...tasks.values()];
   if (filter?.agentId) list = list.filter((t) => t.agentId === filter.agentId);
   if (filter?.status) list = list.filter((t) => t.status === filter.status);
   if (filter?.parentTaskId) list = list.filter((t) => t.parentTaskId === filter.parentTaskId);
+  if (filter?.flowId) list = list.filter((t) => t.flowId === filter.flowId);
   return list.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
@@ -623,10 +624,23 @@ async function projectFlows(): Promise<FlowProjectionState> {
       const steps: FlowStep[] = flow.steps.map((s) =>
         s.id === p.stepId ? { ...s, status: p.status as TaskStatus, taskId: p.taskId ?? s.taskId } : s,
       );
+      if (flow.status === "cancelled") {
+        // Terminal override: a cancelled Flow's OVERALL status never
+        // reverts to running/succeeded/failed just because a step that
+        // was already in flight happens to report in afterward — but the
+        // step's own status is still recorded, for audit/visibility.
+        state.flows.set(p.flowId, { ...flow, steps, revision: flow.revision + 1 });
+        return state;
+      }
       const allDone = steps.every((s) => STEP_DONE_STATUSES.includes(s.status));
       const anyFailed = steps.some((s) => STEP_FAILURE_STATUSES.includes(s.status));
       const flowStatus: Flow["status"] = allDone ? (anyFailed ? "failed" : "succeeded") : "running";
       state.flows.set(p.flowId, { ...flow, steps, revision: flow.revision + 1, status: flowStatus });
+    } else if (event.type === "flow.cancelled") {
+      const p = event.payload as any;
+      const flow = state.flows.get(p.flowId);
+      if (!flow) return state;
+      state.flows.set(p.flowId, { ...flow, status: "cancelled", revision: flow.revision + 1 });
     }
     return state;
   });
@@ -640,6 +654,36 @@ export async function getFlow(flowId: string): Promise<Flow | undefined> {
 export async function listFlows(): Promise<Flow[]> {
   const { flows } = await projectFlows();
   return [...flows.values()];
+}
+
+/** Cancels a running Flow — a terminal override on top of the normal
+ *  step-aggregation-derived status (see projectFlows()'s
+ *  `flow.cancelled` handling above), plus best-effort propagation into
+ *  every still-non-terminal Task linked to this flow (mirroring
+ *  session.ts's cancelSession() for the same "stop real in-flight work,
+ *  not just the bookkeeping" reason). flow-engine.ts's driveFlow() checks
+ *  this status on every iteration and stops scheduling new steps once
+ *  it's set — already-running steps are cancelled via their Task, not
+ *  forcibly killed (same honest limitation as Session cancellation: this
+ *  stops NEW work, it doesn't preempt a model call already in flight). */
+export async function cancelFlow(flowId: string, reason?: string): Promise<Flow> {
+  const existing = await getFlow(flowId);
+  if (!existing) throw new Error(`no such flow: ${flowId}`);
+  if (existing.status !== "running") {
+    throw new Error(`flow ${flowId} is already terminal ("${existing.status}") and cannot be cancelled`);
+  }
+  await appendEvent(FLOWS_STREAM, "flow.cancelled", { flowId, reason });
+
+  const linkedTasks = await listTasks({ flowId });
+  for (const t of linkedTasks) {
+    if (!TERMINAL_STATUSES.includes(t.status)) {
+      await transitionTask(t.id, "cancelled", { reason: `flow ${flowId} was cancelled` });
+    }
+  }
+
+  const updated = await getFlow(flowId);
+  if (!updated) throw new Error("flow.cancelled event did not project to a flow");
+  return updated;
 }
 
 // ---- Automation (registry only in this scaffold — no real scheduler yet;
