@@ -58,6 +58,10 @@ import {
   getWorkerRecord,
   listToolDefinitions,
   subscribeToAllEvents,
+  listAgentRecords,
+  getAgentRecord,
+  registerAgent,
+  updateAgent,
 } from "../core/index.js";
 import type { SessionStatus, ApprovalStatus, TaskStatus } from "../core/types.js";
 
@@ -147,6 +151,63 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
   if (method === "GET" && segments.length === 1 && segments[0] === "tools") {
     sendJson(res, 200, { tools: listToolDefinitions() });
     return;
+  }
+
+  // ---- Agents — the authoritative registry (agents.ts). This is what
+  // lets a client (BaseOS) query identity/role/model/state/currentTask/
+  // worker/metrics from Agent-OS instead of maintaining its own mock
+  // roster (see Phase 4 of the architecture plan). ----
+  if (segments[0] === "agents") {
+    if (method === "GET" && segments.length === 1) {
+      sendJson(res, 200, { agents: await listAgentRecords() });
+      return;
+    }
+    if (method === "GET" && segments.length === 2) {
+      const agent = await getAgentRecord(segments[1]!);
+      if (!agent) {
+        sendJson(res, 404, { error: `no such agent: ${segments[1]}` });
+        return;
+      }
+      sendJson(res, 200, agent);
+      return;
+    }
+    if (method === "POST" && segments.length === 1) {
+      const body = await readRequestBody(req);
+      if (typeof body.id !== "string" || typeof body.name !== "string" || typeof body.persona !== "string") {
+        sendJson(res, 400, { error: "id, name, and persona (all strings) are required" });
+        return;
+      }
+      const existing = await getAgentRecord(body.id);
+      if (existing) {
+        sendJson(res, 409, { error: `agent "${body.id}" already exists — use PATCH-equivalent PUT /agents/:id to update it` });
+        return;
+      }
+      const agent = await registerAgent({
+        id: body.id,
+        name: body.name,
+        persona: body.persona,
+        role: typeof body.role === "string" ? body.role : undefined,
+        capabilities: Array.isArray(body.capabilities) ? body.capabilities.filter((c: unknown) => typeof c === "string") : undefined,
+        defaultModel: typeof body.defaultModel === "string" ? body.defaultModel : undefined,
+      });
+      sendJson(res, 201, agent);
+      return;
+    }
+    if (method === "PUT" && segments.length === 2) {
+      const body = await readRequestBody(req);
+      const updated = await updateAgent(segments[1]!, {
+        name: typeof body.name === "string" ? body.name : undefined,
+        persona: typeof body.persona === "string" ? body.persona : undefined,
+        role: typeof body.role === "string" ? body.role : undefined,
+        capabilities: Array.isArray(body.capabilities) ? body.capabilities.filter((c: unknown) => typeof c === "string") : undefined,
+      });
+      if (!updated) {
+        sendJson(res, 404, { error: `no such agent: ${segments[1]}` });
+        return;
+      }
+      sendJson(res, 200, updated);
+      return;
+    }
   }
 
   // ---- Sessions ----

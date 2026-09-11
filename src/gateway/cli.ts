@@ -6,7 +6,7 @@
 // Ollama instance, falling back to the deterministic stub so the gateway
 // is always runnable with zero configuration), then starts listening.
 
-import { createModelFromEnvOrOllama, createStubModel, createLocalShellWorker } from "../core/index.js";
+import { createModelFromEnvOrOllama, createStubModel, createLocalShellWorker, seedDefaultAgents } from "../core/index.js";
 import { startGateway } from "./server.js";
 
 async function main(): Promise<void> {
@@ -23,6 +23,14 @@ async function main(): Promise<void> {
   }
 
   const worker = createLocalShellWorker();
+
+  // Seeds the authoritative ISΛRK agent roster (agents.ts) if it isn't
+  // already registered — idempotent, so restarting the gateway never
+  // duplicates identity-registration events. This is what makes GET
+  // /agents return real data on a fresh data dir instead of an empty list.
+  const roster = await seedDefaultAgents();
+  console.log(`[gateway] agent registry ready: ${roster.map((a) => a.id).join(", ")}`);
+
   const handle = await startGateway({ model, worker }, port);
   console.log(`[gateway] listening on http://127.0.0.1:${handle.port}`);
 

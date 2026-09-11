@@ -10,6 +10,7 @@ export * from "./skills.js";
 export * from "./permissions.js";
 export * from "./approvals.js";
 export * from "./identity.js";
+export * from "./agents.js";
 export * from "./agentfs.js";
 export * from "./scheduler.js";
 export * from "./eventbus.js";

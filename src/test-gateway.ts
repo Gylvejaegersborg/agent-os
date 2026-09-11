@@ -184,7 +184,53 @@ async function main(): Promise<void> {
     assert(received.includes("event: agent.turn.end"), "the SSE stream delivered a real 'agent.turn.end' event");
     assert(received.includes(sseSession.id), "the delivered event payload references the actual session id");
 
-    console.log("\n-- 8. Unknown routes return 404, not a crash --");
+    console.log("\n-- 8. Agent registry endpoints over real HTTP --");
+    const createAgentRes = await fetch(`${base}/agents`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "gateway-test-registry-agent",
+        name: "Registry Test Agent",
+        persona: "exists only for this integration test",
+        role: "Tester · Integration",
+        capabilities: ["testing"],
+      }),
+    });
+    assert(createAgentRes.status === 201, "POST /agents returns 201");
+    const createdAgent = (await createAgentRes.json()) as any;
+    assert(createdAgent.role === "Tester · Integration", "the created agent's role round-trips through the API");
+
+    const dupeAgentRes = await fetch(`${base}/agents`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: "gateway-test-registry-agent", name: "dupe", persona: "dupe" }),
+    });
+    assert(dupeAgentRes.status === 409, "POST /agents for an already-existing id returns 409, not a silent duplicate");
+
+    const getAgentRes = await fetch(`${base}/agents/gateway-test-registry-agent`);
+    assert(getAgentRes.status === 200, "GET /agents/:id returns 200 for a real agent");
+    const fetchedAgent = (await getAgentRes.json()) as any;
+    assert(fetchedAgent.status === "idle", "a freshly created agent's derived status is 'idle'");
+
+    const missingAgentRes = await fetch(`${base}/agents/no-such-agent`);
+    assert(missingAgentRes.status === 404, "GET /agents/:id returns 404 for an unknown id");
+
+    const updateAgentRes = await fetch(`${base}/agents/gateway-test-registry-agent`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ role: "Tester · Updated" }),
+    });
+    assert(updateAgentRes.status === 200, "PUT /agents/:id returns 200");
+    assert(((await updateAgentRes.json()) as any).role === "Tester · Updated", "the update is reflected in the response");
+
+    const listAgentsRes = await fetch(`${base}/agents`);
+    const listedAgents = (await listAgentsRes.json()) as any;
+    assert(
+      listedAgents.agents.some((a: any) => a.id === "gateway-test-registry-agent"),
+      "GET /agents includes the created agent",
+    );
+
+    console.log("\n-- 9. Unknown routes return 404, not a crash --");
     const notFoundRes = await fetch(`${base}/no-such-route`);
     assert(notFoundRes.status === 404, "an unknown route returns 404");
   } finally {

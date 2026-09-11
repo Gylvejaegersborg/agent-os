@@ -12,6 +12,19 @@ export interface AgentIdentity {
   id: string;
   name: string;
   persona: string;
+  /** e.g. "Manager · Strategy" — free text, presentational/organizational,
+   *  not consulted by any runtime decision (unlike defaultModel, which
+   *  models/real.ts's createModelForAgent() actually reads). Added so
+   *  role lives on the ONE authoritative identity record instead of only
+   *  ever existing in a UI-side mock array (see agents.ts's AgentRecord,
+   *  which is what a gateway client actually consumes). */
+  role?: string;
+  /** Free-text capability labels (e.g. "shell", "market-research") — a
+   *  simple declared list, not enforced against anything (Layer A/B
+   *  permissions remain the actual enforcement mechanism). Exists purely
+   *  so a client can show "what is this agent for" without guessing from
+   *  its persona text. */
+  capabilities?: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -22,11 +35,28 @@ export async function registerAgentIdentity(input: {
   id: string;
   name: string;
   persona: string;
+  role?: string;
+  capabilities?: string[];
 }): Promise<AgentIdentity> {
   await appendEvent(IDENTITY_STREAM, "agent.identity.registered", input);
   const identity = await getAgentIdentity(input.id);
   if (!identity) throw new Error("agent.identity.registered event did not project");
   return identity;
+}
+
+/** Patches an EXISTING identity's fields (role/capabilities/persona/name)
+ *  without re-registering it from scratch. Appends `agent.identity.updated`
+ *  — a reducer branch projectIdentities() already supported, but which
+ *  had no producer function until now. A patch for an id with no
+ *  existing identity is simply ignored (the reducer's `if (existing)`
+ *  guard), same as every other "update" primitive in this codebase that
+ *  refuses to conjure a record that was never created. */
+export async function updateAgentIdentity(
+  id: string,
+  patch: Partial<Pick<AgentIdentity, "name" | "persona" | "role" | "capabilities">>,
+): Promise<AgentIdentity | undefined> {
+  await appendEvent(IDENTITY_STREAM, "agent.identity.updated", { id, ...patch });
+  return getAgentIdentity(id);
 }
 
 async function projectIdentities(): Promise<Map<string, AgentIdentity>> {
@@ -37,6 +67,8 @@ async function projectIdentities(): Promise<Map<string, AgentIdentity>> {
         id: p.id,
         name: p.name,
         persona: p.persona,
+        role: p.role,
+        capabilities: p.capabilities,
         createdAt: event.timestamp,
         updatedAt: event.timestamp,
       });
