@@ -82,6 +82,30 @@ export interface Automation {
 // STANDING_ORDERS_FILE), interpreted by the agent at runtime. This is a
 // conscious choice mirroring OpenClaw's design, not an oversight.
 
+export type SessionStatus = "active" | "paused" | "cancelled" | "completed" | "error";
+
+/** "Who is talking to whom, and is it still going" — a first-class,
+ *  resumable entity distinct from the raw `session:<id>` message stream
+ *  runTurn() already writes to (agent-loop.ts). That stream is the
+ *  conversation transcript; a Session is the registry entry ABOUT that
+ *  conversation: its status, its owner agent, and its relationships to
+ *  other runtime entities (a parent session that spawned it, a Task/Flow
+ *  it's currently driving). Projected the same way everything else here
+ *  is — from a `sessions` event stream (session.ts) — so listing/
+ *  resuming/cancelling a session needs no separate mutable store. */
+export interface Session {
+  id: string;
+  agentId: string;
+  status: SessionStatus;
+  createdAt: string;
+  updatedAt: string;
+  title?: string;
+  parentSessionId?: string;
+  taskId?: string;
+  flowId?: string;
+  metadata: Record<string, unknown>;
+}
+
 export interface Agent {
   id: string;
   identity: { name: string; persona: string };

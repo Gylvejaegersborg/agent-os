@@ -1,6 +1,7 @@
 export * from "./types.js";
 export * from "./id.js";
 export * from "./eventlog.js";
+export * from "./session.js";
 export * from "./tasks.js";
 export * from "./memory.js";
 export * from "./text-similarity.js";

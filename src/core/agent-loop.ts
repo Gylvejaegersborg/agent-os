@@ -12,12 +12,17 @@ import { generateId } from "./id.js";
 import { SkillRegistry, renderSkillCatalog } from "./skills.js";
 import { retrieveMemoryContext } from "./memory.js";
 import { getAgentIdentity } from "./identity.js";
+import { ensureSession, isSessionCancelled } from "./session.js";
 import type { EpisodicKind } from "./types.js";
 
 export interface AgentTurnResult {
   sessionId: string;
   finalContent: string;
   toolCalled?: string;
+  /** True when this turn stopped early because the Session (session.ts)
+   *  was cancelled mid-run rather than completing normally — see
+   *  cancelSession()'s doc comment for how a caller triggers this. */
+  cancelled?: boolean;
 }
 
 export interface RunTurnOptions {
@@ -197,6 +202,12 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   const injectMemory = opts.injectMemory ?? true;
   const maxHops = opts.maxToolHops ?? 3;
 
+  // Registers (or touches) this sessionId in the Session registry
+  // (session.ts) — see ensureSession()'s doc comment: existing callers
+  // that never pre-created a Session keep working unchanged, and now get
+  // a real, listable/cancellable registry entry for free.
+  await ensureSession(sessionId, agentId);
+
   await appendEvent(sessionStream(sessionId), "agent.turn.start", { agentId, userMessage });
   await fireHook("agent.turn.start", { agentId, sessionId, payload: { userMessage } });
 
@@ -205,6 +216,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   let toolCalled: string | undefined;
   let hops = 0;
   let finalContent = "";
+  let cancelled = false;
 
   // Fetched once per turn, outside the hop loop — see renderIdentityContext's
   // own doc comment for why (unlike memory/skills, identity isn't expected
@@ -212,6 +224,16 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   const personaText = await renderIdentityContext(agentId);
 
   while (hops < maxHops) {
+    // Checked at the top of every hop (and again right after tool
+    // dispatch below) rather than once before the loop — cancelSession()
+    // (session.ts) can be called from a completely different process at
+    // any point mid-turn, and this is what makes "cancel a session"
+    // actually stop new model calls/tool executions instead of merely
+    // being ignored until the turn would have finished anyway.
+    if (await isSessionCancelled(sessionId)) {
+      cancelled = true;
+      break;
+    }
     const history = await getSessionHistory(sessionId);
     const catalogText = skills ? renderSkillCatalog(skills.listMetadata()) : "";
     const subagentText = enableSubagents
@@ -268,6 +290,14 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
         content: result.ok ? result.output : `error: ${result.error}`,
       });
       hops++;
+      // Re-checked immediately after the tool actually ran (not just at
+      // the top of the next hop) so a cancellation that arrives WHILE a
+      // tool call is in flight is honored before the next model call is
+      // made, rather than one full extra hop later.
+      if (await isSessionCancelled(sessionId)) {
+        cancelled = true;
+        break;
+      }
       continue;
     }
 
@@ -276,10 +306,19 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     break;
   }
 
-  await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled });
-  await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled } });
+  if (cancelled) {
+    finalContent = finalContent || "Turn cancelled before completion.";
+    await appendEvent(sessionStream(sessionId), "session.message", {
+      role: "assistant",
+      content: finalContent,
+      cancelled: true,
+    });
+  }
 
-  return { sessionId, finalContent, toolCalled };
+  await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled });
+  await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled } });
+
+  return { sessionId, finalContent, toolCalled, cancelled: cancelled || undefined };
 }
 
 export function newSessionId(): string {
