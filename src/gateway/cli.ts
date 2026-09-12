@@ -135,7 +135,20 @@ async function main(): Promise<void> {
   const roster = await seedDefaultAgents();
   console.log(`[gateway] agent registry ready: ${roster.map((a) => a.id).join(", ")}`);
 
-  const handle = await startGateway({ model, worker }, port);
+  // These three are each independently tested and already safety-scoped
+  // on their own terms (agent-loop.ts): subagents don't recursively spawn
+  // further subagents, a memory nomination is only ever a PENDING
+  // proposal until a human explicitly approves it (never writes curated
+  // memory directly), and artifact recording only registers metadata
+  // about something the agent already produced via another tool — it
+  // can't itself create content. All three were simply never turned on
+  // for the live gateway; every agent's own persona/capabilities already
+  // claims some of these (e.g. "subagent-delegation"), so leaving them
+  // off made that claim false in practice.
+  const handle = await startGateway(
+    { model, worker, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true },
+    port,
+  );
   console.log(`[gateway] listening on http://127.0.0.1:${handle.port}`);
 
   const shutdown = async (): Promise<void> => {

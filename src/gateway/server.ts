@@ -451,6 +451,9 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         worker: deps.worker,
         skills: deps.skills,
         maxToolHopsPerStep: deps.maxToolHops,
+        enableSubagents: deps.enableSubagents,
+        enableMemoryNominations: deps.enableMemoryNominations,
+        enableArtifacts: deps.enableArtifacts,
       }).catch((err) => {
         console.error(`[gateway] flow ${flow.id} driving failed:`, err instanceof Error ? err.message : err);
       });
@@ -474,6 +477,9 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         worker: deps.worker,
         skills: deps.skills,
         maxToolHopsPerStep: deps.maxToolHops,
+        enableSubagents: deps.enableSubagents,
+        enableMemoryNominations: deps.enableMemoryNominations,
+        enableArtifacts: deps.enableArtifacts,
       }).catch((err) => {
         console.error(`[gateway] flow ${flow.id} resume failed:`, err instanceof Error ? err.message : err);
       });
