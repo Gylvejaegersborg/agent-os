@@ -50,6 +50,7 @@
 
 import { createFlow, getFlow, updateFlowStep, createTask, transitionTask } from "./tasks.js";
 import { runTurn, newSessionId } from "./agent-loop.js";
+import { createModelForAgent } from "./models/real.js";
 import { publishEvent } from "./eventbus.js";
 import type { ModelAdapter } from "./model.js";
 import type { Worker } from "./worker.js";
@@ -145,11 +146,17 @@ async function runStepOnce(
   await publishEvent("flow.step.started", { flowId, stepId: step.id, agentId: step.agentId, taskId: task.id });
 
   try {
+    // Same per-agent model preference override the gateway's turns route
+    // applies (see server.ts) — each step runs with ITS OWN agent's
+    // preference, not one model shared across the whole flow, falling
+    // back to opts.model (the flow's/gateway's default) when the step's
+    // agent has no override or nothing resolves.
+    const model = (await createModelForAgent(step.agentId)) ?? opts.model;
     const result = await runTurn({
       sessionId: newSessionId(),
       agentId: step.agentId,
       userMessage: step.goal,
-      model: opts.model,
+      model,
       worker: opts.worker,
       skills: opts.skills,
       maxToolHops: opts.maxToolHopsPerStep,

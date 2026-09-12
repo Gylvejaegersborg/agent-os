@@ -94,6 +94,11 @@ async function projectSessions(): Promise<SessionProjectionState> {
       const existing = state.sessions.get(p.sessionId);
       if (!existing) return state;
       state.sessions.set(p.sessionId, { ...existing, status: p.status, updatedAt: event.timestamp });
+    } else if (event.type === "session.renamed") {
+      const p = event.payload as any;
+      const existing = state.sessions.get(p.sessionId);
+      if (!existing) return state;
+      state.sessions.set(p.sessionId, { ...existing, title: p.title, updatedAt: event.timestamp });
     } else if (event.type === "session.task.linked") {
       const p = event.payload as any;
       const existing = state.sessions.get(p.sessionId);
@@ -185,6 +190,21 @@ export async function cancelSession(id: string, reason?: string): Promise<Sessio
 export async function isSessionCancelled(id: string): Promise<boolean> {
   const session = await getSession(id);
   return session?.status === "cancelled";
+}
+
+/** Renames a Session — the display title a client shows in a thread
+ *  picker (BaseOS's Workbench, e.g.), distinct from anything about the
+ *  Session's actual runtime state. Works regardless of status, including
+ *  terminal ones (a completed/cancelled thread can still be relabeled for
+ *  the human reading the list later). Empty string clears back to the
+ *  caller's own fallback label (e.g. a formatted createdAt). */
+export async function renameSession(id: string, title: string): Promise<Session> {
+  const existing = await getSession(id);
+  if (!existing) throw new Error(`no such session: ${id}`);
+  await appendEvent(SESSIONS_STREAM, "session.renamed", { sessionId: id, title });
+  const updated = await getSession(id);
+  if (!updated) throw new Error("session.renamed event did not project to a session");
+  return updated;
 }
 
 /** Links a Session to the Task/Flow it's currently driving — e.g. a chat

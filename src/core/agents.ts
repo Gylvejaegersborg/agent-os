@@ -95,10 +95,15 @@ export async function registerAgent(input: RegisterAgentInput): Promise<AgentRec
  *  it patched. */
 export async function updateAgent(
   id: string,
-  patch: Partial<Pick<RegisterAgentInput, "name" | "persona" | "role" | "capabilities">>,
+  patch: Partial<Pick<RegisterAgentInput, "name" | "persona" | "role" | "capabilities" | "defaultModel">>,
 ): Promise<AgentRecord | undefined> {
-  const updated = await updateAgentIdentity(id, patch);
+  const { defaultModel, ...identityPatch } = patch;
+  const updated = await updateAgentIdentity(id, identityPatch);
   if (!updated) return undefined;
+  if (defaultModel !== undefined) {
+    const { setAgentDefaultModel } = await import("./models/real.js");
+    await setAgentDefaultModel(id, defaultModel);
+  }
   return getAgentRecord(id);
 }
 
