@@ -10,7 +10,7 @@
 
 import "./test-helpers/isolate.js";
 import { startGateway } from "./gateway/server.js";
-import { createStubModel, createStubWorker, installPermissionPolicy, createArtifact } from "./core/index.js";
+import { createStubModel, createStubWorker, installPermissionPolicy, createArtifact, writeEpisodic, nominateAgentMemory, runDreamingPass } from "./core/index.js";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) {
@@ -297,7 +297,49 @@ async function main(): Promise<void> {
     });
     assert(badFlowRes.status === 400, "POST /flows with malformed steps returns 400");
 
-    console.log("\n-- 11. Unknown routes return 404, not a crash --");
+    console.log("\n-- 11. Agent memory endpoints over real HTTP --");
+    const memAgentId = "memory-test-agent";
+    // An explicit correction crosses the promotion threshold on its own
+    // (see memory.ts's scoreEligibility) — real fixture data, not a mock.
+    await writeEpisodic({ agentId: memAgentId, content: "Prefers terse replies", kind: "preference", sourceSessionId: "test", wasExplicitCorrection: true });
+    await runDreamingPass(memAgentId);
+
+    const memRes = await fetch(`${base}/agents/${memAgentId}/memory`);
+    assert(memRes.status === 200, "GET /agents/:id/memory returns 200");
+    const memBody = (await memRes.json()) as any;
+    assert(memBody.curated.userProfile.includes("terse"), "curated memory reflects the promoted preference");
+    assert(memBody.episodicCount === 1, "episodicCount reflects the one fixture entry (got " + memBody.episodicCount + ")");
+    assert(!!memBody.lastDreamingPass, "lastDreamingPass is present after runDreamingPass() ran");
+
+    const episodicRes = await fetch(`${base}/agents/${memAgentId}/memory/episodic`);
+    assert(episodicRes.status === 200, "GET /agents/:id/memory/episodic returns 200");
+    assert(((await episodicRes.json()) as any).entries.length === 1, "episodic listing includes the fixture entry");
+
+    const passesRes = await fetch(`${base}/agents/${memAgentId}/memory/dreaming-passes`);
+    assert(passesRes.status === 200, "GET /agents/:id/memory/dreaming-passes returns 200");
+    assert(((await passesRes.json()) as any).passes.length === 1, "dreaming-passes listing includes the one pass that ran");
+
+    const nomination = await nominateAgentMemory({ agentId: memAgentId, content: "Build with `npm run dev`", kind: "fact", sourceSessionId: "test" });
+    const nomListRes = await fetch(`${base}/agents/${memAgentId}/memory/nominations?status=pending`);
+    assert(nomListRes.status === 200, "GET /agents/:id/memory/nominations returns 200");
+    assert(((await nomListRes.json()) as any).nominations.some((n: any) => n.id === nomination.id), "pending nomination is listed");
+
+    const memApproveRes = await fetch(`${base}/agents/${memAgentId}/memory/nominations/${nomination.id}/approve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ reviewNote: "looks right" }),
+    });
+    assert(memApproveRes.status === 200, "POST .../nominations/:id/approve returns 200");
+    assert(!!((await memApproveRes.json()) as any).entry, "approving returns the resulting episodic entry");
+
+    const memApproveAgainRes = await fetch(`${base}/agents/${memAgentId}/memory/nominations/${nomination.id}/approve`, { method: "POST" });
+    assert(memApproveAgainRes.status === 409, "approving an already-reviewed nomination returns 409, not 500");
+
+    const nomination2 = await nominateAgentMemory({ agentId: memAgentId, content: "Uses dark mode", kind: "preference", sourceSessionId: "test" });
+    const memRejectRes = await fetch(`${base}/agents/${memAgentId}/memory/nominations/${nomination2.id}/reject`, { method: "POST" });
+    assert(memRejectRes.status === 200, "POST .../nominations/:id/reject returns 200");
+
+    console.log("\n-- 12. Unknown routes return 404, not a crash --");
     const notFoundRes = await fetch(`${base}/no-such-route`);
     assert(notFoundRes.status === 404, "an unknown route returns 404");
   } finally {

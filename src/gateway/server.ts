@@ -69,8 +69,14 @@ import {
   updateAgent,
   listArtifacts,
   getArtifact,
+  getCuratedMemory,
+  listEpisodic,
+  listAgentMemoryNominations,
+  approveAgentMemory,
+  rejectAgentMemory,
+  listDreamingPasses,
 } from "../core/index.js";
-import type { SessionStatus, ApprovalStatus, TaskStatus } from "../core/types.js";
+import type { SessionStatus, ApprovalStatus, TaskStatus, NominationStatus } from "../core/types.js";
 import type { ArtifactType } from "../core/artifacts.js";
 import type { FlowStepDefinition } from "../core/flow-engine.js";
 
@@ -285,6 +291,59 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         return;
       }
       sendJson(res, 200, updated);
+      return;
+    }
+  }
+
+  // ---- Agent memory — "what has this agent learned" surfaced to a
+  // client (see memory.ts for the full model: fast-path episodic writes,
+  // a deterministic dreaming pass that's the ONLY thing allowed to write
+  // curated memory, and an agent's own bounded "nominate, human approves"
+  // voice). Nested under /agents/:id/memory rather than a top-level
+  // /memory to keep "whose memory" unambiguous in the URL itself. ----
+  if (segments[0] === "agents" && segments.length >= 3 && segments[2] === "memory") {
+    const agentId = segments[1]!;
+    if (method === "GET" && segments.length === 3) {
+      const [curated, episodic, passes] = await Promise.all([getCuratedMemory(agentId), listEpisodic(agentId), listDreamingPasses(agentId)]);
+      const lastDreamingPass = passes.length ? passes[passes.length - 1] : undefined;
+      sendJson(res, 200, { curated, episodicCount: episodic.length, lastDreamingPass });
+      return;
+    }
+    if (method === "GET" && segments.length === 4 && segments[3] === "episodic") {
+      const entries = await listEpisodic(agentId);
+      sendJson(res, 200, { entries });
+      return;
+    }
+    if (method === "GET" && segments.length === 4 && segments[3] === "dreaming-passes") {
+      const passes = await listDreamingPasses(agentId);
+      sendJson(res, 200, { passes });
+      return;
+    }
+    if (method === "GET" && segments.length === 4 && segments[3] === "nominations") {
+      const nominations = await listAgentMemoryNominations(agentId, {
+        status: (url.searchParams.get("status") as NominationStatus | null) ?? undefined,
+      });
+      sendJson(res, 200, { nominations });
+      return;
+    }
+    if (method === "POST" && segments.length === 6 && segments[3] === "nominations" && segments[5] === "approve") {
+      const body = await readRequestBody(req);
+      try {
+        const entry = await approveAgentMemory(agentId, segments[4]!, typeof body.reviewNote === "string" ? body.reviewNote : undefined);
+        sendJson(res, 200, { entry });
+      } catch (err) {
+        sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+    if (method === "POST" && segments.length === 6 && segments[3] === "nominations" && segments[5] === "reject") {
+      const body = await readRequestBody(req);
+      try {
+        await rejectAgentMemory(agentId, segments[4]!, typeof body.reviewNote === "string" ? body.reviewNote : undefined);
+        sendJson(res, 200, { ok: true });
+      } catch (err) {
+        sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
+      }
       return;
     }
   }
