@@ -674,15 +674,27 @@ export async function cancelFlow(flowId: string, reason?: string): Promise<Flow>
   }
   await appendEvent(FLOWS_STREAM, "flow.cancelled", { flowId, reason });
 
+  // Durable bookkeeping (appendEvent, above/below) is necessary but not
+  // sufficient — unlike the normal step-completion path in
+  // flow-engine.ts, nothing here was publishing to the live eventbus, so
+  // cancelling a Flow updated its stored status but never told any open
+  // SSE subscriber (FlowTab, the Events tab) to refresh. That's why
+  // cancelling could leave a step showing "running" indefinitely in the
+  // UI even though the Task itself was already marked cancelled
+  // server-side. Mirror flow-engine.ts's own publishEvent shapes so the
+  // same handlers pick these up.
   const linkedTasks = await listTasks({ flowId });
   for (const t of linkedTasks) {
     if (!TERMINAL_STATUSES.includes(t.status)) {
       await transitionTask(t.id, "cancelled", { reason: `flow ${flowId} was cancelled` });
+      const step = existing.steps.find((s) => s.taskId === t.id);
+      await publishEvent("flow.step.completed", { flowId, stepId: step?.id ?? t.id, agentId: t.agentId, taskId: t.id, status: "cancelled" });
     }
   }
 
   const updated = await getFlow(flowId);
   if (!updated) throw new Error("flow.cancelled event did not project to a flow");
+  await publishEvent("flow.completed", { flowId, status: updated.status });
   return updated;
 }
 
