@@ -10,12 +10,59 @@ import {
   createModelFromEnvOrOllama,
   createStubModel,
   createLocalShellWorker,
+  createSandboxedWorker,
   seedDefaultAgents,
   reconcileLostTasks,
   startTaskTimeoutSweeper,
   startTaskLivenessRenewer,
+  registerHook,
+  installPermissionPolicy,
+  DEFAULT_HARD_BLOCKLIST,
+  type SandboxPolicy,
 } from "../core/index.js";
 import { startGateway } from "./server.js";
+
+// The one agent allowed to touch a real shell at all. Deliberately a
+// single, well-known id rather than a config knob: this whole feature
+// (agents fixing their own harness) is scoped to ONE agent on purpose —
+// every OTHER agent in the roster (seedDefaultAgents()) stays exactly as
+// sandboxed as it always was (zero shell access), no matter what a user
+// asks it to do. "claude" already exists in that roster with persona
+// "A general-purpose software engineering agent for the ISΛRK operator's
+// own dashboard and tooling" and capabilities ["shell", "code-editing",
+// "subagent-delegation"] — this is that agent made real instead of
+// aspirational.
+const ENGINEER_AGENT_ID = "claude";
+
+/** Builds the Layer-A PermissionPolicy for ENGINEER_AGENT_ID. Read-only
+ *  inspection commands are pre-approved so diagnosing a problem doesn't
+ *  require a round trip through the Approvals tab for every `git diff` or
+ *  `cat`; genuinely mutating commands (edits, `git add`/`commit`, installs)
+ *  fall through to the policy's default "ask" — there is no "allow"
+ *  rule for writes anywhere in this list, on purpose. `git push` (or
+ *  anything else that reaches GitHub) is never special-cased into "allow"
+ *  either, so it always lands in the Approvals tab too, regardless of
+ *  what else this policy permits. */
+function buildEngineerPolicy() {
+  const SAFE_READONLY = /"command":\s*"\s*(git (status|diff|log|show|branch\b[^&|;]*--list)|ls\b|cat\b|head\b|tail\b|grep\b|rg\b|wc\b|pwd\b|npm run (typecheck|build|test[\w-]*)\b|tsc\b)/;
+  const INFRA_PATHS = /\.github\/|\.devcontainer\/|(^|[\s"'/])scripts\//;
+  return {
+    agentId: ENGINEER_AGENT_ID,
+    rules: [
+      {
+        tool: "shell",
+        decision: "ask" as const,
+        argsPattern: INFRA_PATHS,
+        label:
+          "touches CI/infra (.github/, .devcontainer/, or scripts/) — these run with elevated trust " +
+          "(Actions secrets, the devcontainer itself), so they're always reviewed regardless of what the command does.",
+      },
+      { tool: "shell", decision: "allow" as const, argsPattern: SAFE_READONLY },
+      // No further rules: anything else (edits, git add/commit/push,
+      // npm/apt installs, rm, ...) falls through to the default "ask".
+    ],
+  };
+}
 
 async function main(): Promise<void> {
   const port = process.env.AGENT_OS_GATEWAY_PORT ? Number(process.env.AGENT_OS_GATEWAY_PORT) : 8787;
@@ -45,7 +92,41 @@ async function main(): Promise<void> {
     console.log(`[gateway] using model adapter: ${model.id}`);
   }
 
-  const worker = createLocalShellWorker();
+  // Layer B: confines EVERY shell command (whichever agent it came from)
+  // to this process's own working tree (agent-os, per start.sh's `cd
+  // "$AGENT_OS_DIR"`) plus BaseOStest's own checkout — passed in via
+  // BASEOS_REPO_DIR since the two repos don't share a useful common
+  // ancestor in a Codespace (agent-os lives under $HOME, BaseOStest under
+  // /workspaces/...) for a single workspaceRoot to cover both. Applies
+  // uniformly as defense in depth even though Layer A (below) is what
+  // actually restricts WHO can reach the shell tool at all.
+  const sandboxPolicy: SandboxPolicy = {
+    filesystemScope: "workspace-and-temp",
+    workspaceRoot: process.cwd(),
+    additionalRoots: process.env.BASEOS_REPO_DIR ? [process.env.BASEOS_REPO_DIR] : [],
+    hardBlocklist: DEFAULT_HARD_BLOCKLIST,
+  };
+  const worker = createSandboxedWorker(createLocalShellWorker(), sandboxPolicy);
+
+  // Layer A, part 1: shell access is restricted to ENGINEER_AGENT_ID —
+  // every other agent's tool.before hits this first (hooks.ts's fireHook
+  // runs handlers in registration order and returns on the first block)
+  // and is denied outright, before ever reaching a Worker. This is a
+  // deliberate product choice, not just a safety one — see the design
+  // discussion this came out of: one agent owns harness maintenance, not
+  // "whichever agent happens to be open."
+  registerHook("tool.before", async (ctx) => {
+    if (String(ctx.payload.name ?? "") !== "shell") return;
+    if (ctx.agentId === ENGINEER_AGENT_ID) return;
+    return {
+      block: true,
+      reason: `shell access is restricted to the "${ENGINEER_AGENT_ID}" agent — ask it directly if you need something inspected or fixed.`,
+    };
+  });
+  // Layer A, part 2: ENGINEER_AGENT_ID's own rules (see buildEngineerPolicy
+  // above) — safe reads pre-approved, everything else durably queued for
+  // approval in the Workbench's Approvals tab.
+  installPermissionPolicy(buildEngineerPolicy());
 
   // Seeds the authoritative ISΛRK agent roster (agents.ts) if it isn't
   // already registered — idempotent, so restarting the gateway never
