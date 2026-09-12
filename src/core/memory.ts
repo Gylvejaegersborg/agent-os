@@ -398,6 +398,44 @@ export async function runDreamingPass(
   return pass;
 }
 
+export interface DreamingSweeperHandle {
+  stop: () => void;
+}
+
+/** Runs runDreamingPass() for every currently-known agent — on its own,
+ *  nothing ever calls runDreamingPass() outside tests/the CLI demo, so a
+ *  deployed gateway could have agents nominating/writing episodic memory
+ *  all day with no review pass ever promoting any of it into curated
+ *  memory (MEMORY.md/USER.md) for injectMemory to actually surface.
+ *  Mirrors tasks.ts's startTaskTimeoutSweeper(): a plain setInterval,
+ *  unref'd so it never keeps the process alive on its own, one failed
+ *  agent's pass logged and skipped rather than aborting the rest. Dynamic
+ *  import of agents.js (not a static one) purely to keep this module's
+ *  import graph leaf-like, matching agent-loop.ts's own stated reason for
+ *  doing the same with subagent.js/memory.js — there is no real circular
+ *  risk today (agents.ts does not import memory.ts), just defensive
+ *  consistency with how the rest of this codebase treats cross-module
+ *  edges it doesn't want to force static. */
+export function startMemoryDreamingSweeper(intervalMs = 5 * 60_000): DreamingSweeperHandle {
+  const timer = setInterval(() => {
+    (async () => {
+      const { listAgentRecords } = await import("./agents.js");
+      const agents = await listAgentRecords();
+      for (const agent of agents) {
+        try {
+          await runDreamingPass(agent.id);
+        } catch (err) {
+          console.error(`[memory] dreaming pass failed for agent "${agent.id}":`, err instanceof Error ? err.message : err);
+        }
+      }
+    })().catch((err) => {
+      console.error("[memory] dreaming sweep failed:", err instanceof Error ? err.message : err);
+    });
+  }, intervalMs);
+  if (typeof timer.unref === "function") timer.unref();
+  return { stop: () => clearInterval(timer) };
+}
+
 export async function listDreamingPasses(agentId: string): Promise<DreamingPass[]> {
   return project<DreamingPass[]>(dreamingStream(agentId), [], (state, event) => {
     if (event.type === "memory.dreaming.completed") state.push(event.payload as unknown as DreamingPass);

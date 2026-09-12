@@ -15,6 +15,7 @@ import {
   reconcileLostTasks,
   startTaskTimeoutSweeper,
   startTaskLivenessRenewer,
+  startMemoryDreamingSweeper,
   registerHook,
   installPermissionPolicy,
   DEFAULT_HARD_BLOCKLIST,
@@ -81,6 +82,14 @@ async function main(): Promise<void> {
   // both running continuously, not just reconciliation at startup.
   startTaskTimeoutSweeper();
   startTaskLivenessRenewer();
+  // Same gap as the others found in this round: runDreamingPass()
+  // (memory.ts) otherwise never runs outside tests/the CLI demo, so
+  // episodic writes and approved memory nominations would just pile up
+  // with nothing ever promoting them into curated memory. Every 5
+  // minutes is arbitrary but reasonable for a dev-scale deployment —
+  // dreaming itself is cheap (no model call, pure scoring) when there's
+  // nothing newly eligible to phrase.
+  startMemoryDreamingSweeper();
 
   const model = (await createModelFromEnvOrOllama()) ?? createStubModel();
   if (model.id === "stub-model") {
