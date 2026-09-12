@@ -43,7 +43,9 @@ import {
   getSession,
   listSessions,
   cancelSession,
+  renameSession,
   runTurn,
+  createModelForAgent,
   getSessionHistory,
   newSessionId,
   listTasks,
@@ -276,6 +278,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         persona: typeof body.persona === "string" ? body.persona : undefined,
         role: typeof body.role === "string" ? body.role : undefined,
         capabilities: Array.isArray(body.capabilities) ? body.capabilities.filter((c: unknown) => typeof c === "string") : undefined,
+        defaultModel: typeof body.defaultModel === "string" ? body.defaultModel : undefined,
       });
       if (!updated) {
         sendJson(res, 404, { error: `no such agent: ${segments[1]}` });
@@ -340,6 +343,20 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
       }
       return;
     }
+    if (method === "POST" && segments.length === 3 && segments[2] === "rename") {
+      const body = await readRequestBody(req);
+      if (typeof body.title !== "string") {
+        sendJson(res, 400, { error: "title (string) is required" });
+        return;
+      }
+      try {
+        const session = await renameSession(segments[1]!, body.title);
+        sendJson(res, 200, session);
+      } catch (err) {
+        sendJson(res, 404, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
     if (method === "POST" && segments.length === 3 && segments[2] === "turns") {
       const session = await getSession(segments[1]!);
       if (!session) {
@@ -351,11 +368,17 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         sendJson(res, 400, { error: "userMessage (string) is required" });
         return;
       }
+      // Per-agent model preference (set via POST/PUT /agents) overrides
+      // the gateway-wide default when one is registered and an env var
+      // still resolves a real provider — falls back to deps.model (the
+      // stub, when no provider is configured at all) exactly like before
+      // this existed. See models/real.ts's createModelForAgent().
+      const model = (await createModelForAgent(session.agentId)) ?? deps.model;
       const result = await runTurn({
         sessionId: session.id,
         agentId: session.agentId,
         userMessage: body.userMessage,
-        model: deps.model,
+        model,
         worker: deps.worker,
         skills: deps.skills,
         enableSubagents: deps.enableSubagents,
