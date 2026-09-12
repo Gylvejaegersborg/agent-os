@@ -79,6 +79,13 @@ export interface DriveFlowOptions {
   worker: Worker;
   skills?: SkillRegistry;
   maxToolHopsPerStep?: number;
+  /** Forwarded as-is to each step's runTurn() call (agent-loop.ts) — same
+   *  meaning as the gateway's direct-chat turns route. Previously just
+   *  missing from this options type entirely, so even a gateway that
+   *  enabled these for chat never granted them inside a Flow step. */
+  enableSubagents?: boolean;
+  enableMemoryNominations?: boolean;
+  enableArtifacts?: boolean;
 }
 
 export interface FlowStepResult {
@@ -160,6 +167,9 @@ async function runStepOnce(
       worker: opts.worker,
       skills: opts.skills,
       maxToolHops: opts.maxToolHopsPerStep,
+      enableSubagents: opts.enableSubagents,
+      enableMemoryNominations: opts.enableMemoryNominations,
+      enableArtifacts: opts.enableArtifacts,
     });
     await transitionTask(task.id, "succeeded", { output: { finalContent: result.finalContent } });
     await publishEvent("flow.step.completed", { flowId, stepId: step.id, agentId: step.agentId, taskId: task.id, status: "succeeded" });

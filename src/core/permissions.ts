@@ -33,6 +33,12 @@ export interface ToolRule {
    *  test against JSON.stringify(args) — deliberately minimal, matching
    *  this scaffold's "auditable in five minutes" constraint). */
   argsPattern?: RegExp;
+  /** Optional short human-readable tag folded into the durable
+   *  ApprovalRequest's reason when this rule evaluates to "ask" — lets a
+   *  reviewer tell "this needs approval because it touches CI/infra" apart
+   *  from the generic "this rule said ask" default, at a glance in the
+   *  Approvals tab, without reading the raw args. */
+  label?: string;
 }
 
 export interface PermissionPolicy {
@@ -55,6 +61,13 @@ function matchRule(toolName: string, args: Record<string, unknown>, rule: ToolRu
   return true;
 }
 
+/** Shared by evaluatePolicy() and installPermissionPolicy() — finds the
+ *  first matching rule, if any, so a caller that needs more than just the
+ *  decision (e.g. a rule's `label`) doesn't have to re-walk the list. */
+function findMatchingRule(policy: PermissionPolicy, toolName: string, args: Record<string, unknown>): ToolRule | undefined {
+  return policy.rules.find((rule) => matchRule(toolName, args, rule));
+}
+
 /** Evaluates a policy's rules in order — first match wins. No matching
  *  rule at all defaults to "ask" (never silently allow the unspecified
  *  case), matching the safety-first posture of every harness studied. */
@@ -63,10 +76,7 @@ export function evaluatePolicy(
   toolName: string,
   args: Record<string, unknown>,
 ): ToolDecision {
-  for (const rule of policy.rules) {
-    if (matchRule(toolName, args, rule)) return rule.decision;
-  }
-  return "ask";
+  return findMatchingRule(policy, toolName, args)?.decision ?? "ask";
 }
 
 /** Wires a PermissionPolicy into the hook system as a `tool.before`
@@ -111,12 +121,13 @@ export function installPermissionPolicy(policy: PermissionPolicy): void {
     // memory.js — approvals.ts has no need to import permissions.ts, but
     // keeping this edge lazy means adding one never risks a cycle.
     const { requestApproval } = await import("./approvals.js");
+    const label = findMatchingRule(policy, toolName, args)?.label;
     const request = await requestApproval({
       agentId: ctx.agentId,
       sessionId: ctx.sessionId,
       toolName,
       args,
-      reason: `permission policy rule for tool "${toolName}" evaluated to "ask"`,
+      reason: label ?? `permission policy rule for tool "${toolName}" evaluated to "ask"`,
     });
     return {
       block: true,
@@ -136,6 +147,13 @@ export interface SandboxPolicy {
   filesystemScope: FilesystemScope;
   /** Absolute path considered "the workspace" for workspace-scoped modes. */
   workspaceRoot: string;
+  /** Additional absolute paths treated exactly like `workspaceRoot` for
+   *  containment purposes — e.g. a second, sibling repo checkout that
+   *  doesn't share a useful common ancestor with workspaceRoot (picking
+   *  their common ancestor, like "/", would defeat the whole check).
+   *  Optional and defaults to none, so every existing single-root caller
+   *  is unaffected. */
+  additionalRoots?: string[];
   /** Command substrings that are always rejected regardless of anything
    *  else — the hardline blocklist pattern from Hermes' 8-layer model:
    *  a floor beneath even an otherwise-permissive policy. */
@@ -350,7 +368,7 @@ export function checkSandbox(policy: SandboxPolicy, command: string): SandboxChe
 
   if (policy.filesystemScope === "unrestricted") return { allowed: true };
 
-  const allowedRoots = [path.resolve(policy.workspaceRoot)];
+  const allowedRoots = [path.resolve(policy.workspaceRoot), ...(policy.additionalRoots ?? []).map((r) => path.resolve(r))];
   if (policy.filesystemScope === "workspace-and-temp") {
     allowedRoots.push(path.resolve(os.tmpdir()));
   }
