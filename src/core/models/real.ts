@@ -104,6 +104,102 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
         ...(toolBlock ? { toolCall: { name: toolBlock.name, args: toolBlock.input } } : {}),
       };
     },
+
+    // Real, provider-level token streaming — Anthropic's `stream: true`
+    // Messages API, parsed as SSE. This is the actual mechanism BaseOS's
+    // Chat.tsx used to implement directly in the BROWSER before the
+    // Agent-OS integration (see that repo's history) — the exact same
+    // parsing logic, now living in the harness where it belongs instead
+    // of duplicated client-side. Handles content_block_start/delta/stop
+    // for both a text block (text_delta, forwarded to onDelta chunk by
+    // chunk) and a tool_use block (input_json_delta chunks accumulated
+    // and parsed once complete — Anthropic streams a tool call's JSON
+    // input incrementally too, but there's no meaningful "delta" to show
+    // a user for that, so only text deltas go to onDelta).
+    async completeStream(messages: ModelMessage[], onDelta: (deltaText: string) => void): Promise<ModelResponse> {
+      const { system, messages: anthropicMessages } = toAnthropicMessages(messages);
+
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01",
+      };
+      if (authStyle === "api-key") {
+        headers["x-api-key"] = opts.apiKey;
+      } else {
+        headers["authorization"] = `Bearer ${opts.apiKey}`;
+        headers["anthropic-beta"] = "oauth-2025-04-20";
+      }
+
+      const body: Record<string, unknown> = {
+        model,
+        max_tokens: opts.maxTokens ?? 1024,
+        messages: anthropicMessages,
+        stream: true,
+        ...(system ? { system } : {}),
+      };
+      if (opts.tools?.length) {
+        body.tools = opts.tools.map((t) => ({
+          name: t.name,
+          description: t.description,
+          input_schema: t.parameters,
+        }));
+      }
+
+      const res = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(body) });
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(`Anthropic API error ${res.status}: ${JSON.stringify(errJson).slice(0, 500)}`);
+      }
+
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let accumulated = "";
+      let toolName: string | undefined;
+      let toolJson = "";
+      let toolCall: { name: string; args: Record<string, unknown> } | undefined;
+
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? ""; // keep a possibly-incomplete trailing line for the next chunk
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const data = line.slice(6).trim();
+          if (!data) continue;
+          let parsed: any;
+          try {
+            parsed = JSON.parse(data);
+          } catch {
+            continue; // malformed/partial frame — skip rather than crash the stream
+          }
+
+          if (parsed.type === "content_block_start" && parsed.content_block?.type === "tool_use") {
+            toolName = parsed.content_block.name;
+            toolJson = "";
+          } else if (parsed.type === "content_block_delta") {
+            if (parsed.delta?.type === "text_delta") {
+              accumulated += parsed.delta.text;
+              onDelta(parsed.delta.text);
+            } else if (parsed.delta?.type === "input_json_delta") {
+              toolJson += parsed.delta.partial_json ?? "";
+            }
+          } else if (parsed.type === "content_block_stop" && toolName) {
+            try {
+              toolCall = { name: toolName, args: JSON.parse(toolJson || "{}") };
+            } catch {
+              toolCall = { name: toolName, args: {} };
+            }
+            toolName = undefined;
+          }
+        }
+      }
+
+      return { content: accumulated, ...(toolCall ? { toolCall } : {}) };
+    },
   };
 }
 

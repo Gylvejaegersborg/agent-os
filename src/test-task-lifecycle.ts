@@ -16,6 +16,8 @@
 //      contrasted with the existing 'managed' explicit-step-control path.
 // Run with: node dist/test-task-lifecycle.js
 
+import "./test-helpers/isolate.js";
+import { execFileSync } from "node:child_process";
 import {
   createTask,
   transitionTask,
@@ -23,7 +25,7 @@ import {
   listTasks,
   checkTaskTimeouts,
   reconcileLostTasks,
-  simulateProcessRestart,
+  renewTaskLiveness,
   flushDigest,
   peekDigestQueue,
   subscribeToEvent,
@@ -105,45 +107,74 @@ async function testTimeoutEnforcement(): Promise<void> {
 }
 
 async function testLostDetection(): Promise<void> {
-  console.log("\n-- 2. 'lost' detection (reconciliation sweep) --");
+  console.log("\n-- 2. 'lost' detection — durable, time-based liveness (in-process) --");
   const agentId = "lifecycle-test-agent";
 
-  // Task A: started running in "this process" and never finished — this
-  // is the orphan we expect reconciliation to catch after a "restart".
+  // Task A: transitioned running once and never renewed again — this is
+  // the orphan we expect reconciliation to catch once its renewal goes
+  // stale, regardless of which process (or none) is still "watching" it.
   const orphan = await createTask({ type: "cli", agentId, input: {} });
-  await transitionTask(orphan.id, "running");
+  await transitionTask(orphan.id, "running"); // this itself renews liveness once (see tasks.ts)
 
-  // Task B: also running, but we'll leave the process registry intact for
-  // it — reconciliation must NOT falsely mark a genuinely-live Task lost.
+  // Task B: also running, and genuinely kept alive by an explicit
+  // renewTaskLiveness() call partway through — modeling a real Worker's
+  // own heartbeat, not just the initial transition.
   const stillAlive = await createTask({ type: "cli", agentId, input: {} });
   await transitionTask(stillAlive.id, "running");
 
-  // Sanity: reconciling BEFORE any restart finds nothing lost — both
-  // Tasks are registered live in this process's liveTaskIds.
-  const before = await reconcileLostTasks();
-  assert(!before.lost.includes(orphan.id) && !before.lost.includes(stillAlive.id), "reconciling with an intact live registry finds nothing lost");
+  // Sanity: reconciling immediately, with a generous threshold, finds
+  // nothing stale yet — both Tasks were just renewed.
+  const before = await reconcileLostTasks({ staleAfterMs: 10_000 });
+  assert(!before.lost.includes(orphan.id) && !before.lost.includes(stillAlive.id), "reconciling immediately after renewal finds nothing stale");
 
-  // Simulate this process crashing and a fresh process starting up: the
-  // in-memory liveTaskIds registry is wiped, exactly like a real restart.
-  simulateProcessRestart();
+  await sleep(60);
+  await renewTaskLiveness(stillAlive.id); // stillAlive's clock resets; orphan's does not
 
-  // The fresh process picks stillAlive back up and marks it running again
-  // (its own transitionTask() call re-registers it as live) BEFORE
-  // running reconciliation — modeling "we resumed ownership of this one".
-  await transitionTask(stillAlive.id, "running");
-
-  const after = await reconcileLostTasks();
-  assert(after.lost.includes(orphan.id), "reconciliation marks the orphaned Task (never re-registered) as lost");
-  assert(!after.lost.includes(stillAlive.id), "reconciliation does NOT mark the re-registered-as-live Task lost");
+  await sleep(60);
+  // staleAfterMs=80 is shorter than orphan's ~120ms silence but longer
+  // than stillAlive's ~60ms since its last renewal.
+  const after = await reconcileLostTasks({ staleAfterMs: 80 });
+  assert(after.lost.includes(orphan.id), "a Task with no renewal inside staleAfterMs is marked lost");
+  assert(!after.lost.includes(stillAlive.id), "a Task renewed inside staleAfterMs is NOT marked lost");
 
   const orphanTask = await getTask(orphan.id);
   const aliveTask = await getTask(stillAlive.id);
   assert(orphanTask?.status === "lost", `orphaned Task's projected status is "lost" (got "${orphanTask?.status}")`);
-  assert(aliveTask?.status === "running", `re-registered Task's status remains "running" (got "${aliveTask?.status}")`);
+  assert(aliveTask?.status === "running", `renewed Task's status remains "running" (got "${aliveTask?.status}")`);
 
   const events = await readStream("tasks");
   const sweptEvents = events.filter((e) => e.type === "task.reconciliation.swept");
   assert(sweptEvents.length >= 2, `task.reconciliation.swept audit events were appended (got ${sweptEvents.length})`);
+}
+
+async function testLostDetectionAcrossRealProcesses(): Promise<void> {
+  console.log("\n-- 3. 'lost' detection — genuinely cross-process --");
+  // The strongest version of this test: a SEPARATE Node process (not a
+  // simulated in-memory reset within this one) creates a Task, transitions
+  // it to 'running' (one durable renewal), and exits immediately without
+  // ever renewing it again — a real crash. This process then reconciles
+  // against the SAME data directory and must detect the orphan purely
+  // from durable event-log state, proving the mechanism doesn't secretly
+  // depend on any process-local memory to work.
+  const dataDir = process.env.AGENT_OS_DATA_DIR;
+  if (!dataDir) throw new Error("expected AGENT_OS_DATA_DIR to be set by test-helpers/isolate.js");
+
+  const output = execFileSync("node", ["dist/test-helpers/crash-worker.js", "crash-worker-agent"], {
+    env: { ...process.env, AGENT_OS_DATA_DIR: dataDir },
+    encoding: "utf-8",
+  });
+  const crashedTaskId = output.trim();
+  assert(crashedTaskId.length > 0, "the child process printed a real Task id");
+
+  const immediately = await reconcileLostTasks({ staleAfterMs: 5_000 });
+  assert(!immediately.lost.includes(crashedTaskId), "immediately after the child exits, its Task isn't stale yet (generous threshold)");
+
+  await sleep(60);
+  const afterWait = await reconcileLostTasks({ staleAfterMs: 40 });
+  assert(afterWait.lost.includes(crashedTaskId), "a Task whose OWNING PROCESS crashed is detected as lost by a completely different process");
+
+  const crashedTask = await getTask(crashedTaskId);
+  assert(crashedTask?.status === "lost", `the cross-process-orphaned Task's status is "lost" (got "${crashedTask?.status}")`);
 }
 
 async function testNotifyPolicy(): Promise<void> {
@@ -270,6 +301,7 @@ async function testMirroredFlow(): Promise<void> {
 async function main(): Promise<void> {
   await testTimeoutEnforcement();
   await testLostDetection();
+  await testLostDetectionAcrossRealProcesses();
   await testNotifyPolicy();
   await testMirroredFlow();
 

@@ -39,9 +39,13 @@ export interface PermissionPolicy {
   agentId: string;
   rules: ToolRule[];
   /** Called when a rule's decision is "ask" — return true to allow, false
-   *  to deny. In a real deployment this prompts the human; the scaffold's
-   *  default just denies (see denyOnAsk below) so nothing hangs waiting
-   *  for input that will never come in an automated demo/test run. */
+   *  to deny, SYNCHRONOUSLY, in this same process, before the tool call
+   *  proceeds. Meant for an in-process demo/test that wants an immediate
+   *  yes/no without going through the durable approvals.ts flow at all.
+   *  When omitted (the default, and what a real deployment should use),
+   *  installPermissionPolicy() instead creates a durable ApprovalRequest
+   *  via approvals.ts's requestApproval() and blocks the tool call — see
+   *  that branch below for why this is the better default. */
   onAsk?: (ctx: HookContext) => Promise<boolean>;
 }
 
@@ -81,11 +85,46 @@ export function installPermissionPolicy(policy: PermissionPolicy): void {
     if (decision === "deny") {
       return { block: true, reason: `denied by permission policy: tool "${toolName}" is not allowed` };
     }
+
     // decision === "ask"
-    const allowed = policy.onAsk ? await policy.onAsk(ctx) : false; // default: deny on ask, never hang
-    if (!allowed) {
-      return { block: true, reason: `denied: tool "${toolName}" requires approval and none was given` };
+    if (policy.onAsk) {
+      const allowed = await policy.onAsk(ctx);
+      if (!allowed) {
+        return { block: true, reason: `denied: tool "${toolName}" requires approval and none was given` };
+      }
+      return;
     }
+
+    // No synchronous onAsk callback — this is the real path a deployed
+    // runtime should use. Rather than auto-denying and losing all record
+    // of the request (the old behavior — nothing hangs, but nothing is
+    // ever recoverable either), persist a durable ApprovalRequest
+    // (approvals.ts) and block THIS call with its id in the reason. The
+    // tool call itself is never resumed automatically once approved —
+    // that would require pausing this in-process turn indefinitely,
+    // which this scaffold deliberately does not do (see session.ts's
+    // cancellation model for the primitive that DOES span processes). A
+    // caller that wants "retry once approved" issues a new turn/tool call
+    // after checking the request's status via getApproval()/listApprovals().
+    // Dynamic import avoids a module-init-time circular dependency the
+    // same way agent-loop.ts's dispatchTool() does for subagent.js/
+    // memory.js — approvals.ts has no need to import permissions.ts, but
+    // keeping this edge lazy means adding one never risks a cycle.
+    const { requestApproval } = await import("./approvals.js");
+    const request = await requestApproval({
+      agentId: ctx.agentId,
+      sessionId: ctx.sessionId,
+      toolName,
+      args,
+      reason: `permission policy rule for tool "${toolName}" evaluated to "ask"`,
+    });
+    return {
+      block: true,
+      reason:
+        `blocked pending approval: tool "${toolName}" requires approval — request ${request.id} has been ` +
+        `recorded (status: pending). Call approveRequest()/rejectRequest() (approvals.ts) to resolve it, then ` +
+        `issue a new turn/tool call.`,
+    };
   });
 }
 
@@ -217,13 +256,33 @@ function looksLikePath(token: string): boolean {
   return /[\\/]/.test(token) || /^[A-Za-z]:/.test(token);
 }
 
+/** Matches a Windows drive-absolute path ("C:\...", "C:/...") regardless
+ *  of the HOST platform this check itself is running on. This is
+ *  deliberately NOT gated on IS_WIN32: a sandboxed Worker enforcing a
+ *  Linux-hosted deployment can still receive a command string containing
+ *  a Windows-style path (a model can emit any string it likes), and
+ *  Node's path.resolve() only treats "C:\..." as absolute when the
+ *  PROCESS itself is running on win32 — on POSIX it silently treats the
+ *  drive letter as an ordinary relative path segment, which resolves
+ *  *inside* `root` instead of being rejected. That was a live bypass:
+ *  see the regression tests in test-sandbox-hardening.ts for (b)/(d).
+ */
+const WINDOWS_DRIVE_PATH = /^[A-Za-z]:[\\/]/;
+
 /** Resolves a path-like token to an absolute path, first normalizing any
  *  MSYS-style drive prefix. Relative tokens resolve against `root`;
  *  absolute tokens (Windows drive paths, UNC paths, POSIX-rooted paths)
  *  resolve to themselves regardless of `root` — which is exactly the case
- *  the old "../"-only check missed entirely. */
+ *  the old "../"-only check missed entirely. Windows drive-absolute paths
+ *  are resolved via posix rules on purpose (see WINDOWS_DRIVE_PATH) so the
+ *  check is host-platform-independent instead of only correct when this
+ *  process itself happens to run on win32. */
 function resolveCandidate(root: string, token: string): string {
-  return path.resolve(root, normalizeMsysPath(token));
+  const normalized = normalizeMsysPath(token);
+  if (WINDOWS_DRIVE_PATH.test(normalized)) {
+    return path.posix.resolve("/" + normalized.replace(/\\/g, "/"));
+  }
+  return path.resolve(root, normalized);
 }
 
 /** Resolves symlinks via fs.realpathSync where the path (or the nearest

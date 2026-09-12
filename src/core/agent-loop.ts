@@ -5,6 +5,7 @@
 // observability for free (see eventlog.ts).
 
 import { appendEvent, project } from "./eventlog.js";
+import { publishEvent } from "./eventbus.js";
 import type { ModelAdapter, ModelMessage } from "./model.js";
 import type { Worker } from "./worker.js";
 import { fireHook } from "./hooks.js";
@@ -12,12 +13,19 @@ import { generateId } from "./id.js";
 import { SkillRegistry, renderSkillCatalog } from "./skills.js";
 import { retrieveMemoryContext } from "./memory.js";
 import { getAgentIdentity } from "./identity.js";
+import { ensureSession, isSessionCancelled, getSession } from "./session.js";
+import { getToolDefinition, withTimeout } from "./tool-registry.js";
+import type { ArtifactType } from "./artifacts.js";
 import type { EpisodicKind } from "./types.js";
 
 export interface AgentTurnResult {
   sessionId: string;
   finalContent: string;
   toolCalled?: string;
+  /** True when this turn stopped early because the Session (session.ts)
+   *  was cancelled mid-run rather than completing normally — see
+   *  cancelSession()'s doc comment for how a caller triggers this. */
+  cancelled?: boolean;
 }
 
 export interface RunTurnOptions {
@@ -63,6 +71,16 @@ export interface RunTurnOptions {
    *  synchronous "ask the user right now" mechanism. Omit to disable
    *  nomination for this turn, same opt-in pattern as enableSubagents. */
   enableMemoryNominations?: boolean;
+  /** When provided, the model can call the `record-artifact` tool to
+   *  attach a produced output (a file it wrote via the shell tool, a
+   *  report, a plan, ...) to this Task/Session — see artifacts.ts. The
+   *  artifact itself is just a pointer (type + location + metadata);
+   *  this scaffold doesn't manage blob storage, so the model is
+   *  expected to have already produced the actual content some other
+   *  way (typically via the shell tool) before recording it. Omit to
+   *  disable artifact recording for this turn, same opt-in pattern as
+   *  enableSubagents/enableMemoryNominations. */
+  enableArtifacts?: boolean;
 }
 
 function sessionStream(sessionId: string): string {
@@ -137,6 +155,7 @@ async function dispatchTool(
     model: ModelAdapter;
     enableSubagents?: boolean;
     enableMemoryNominations?: boolean;
+    enableArtifacts?: boolean;
   },
 ): Promise<ToolDispatchResult> {
   if (toolCall.name === "shell") {
@@ -189,22 +208,56 @@ async function dispatchTool(
       output: `Nomination ${nomination.id} recorded as PENDING — it has no effect on memory until a human explicitly approves it.`,
     };
   }
+  if (toolCall.name === "record-artifact") {
+    if (!ctx.enableArtifacts) {
+      return { ok: false, output: "", error: "artifact recording is not enabled for this session" };
+    }
+    const type = String(toolCall.args.type ?? "other") as ArtifactType;
+    const location = String(toolCall.args.location ?? "");
+    if (!location) return { ok: false, output: "", error: "record-artifact tool call missing required 'location' argument" };
+    const description = typeof toolCall.args.description === "string" ? toolCall.args.description : undefined;
+    // Dynamic import mirrors the subagent.js/memory.js pattern above.
+    const { createArtifact } = await import("./artifacts.js");
+    const session = await getSession(ctx.sessionId);
+    const artifact = await createArtifact({
+      type,
+      location,
+      producer: ctx.agentId,
+      sessionId: ctx.sessionId,
+      taskId: session?.taskId,
+      metadata: description ? { description } : {},
+    });
+    return { ok: true, output: `Artifact ${artifact.id} (${type}) recorded at "${location}".` };
+  }
   return { ok: false, output: "", error: `unknown tool: ${toolCall.name}` };
 }
 
 export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
-  const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents, enableMemoryNominations } = opts;
+  const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents, enableMemoryNominations, enableArtifacts } = opts;
   const injectMemory = opts.injectMemory ?? true;
   const maxHops = opts.maxToolHops ?? 3;
 
+  // Registers (or touches) this sessionId in the Session registry
+  // (session.ts) — see ensureSession()'s doc comment: existing callers
+  // that never pre-created a Session keep working unchanged, and now get
+  // a real, listable/cancellable registry entry for free.
+  await ensureSession(sessionId, agentId);
+
   await appendEvent(sessionStream(sessionId), "agent.turn.start", { agentId, userMessage });
   await fireHook("agent.turn.start", { agentId, sessionId, payload: { userMessage } });
+  // Published on the real event bus (eventbus.ts), NOT a second/parallel
+  // event system — this is what lets an external transport (the gateway,
+  // still to be built) expose live runtime activity by subscribing to
+  // the SAME event types already recorded in the session stream above,
+  // rather than polling the filesystem for changes.
+  await publishEvent("agent.turn.start", { sessionId, agentId, userMessage });
 
   await appendEvent(sessionStream(sessionId), "session.message", { role: "user", content: userMessage });
 
   let toolCalled: string | undefined;
   let hops = 0;
   let finalContent = "";
+  let cancelled = false;
 
   // Fetched once per turn, outside the hop loop — see renderIdentityContext's
   // own doc comment for why (unlike memory/skills, identity isn't expected
@@ -212,6 +265,16 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   const personaText = await renderIdentityContext(agentId);
 
   while (hops < maxHops) {
+    // Checked at the top of every hop (and again right after tool
+    // dispatch below) rather than once before the loop — cancelSession()
+    // (session.ts) can be called from a completely different process at
+    // any point mid-turn, and this is what makes "cancel a session"
+    // actually stop new model calls/tool executions instead of merely
+    // being ignored until the turn would have finished anyway.
+    if (await isSessionCancelled(sessionId)) {
+      cancelled = true;
+      break;
+    }
     const history = await getSessionHistory(sessionId);
     const catalogText = skills ? renderSkillCatalog(skills.listMetadata()) : "";
     const subagentText = enableSubagents
@@ -219,6 +282,9 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       : "";
     const nominationText = enableMemoryNominations
       ? "You can propose something worth remembering long-term by calling the `nominate-memory` tool with {content, kind}. This does NOT write to memory directly — it creates a pending nomination that a human must explicitly approve before it can ever influence curated memory."
+      : "";
+    const artifactText = enableArtifacts
+      ? "When you produce a real output worth attaching to this task (a file you wrote, a report, a plan), call the `record-artifact` tool with {type, location, description?} to register it. This does not create the content itself — produce it first (e.g. via the shell tool), then record where it lives."
       : "";
     // Re-read fresh every turn (not cached) — see injectMemory's own doc
     // comment for why. Only ever populated by the dreaming pass
@@ -228,11 +294,26 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     // personaText first — "who you are" precedes "what you remember/can do"
     // in the assembled system message, matching how a human-written system
     // prompt would order identity before capability context.
-    const systemParts = [personaText, memoryText, catalogText, subagentText, nominationText].filter(Boolean);
+    const systemParts = [personaText, memoryText, catalogText, subagentText, nominationText, artifactText].filter(Boolean);
     const messages: ModelMessage[] = systemParts.length
       ? [{ role: "system", content: systemParts.join("\n\n") }, ...history]
       : history;
-    const response = await model.complete(messages);
+    // Prefer real incremental streaming when this model adapter supports
+    // it (model.ts's ModelAdapter.completeStream) — publishes each chunk
+    // on the real event bus AS IT ARRIVES, not just the final assembled
+    // text once the whole call finishes. A model without completeStream
+    // behaves exactly as before this existed (plain model.complete()).
+    // Deltas are deliberately NOT appended to the durable session stream
+    // — they're ephemeral live-progress signal; the one final assembled
+    // "session.message" event below remains the durable record, same as
+    // always, so the event log doesn't balloon with one entry per token.
+    const response = model.completeStream
+      ? await model.completeStream(messages, (delta) => {
+          publishEvent("agent.turn.delta", { sessionId, agentId, delta }).catch((err) => {
+            console.error("[agent-loop] failed to publish turn delta:", err instanceof Error ? err.message : err);
+          });
+        })
+      : await model.complete(messages);
 
     if (response.toolCall) {
       toolCalled = response.toolCall.name;
@@ -251,16 +332,35 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       }
 
       await appendEvent(sessionStream(sessionId), "tool.call.start", response.toolCall);
-      const result = await dispatchTool(response.toolCall, {
-        worker,
-        skills,
-        agentId,
-        sessionId,
-        model,
-        enableSubagents,
-        enableMemoryNominations,
-      });
+      await publishEvent("tool.call.start", { sessionId, agentId, ...response.toolCall });
+      // A registered ToolDefinition's timeoutMs (tool-registry.ts) is
+      // enforced HERE, at the one call site every tool call passes
+      // through — not inside dispatchTool()'s individual branches — so
+      // it applies uniformly regardless of which tool ran. Every
+      // built-in tool ships with no timeoutMs by default (see
+      // BUILTIN_TOOL_DEFINITIONS), so withTimeout() is a true no-op for
+      // existing behavior unless a caller explicitly registers one.
+      const toolDef = getToolDefinition(response.toolCall.name);
+      const result = await withTimeout(
+        dispatchTool(response.toolCall, {
+          worker,
+          skills,
+          agentId,
+          sessionId,
+          model,
+          enableSubagents,
+          enableMemoryNominations,
+          enableArtifacts,
+        }),
+        toolDef?.timeoutMs,
+        () => ({
+          ok: false,
+          output: "",
+          error: `tool "${response.toolCall!.name}" timed out after ${toolDef?.timeoutMs}ms`,
+        }),
+      );
       await appendEvent(sessionStream(sessionId), "tool.call.end", { ...response.toolCall, result });
+      await publishEvent("tool.call.end", { sessionId, agentId, ...response.toolCall, result });
       await fireHook("tool.after", { agentId, sessionId, payload: { ...response.toolCall, result } });
 
       await appendEvent(sessionStream(sessionId), "session.message", {
@@ -268,6 +368,14 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
         content: result.ok ? result.output : `error: ${result.error}`,
       });
       hops++;
+      // Re-checked immediately after the tool actually ran (not just at
+      // the top of the next hop) so a cancellation that arrives WHILE a
+      // tool call is in flight is honored before the next model call is
+      // made, rather than one full extra hop later.
+      if (await isSessionCancelled(sessionId)) {
+        cancelled = true;
+        break;
+      }
       continue;
     }
 
@@ -276,10 +384,20 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     break;
   }
 
-  await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled });
-  await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled } });
+  if (cancelled) {
+    finalContent = finalContent || "Turn cancelled before completion.";
+    await appendEvent(sessionStream(sessionId), "session.message", {
+      role: "assistant",
+      content: finalContent,
+      cancelled: true,
+    });
+  }
 
-  return { sessionId, finalContent, toolCalled };
+  await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled });
+  await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled } });
+  await publishEvent("agent.turn.end", { sessionId, agentId, finalContent, toolCalled, cancelled });
+
+  return { sessionId, finalContent, toolCalled, cancelled: cancelled || undefined };
 }
 
 export function newSessionId(): string {
