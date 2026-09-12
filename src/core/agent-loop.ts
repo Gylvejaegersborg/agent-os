@@ -264,6 +264,19 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // to change mid-turn).
   const personaText = await renderIdentityContext(agentId);
 
+  // A model/provider error (rate limit, network blip, bad key, ...)
+  // thrown anywhere in the hop loop below used to just propagate
+  // straight out of runTurn(), skipping every event after it — the
+  // gateway's turns route still reported the failure over HTTP, but
+  // nothing durable ever recorded it, so a client that re-fetches
+  // session history right after (as BaseOS's chat does) saw no trace it
+  // ever happened: the turn silently vanished instead of explaining
+  // itself. Caught here and durably recorded as a real session.message
+  // before rethrowing — every existing caller's throw-on-failure
+  // behavior (flow-engine.ts's retry logic, the gateway's error
+  // response, any test asserting rejection) is unchanged; this only adds
+  // a durable trail alongside it.
+  try {
   while (hops < maxHops) {
     // Checked at the top of every hop (and again right after tool
     // dispatch below) rather than once before the loop — cancelSession()
@@ -382,6 +395,15 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     finalContent = response.content;
     await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent });
     break;
+  }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    finalContent = `⚠ ${message}`;
+    await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent, error: true });
+    await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled, error: message });
+    await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled, error: message } });
+    await publishEvent("agent.turn.end", { sessionId, agentId, finalContent, toolCalled, cancelled, error: message });
+    throw err;
   }
 
   if (cancelled) {
