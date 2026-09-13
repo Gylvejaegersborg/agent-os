@@ -133,6 +133,117 @@ export async function getSessionHistory(sessionId: string): Promise<ModelMessage
   });
 }
 
+// ---- Context compaction (ROADMAP.md's "context compaction" item) ----
+//
+// getSessionHistory() above is an unbounded, append-only projection — by
+// design, and that design is NOT changed here: the durable log (and
+// anything reading it directly, like a UI's full transcript view) keeps
+// seeing every message that ever happened, forever. What changes is
+// what gets FED TO THE MODEL on a long-running session: once history
+// grows past a threshold, everything older than the most recent
+// COMPACT_KEEP_RECENT messages is replaced, for the model's eyes only,
+// by one summary the model itself wrote — summarized via a real call to
+// the SAME model adapter already in use for the turn, not hardcoded
+// truncation. A `session.compacted` event records WHEN and THROUGH
+// WHICH message index compaction happened; it's additive, never
+// rewriting or deleting the session.message events it summarizes —
+// same "append, never mutate" posture as every other stream in this
+// codebase.
+
+/** Rough proxy for "getting close to a model's context window" — chars,
+ *  not real tokens (this scaffold has no tokenizer dependency for any
+ *  provider, and a rough proxy that's honest about being rough is better
+ *  than a precise-looking number that's actually wrong for half the
+ *  providers). Deliberately generous: triggering compaction too early
+ *  would throw away useful context for no benefit; too late risks an
+ *  actual provider error, which is the failure this exists to prevent. */
+const COMPACTION_TRIGGER_CHARS = 24_000;
+/** Never compact below this many messages — a short but verbose
+ *  conversation (a few long messages) shouldn't get summarized away
+ *  just because COMPACTION_TRIGGER_CHARS was crossed; compaction is for
+ *  conversations that have genuinely gone on a while. */
+const COMPACTION_MIN_MESSAGES = 12;
+/** How many of the MOST RECENT messages stay verbatim, never folded into
+ *  the summary — recent exchanges are exactly what a continuation needs
+ *  word-for-word (the user's last few asks, the model's last few
+ *  answers), unlike older context where a summary genuinely suffices. */
+const COMPACTION_KEEP_RECENT = 8;
+
+function totalChars(messages: ModelMessage[]): number {
+  return messages.reduce((sum, m) => sum + m.content.length, 0);
+}
+
+interface CompactionState {
+  /** How many of the session's session.message events the most recent
+   *  compaction already covers — 0 means "never compacted." */
+  throughIndex: number;
+  summary: string;
+}
+
+async function getCompactionState(sessionId: string): Promise<CompactionState> {
+  return project<CompactionState>(sessionStream(sessionId), { throughIndex: 0, summary: "" }, (state, event) => {
+    if (event.type === "session.compacted") {
+      const p = event.payload as { summary: string; throughIndex: number };
+      return { throughIndex: p.throughIndex, summary: p.summary };
+    }
+    return state;
+  });
+}
+
+/** The model-facing counterpart to getSessionHistory() — same durable
+ *  messages, but with anything already covered by a prior compaction
+ *  collapsed into that compaction's summary (one synthetic system
+ *  message) instead of being replayed in full. Falls back to the exact
+ *  full history, byte-for-byte, when the session has never been
+ *  compacted — so every existing caller/test that never triggers
+ *  compaction at all sees zero behavior change. */
+export async function getModelFacingHistory(sessionId: string): Promise<ModelMessage[]> {
+  const [full, compaction] = await Promise.all([getSessionHistory(sessionId), getCompactionState(sessionId)]);
+  if (compaction.throughIndex === 0) return full;
+  const remaining = full.slice(compaction.throughIndex);
+  return [{ role: "system", content: `[Summary of earlier conversation, compacted to stay within context limits]\n${compaction.summary}` }, ...remaining];
+}
+
+/** Checked once per turn (not per hop — a single turn's own tool-calling
+ *  hops don't usually grow history enough within themselves to matter,
+ *  and checking once keeps this cheap). If the model-facing history is
+ *  still over threshold, asks the SAME model adapter the turn is already
+ *  using to summarize everything except the most recent
+ *  COMPACTION_KEEP_RECENT messages, then records a session.compacted
+ *  event covering exactly what was summarized. A summarization call
+ *  that itself fails (model/provider error) is logged and swallowed —
+ *  compaction is a context-management nicety, not something that should
+ *  ever be able to take down a turn that would otherwise have succeeded
+ *  uncompacted (a provider that's already over its own limit will fail
+ *  on the REAL call moments later anyway, with its own real error). */
+async function maybeCompactSession(sessionId: string, model: ModelAdapter): Promise<void> {
+  const full = await getSessionHistory(sessionId);
+  if (full.length < COMPACTION_MIN_MESSAGES) return;
+  const compaction = await getCompactionState(sessionId);
+  const remaining = full.slice(compaction.throughIndex);
+  if (remaining.length <= COMPACTION_KEEP_RECENT) return; // nothing old enough left to fold in
+  if (totalChars(remaining) < COMPACTION_TRIGGER_CHARS) return;
+
+  const toSummarize = remaining.slice(0, remaining.length - COMPACTION_KEEP_RECENT);
+  const newThroughIndex = compaction.throughIndex + toSummarize.length;
+  const priorSummaryPart = compaction.summary ? `Previous summary of even earlier context:\n${compaction.summary}\n\n` : "";
+  const transcript = toSummarize.map((m) => `${m.role}: ${m.content}`).join("\n\n");
+
+  try {
+    const result = await model.complete([
+      {
+        role: "system",
+        content:
+          "Summarize the following conversation concisely but completely — preserve concrete facts, decisions, file paths, and anything a continuation would genuinely need. Prose is fine; do not editorialize or add commentary about the summarization itself.",
+      },
+      { role: "user", content: `${priorSummaryPart}Conversation to summarize:\n\n${transcript}` },
+    ]);
+    await appendEvent(sessionStream(sessionId), "session.compacted", { summary: result.content, throughIndex: newThroughIndex });
+  } catch (err) {
+    console.error(`[agent-loop] context compaction failed for session ${sessionId} (continuing uncompacted):`, err instanceof Error ? err.message : err);
+  }
+}
+
 export interface SessionUsage {
   inputTokens: number;
   outputTokens: number;
@@ -416,6 +527,12 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // to change mid-turn).
   const personaText = await renderIdentityContext(agentId);
 
+  // Checked once per turn, BEFORE the hop loop builds its first set of
+  // messages — so if this turn is the one that pushes history over
+  // threshold, the compaction already applies to THIS turn's own model
+  // calls via getModelFacingHistory() below, not just the next one.
+  await maybeCompactSession(sessionId, model);
+
   // A model/provider error (rate limit, network blip, bad key, ...)
   // thrown anywhere in the hop loop below used to just propagate
   // straight out of runTurn(), skipping every event after it — the
@@ -440,7 +557,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       cancelled = true;
       break;
     }
-    const history = await getSessionHistory(sessionId);
+    const history = await getModelFacingHistory(sessionId);
     const planModeText = planMode
       ? "PLAN MODE IS ACTIVE: you can inspect (read_file, shell commands that only read/list, skill) but calling shell/edit_file/write_file/subagent " +
         "will be blocked outright by the harness regardless of anything else — this is not a suggestion you can reason your way around. Investigate, " +

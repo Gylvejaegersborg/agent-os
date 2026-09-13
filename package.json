@@ -40,6 +40,7 @@
     "test-plan-mode": "tsc -b && node dist/test-plan-mode.js",
     "test-configured-hooks": "tsc -b && node dist/test-configured-hooks.js",
     "test-skill-install": "tsc -b && node dist/test-skill-install.js",
+    "test-context-compaction": "tsc -b && node dist/test-context-compaction.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {

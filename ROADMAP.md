@@ -86,6 +86,19 @@ into the LIVE gateway, not just what exists somewhere in the codebase).
       the same way `POST /skills` already does. A human-triggered
       settings action; no new gating beyond what the rest of `/skills`
       already has none of. **[gateway]** `POST /skills/install`.
+- [x] Context compaction — additive, not destructive: `getSessionHistory()`
+      (the durable, full log) is completely untouched, forever; a NEW
+      `getModelFacingHistory()` is what `runTurn()` actually feeds the
+      model, collapsing anything before the most recent
+      `COMPACTION_KEEP_RECENT` messages into one summary once history
+      crosses a char threshold, written by a REAL call to the same model
+      adapter the turn is already using (not hardcoded truncation). A
+      second compaction folds the previous summary back in rather than
+      starting over or duplicating. A failed summarization call is
+      logged and swallowed — compaction is a nicety, never something
+      that should be able to fail a turn that would have otherwise
+      succeeded uncompacted. **[core]** `agent-loop.ts`'s
+      `maybeCompactSession()`/`session.compacted` event.
 
 ## Open
 
@@ -95,11 +108,6 @@ codebases drift, and at least one gap in the original comparison
 (real token streaming) turned out to be partially wrong once actually
 checked — see the correction below.
 
-- [ ] **Context compaction.** `getSessionHistory()` (`agent-loop.ts`) is
-      an unbounded projection — every session.message event, forever. A
-      long-running session will eventually blow the model's context
-      window with no graceful degradation. Claude Code auto-summarizes
-      near the limit. **[core]**
 - [ ] **Checkpoint / rewind.** No file snapshotting at all — once
       `edit_file`/`write_file` lands (even approved), there's no undo
       beyond `git`. Claude Code can roll back conversation + files
