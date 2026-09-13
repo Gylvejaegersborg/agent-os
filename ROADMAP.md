@@ -99,6 +99,22 @@ into the LIVE gateway, not just what exists somewhere in the codebase).
       that should be able to fail a turn that would have otherwise
       succeeded uncompacted. **[core]** `agent-loop.ts`'s
       `maybeCompactSession()`/`session.compacted` event.
+- [x] Checkpoint / rewind — scoped down HONESTLY rather than attempted in
+      full: this is per-file undo for `edit_file`/`write_file`
+      mutations, not Claude Code's full "rewind conversation + files
+      together to an arbitrary point in time." Every successful mutation
+      records the file's content immediately BEFORE it changed; restoring
+      a revision writes that content back (or deletes the file, for a
+      revision where it didn't exist before) and is itself recorded as a
+      new, undoable revision — same "append, never delete history"
+      posture as the rest of this codebase. What this does NOT do:
+      snapshot the conversation itself, treat a multi-file change as one
+      transaction, or let you jump to an arbitrary point in a session —
+      that's the real remaining gap if full checkpoint/rewind is ever
+      built. **[core]** `file-revisions.ts`; **[gateway]**
+      `GET /files/revisions`, `POST /files/revisions/:id/restore`
+      (sandbox-checked). No UI yet — a revision browser/restore button
+      is the natural next step.
 
 ## Open
 
@@ -108,10 +124,6 @@ codebases drift, and at least one gap in the original comparison
 (real token streaming) turned out to be partially wrong once actually
 checked — see the correction below.
 
-- [ ] **Checkpoint / rewind.** No file snapshotting at all — once
-      `edit_file`/`write_file` lands (even approved), there's no undo
-      beyond `git`. Claude Code can roll back conversation + files
-      together to an earlier point. **[core]**
 - [ ] **MCP (Model Context Protocol) support.** The tool registry is
       closed — `shell`/`skill`/`subagent`/`nominate-memory`/
       `record-artifact`/`read_file`/`edit_file`/`write_file`, nothing

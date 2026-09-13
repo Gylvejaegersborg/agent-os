@@ -41,6 +41,7 @@
     "test-configured-hooks": "tsc -b && node dist/test-configured-hooks.js",
     "test-skill-install": "tsc -b && node dist/test-skill-install.js",
     "test-context-compaction": "tsc -b && node dist/test-context-compaction.js",
+    "test-file-revisions": "tsc -b && node dist/test-file-revisions.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {

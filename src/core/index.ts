@@ -7,6 +7,7 @@ export * from "./memory.js";
 export * from "./text-similarity.js";
 export * from "./hooks.js";
 export * from "./configured-hooks.js";
+export * from "./file-revisions.js";
 export * from "./skills.js";
 export * from "./permissions.js";
 export * from "./approvals.js";

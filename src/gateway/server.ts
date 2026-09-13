@@ -79,7 +79,11 @@ import {
   writeSkill,
   deleteSkill,
   parseSkillFile,
+  listFileRevisions,
+  getFileRevision,
+  restoreFileRevision,
 } from "../core/index.js";
+import { checkPathSandbox } from "../core/permissions.js";
 import type { SessionStatus, ApprovalStatus, TaskStatus, NominationStatus } from "../core/types.js";
 import type { SandboxPolicy } from "../core/permissions.js";
 import type { ConfiguredHook } from "../core/configured-hooks.js";
@@ -322,6 +326,44 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
   if (segments[0] === "hooks" && method === "GET" && segments.length === 1) {
     sendJson(res, 200, { hooks: deps.configuredHooks ?? [] });
     return;
+  }
+
+  // ---- File revisions — per-file undo for read_file/edit_file/write_file
+  // mutations (file-revisions.ts). ROADMAP.md's "checkpoint / rewind"
+  // item, scoped down honestly: this undoes ONE file's mutations, not a
+  // full conversation+files rewind to an arbitrary point in time. A
+  // restore is a human-triggered action (this is an HTTP route, not a
+  // model tool call) — still checked against the gateway's own
+  // sandboxPolicy when one is configured, so a restore can't write
+  // outside the same workspace the file tools themselves are confined
+  // to. ----
+  if (segments[0] === "files" && segments[1] === "revisions") {
+    if (method === "GET" && segments.length === 2) {
+      const revisions = await listFileRevisions(url.searchParams.get("path") ?? undefined);
+      sendJson(res, 200, { revisions });
+      return;
+    }
+    if (method === "POST" && segments.length === 4 && segments[3] === "restore") {
+      const revision = await getFileRevision(segments[2]!);
+      if (!revision) {
+        sendJson(res, 404, { error: `no such file revision: ${segments[2]}` });
+        return;
+      }
+      if (deps.sandboxPolicy) {
+        const check = checkPathSandbox(deps.sandboxPolicy, revision.path);
+        if (!check.allowed) {
+          sendJson(res, 403, { error: `sandbox rejected restore: ${check.reason}` });
+          return;
+        }
+      }
+      try {
+        await restoreFileRevision(segments[2]!);
+        sendJson(res, 200, { ok: true });
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
   }
 
   // ---- Skills — agentskills.io-format instructions (skills.ts), human-

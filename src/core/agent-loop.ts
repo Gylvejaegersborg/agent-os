@@ -20,6 +20,7 @@ import { getToolDefinition, withTimeout } from "./tool-registry.js";
 import type { ArtifactType } from "./artifacts.js";
 import type { EpisodicKind } from "./types.js";
 import { checkPathSandbox, type SandboxPolicy } from "./permissions.js";
+import { recordFileRevision } from "./file-revisions.js";
 
 export interface AgentTurnResult {
   sessionId: string;
@@ -357,6 +358,13 @@ async function dispatchFileTool(
 
     if (name === "write_file") {
       const content = String(args.content ?? "");
+      // Recorded BEFORE the write — a revision captures what the file
+      // looked like immediately before THIS mutation, so restoring it
+      // later reverses exactly this write, not some other state.
+      // existedBefore distinguishes "overwrite" (restore = write the old
+      // content back) from "brand-new file" (restore = delete it).
+      const previousContent = await fs.readFile(targetPath, "utf8").catch(() => undefined);
+      await recordFileRevision({ path: targetPath, previousContent, existedBefore: previousContent !== undefined, tool: "write_file" });
       await fs.mkdir(path.dirname(targetPath), { recursive: true });
       await fs.writeFile(targetPath, content, "utf8");
       return { ok: true, output: `Wrote ${content.length} chars to ${targetPath}.` };
@@ -381,6 +389,9 @@ async function dispatchFileTool(
       };
     }
     const updated = replaceAll ? current.split(oldString).join(newString) : current.replace(oldString, newString);
+    // edit_file requires the file to already exist (it was just read
+    // above), so existedBefore is always true here, unlike write_file.
+    await recordFileRevision({ path: targetPath, previousContent: current, existedBefore: true, tool: "edit_file" });
     await fs.writeFile(targetPath, updated, "utf8");
     return { ok: true, output: `Replaced ${replaceAll ? occurrences : 1} occurrence(s) in ${targetPath}.` };
   } catch (err) {
