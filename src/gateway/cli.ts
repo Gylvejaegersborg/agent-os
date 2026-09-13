@@ -6,6 +6,7 @@
 // Ollama instance, falling back to the deterministic stub so the gateway
 // is always runnable with zero configuration), then starts listening.
 
+import * as path from "node:path";
 import {
   createModelFromEnvOrOllama,
   createStubModel,
@@ -19,6 +20,8 @@ import {
   registerHook,
   installPermissionPolicy,
   DEFAULT_HARD_BLOCKLIST,
+  SkillRegistry,
+  loadConfiguredHooks,
   type SandboxPolicy,
 } from "../core/index.js";
 import { startGateway } from "./server.js";
@@ -35,15 +38,28 @@ import { startGateway } from "./server.js";
 // aspirational.
 const ENGINEER_AGENT_ID = "claude";
 
+// Every tool that can touch the filesystem or a real shell — restricted to
+// ENGINEER_AGENT_ID below, same reasoning as the shell-only version this
+// replaced. read_file/edit_file/write_file (agent-loop.ts) are the
+// structured alternative to editing via shell redirection — same
+// capability, same restriction, just a cleaner primitive for the model
+// (and a diff-able one for the Approvals tab) instead of an opaque
+// command string.
+const FILESYSTEM_TOOLS = ["shell", "read_file", "edit_file", "write_file"];
+
 /** Builds the Layer-A PermissionPolicy for ENGINEER_AGENT_ID. Read-only
- *  inspection commands are pre-approved so diagnosing a problem doesn't
- *  require a round trip through the Approvals tab for every `git diff` or
- *  `cat`; genuinely mutating commands (edits, `git add`/`commit`, installs)
- *  fall through to the policy's default "ask" — there is no "allow"
- *  rule for writes anywhere in this list, on purpose. `git push` (or
- *  anything else that reaches GitHub) is never special-cased into "allow"
- *  either, so it always lands in the Approvals tab too, regardless of
- *  what else this policy permits. */
+ *  inspection (shell's own safe-command list, plus read_file uncondition-
+ *  ally — a file read carries the same risk profile as `cat`) is
+ *  pre-approved so diagnosing a problem doesn't require a round trip
+ *  through the Approvals tab for every lookup; genuinely mutating calls
+ *  (shell edits, `git add`/`commit`, installs, edit_file, write_file) fall
+ *  through to the policy's default "ask" — there is no "allow" rule for
+ *  writes anywhere in this list, on purpose. `git push` (or anything else
+ *  that reaches GitHub) is never special-cased into "allow" either, so it
+ *  always lands in the Approvals tab too, regardless of what else this
+ *  policy permits. The infra-path rule uses tool:"*" so it catches
+ *  edit_file/write_file touching .github/.devcontainer/scripts the same
+ *  way it already caught a shell command mentioning them. */
 function buildEngineerPolicy() {
   const SAFE_READONLY = /"command":\s*"\s*(git (status|diff|log|show|branch\b[^&|;]*--list)|ls\b|cat\b|head\b|tail\b|grep\b|rg\b|wc\b|pwd\b|npm run (typecheck|build|test[\w-]*)\b|tsc\b)/;
   const INFRA_PATHS = /\.github\/|\.devcontainer\/|(^|[\s"'/])scripts\//;
@@ -51,16 +67,18 @@ function buildEngineerPolicy() {
     agentId: ENGINEER_AGENT_ID,
     rules: [
       {
-        tool: "shell",
+        tool: "*",
         decision: "ask" as const,
         argsPattern: INFRA_PATHS,
         label:
           "touches CI/infra (.github/, .devcontainer/, or scripts/) — these run with elevated trust " +
-          "(Actions secrets, the devcontainer itself), so they're always reviewed regardless of what the command does.",
+          "(Actions secrets, the devcontainer itself), so they're always reviewed regardless of what the call does.",
       },
       { tool: "shell", decision: "allow" as const, argsPattern: SAFE_READONLY },
-      // No further rules: anything else (edits, git add/commit/push,
-      // npm/apt installs, rm, ...) falls through to the default "ask".
+      { tool: "read_file", decision: "allow" as const },
+      // No further rules: anything else (shell edits, git add/commit/push,
+      // npm/apt installs, rm, edit_file, write_file, ...) falls through to
+      // the default "ask".
     ],
   };
 }
@@ -90,6 +108,30 @@ async function main(): Promise<void> {
   // dreaming itself is cheap (no model call, pure scoring) when there's
   // nothing newly eligible to phrase.
   startMemoryDreamingSweeper();
+
+  // Skills (skills.ts) previously had ZERO wiring into the live gateway —
+  // SkillRegistry.fromDirectory() existed, was tested, and had a full
+  // HTTP surface (GET/POST/DELETE /skills on server.ts) as of this same
+  // round of fixes, but nothing ever constructed one here, so the skill
+  // catalog was never injected into any turn and the `skill` tool could
+  // never find anything to load — same pattern as subagents/memory/
+  // dreaming before those got turned on. Defaults to a `skills/`
+  // directory next to this process's own cwd (agent-os's own tree, per
+  // start.sh); override with AGENT_OS_SKILLS_DIR. Safe on a totally fresh
+  // checkout: discoverSkills() treats a missing directory as "zero
+  // skills," not an error.
+  const skillsDir = process.env.AGENT_OS_SKILLS_DIR ?? path.join(process.cwd(), "skills");
+  const skills = await SkillRegistry.fromDirectory(skillsDir);
+  console.log(`[gateway] skills catalog ready: ${skills.listMetadata().length} skill(s) from ${skillsDir}`);
+
+  // User-configurable hooks (configured-hooks.ts) — a plain JSON file any
+  // operator can edit without touching this file, unlike the hardcoded
+  // hooks registered a few lines below. Missing file is zero hooks, not
+  // an error; a malformed one throws loudly (a silently-dropped hook is a
+  // security-relevant bug waiting to happen).
+  const hooksFile = process.env.AGENT_OS_HOOKS_FILE ?? path.join(process.cwd(), "hooks.json");
+  const configuredHooks = await loadConfiguredHooks(hooksFile);
+  console.log(`[gateway] configured hooks: ${configuredHooks.length} loaded from ${hooksFile}`);
 
   const model = (await createModelFromEnvOrOllama()) ?? createStubModel();
   if (model.id === "stub-model") {
@@ -125,11 +167,12 @@ async function main(): Promise<void> {
   // discussion this came out of: one agent owns harness maintenance, not
   // "whichever agent happens to be open."
   registerHook("tool.before", async (ctx) => {
-    if (String(ctx.payload.name ?? "") !== "shell") return;
+    const toolName = String(ctx.payload.name ?? "");
+    if (!FILESYSTEM_TOOLS.includes(toolName)) return;
     if (ctx.agentId === ENGINEER_AGENT_ID) return;
     return {
       block: true,
-      reason: `shell access is restricted to the "${ENGINEER_AGENT_ID}" agent — ask it directly if you need something inspected or fixed.`,
+      reason: `"${toolName}" is restricted to the "${ENGINEER_AGENT_ID}" agent — ask it directly if you need something inspected or fixed.`,
     };
   });
   // Layer A, part 2: ENGINEER_AGENT_ID's own rules (see buildEngineerPolicy
@@ -155,7 +198,7 @@ async function main(): Promise<void> {
   // claims some of these (e.g. "subagent-delegation"), so leaving them
   // off made that claim false in practice.
   const handle = await startGateway(
-    { model, worker, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true },
+    { model, worker, skills, skillsDir, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true, sandboxPolicy, configuredHooks },
     port,
   );
   console.log(`[gateway] listening on http://127.0.0.1:${handle.port}`);

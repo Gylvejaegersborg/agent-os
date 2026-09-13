@@ -98,10 +98,14 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
 
       const textBlock = json.content?.find((b: any) => b.type === "text");
       const toolBlock = json.content?.find((b: any) => b.type === "tool_use");
+      const usage = json.usage
+        ? { inputTokens: json.usage.input_tokens ?? 0, outputTokens: json.usage.output_tokens ?? 0 }
+        : undefined;
 
       return {
         content: textBlock?.text ?? "",
         ...(toolBlock ? { toolCall: { name: toolBlock.name, args: toolBlock.input } } : {}),
+        ...(usage ? { usage } : {}),
       };
     },
 
@@ -158,6 +162,12 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
       let toolName: string | undefined;
       let toolJson = "";
       let toolCall: { name: string; args: Record<string, unknown> } | undefined;
+      // Anthropic splits usage across two event types: input_tokens
+      // arrives once, up front, on message_start; output_tokens is
+      // cumulative and updates on each message_delta (the LAST one
+      // received is the final total — not a delta to sum).
+      let inputTokens = 0;
+      let outputTokens = 0;
 
       for (;;) {
         const { done, value } = await reader.read();
@@ -177,7 +187,9 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
             continue; // malformed/partial frame — skip rather than crash the stream
           }
 
-          if (parsed.type === "content_block_start" && parsed.content_block?.type === "tool_use") {
+          if (parsed.type === "message_start") {
+            inputTokens = parsed.message?.usage?.input_tokens ?? 0;
+          } else if (parsed.type === "content_block_start" && parsed.content_block?.type === "tool_use") {
             toolName = parsed.content_block.name;
             toolJson = "";
           } else if (parsed.type === "content_block_delta") {
@@ -194,11 +206,14 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
               toolCall = { name: toolName, args: {} };
             }
             toolName = undefined;
+          } else if (parsed.type === "message_delta") {
+            if (typeof parsed.usage?.output_tokens === "number") outputTokens = parsed.usage.output_tokens;
           }
         }
       }
 
-      return { content: accumulated, ...(toolCall ? { toolCall } : {}) };
+      const usage = inputTokens || outputTokens ? { inputTokens, outputTokens } : undefined;
+      return { content: accumulated, ...(toolCall ? { toolCall } : {}), ...(usage ? { usage } : {}) };
     },
   };
 }
@@ -242,12 +257,16 @@ export function createOpenAiModel(opts: OpenAiOptions): ModelAdapter {
 
       const choice = json.choices?.[0]?.message;
       const toolCall = choice?.tool_calls?.[0];
+      const usage = json.usage
+        ? { inputTokens: json.usage.prompt_tokens ?? 0, outputTokens: json.usage.completion_tokens ?? 0 }
+        : undefined;
 
       return {
         content: choice?.content ?? "",
         ...(toolCall
           ? { toolCall: { name: toolCall.function.name, args: JSON.parse(toolCall.function.arguments || "{}") } }
           : {}),
+        ...(usage ? { usage } : {}),
       };
     },
   };
@@ -326,13 +345,112 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
 
       const choice = json.choices?.[0]?.message;
       const toolCall = choice?.tool_calls?.[0];
+      const usage = json.usage
+        ? { inputTokens: json.usage.prompt_tokens ?? 0, outputTokens: json.usage.completion_tokens ?? 0 }
+        : undefined;
 
       return {
         content: choice?.content ?? "",
         ...(toolCall
           ? { toolCall: { name: toolCall.function.name, args: JSON.parse(toolCall.function.arguments || "{}") } }
           : {}),
+        ...(usage ? { usage } : {}),
       };
+    },
+
+    // Real token streaming, via the same OpenAI-compatible endpoint's
+    // `stream: true` mode — ROADMAP.md flagged this as the one adapter
+    // missing it (Anthropic's already had it). OpenAI-style SSE frames:
+    // `data: {"choices":[{"delta":{...}}]}` per chunk, terminated by a
+    // literal `data: [DONE]` line. A tool call's `function.arguments`
+    // streams incrementally across multiple chunks at the same index;
+    // this scaffold only ever surfaces ONE tool call per turn (same
+    // assumption the non-streaming path above makes via `tool_calls?.[0]`),
+    // so only index 0 is tracked.
+    async completeStream(messages: ModelMessage[], onDelta: (deltaText: string) => void): Promise<ModelResponse> {
+      const ollamaMessages = messages.map((m) => ({
+        role: m.role === "tool" ? "user" : m.role,
+        content: m.content,
+      }));
+
+      const body: Record<string, unknown> = { model, messages: ollamaMessages, stream: true };
+      if (opts.tools?.length) {
+        body.tools = opts.tools.map((t) => ({
+          type: "function",
+          function: { name: t.name, description: t.description, parameters: t.parameters },
+        }));
+      }
+
+      let res: Response;
+      try {
+        res = await fetch(baseUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      } catch (err) {
+        throw new Error(
+          `Could not reach Ollama at ${baseUrl} — is it running? ('ollama serve', or 'ollama pull ${model}' if the model isn't installed yet). Original error: ${err}`,
+        );
+      }
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(`Ollama API error ${res.status}: ${JSON.stringify(errJson).slice(0, 500)}`);
+      }
+
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let accumulated = "";
+      let toolName: string | undefined;
+      let toolArgs = "";
+      // Some OpenAI-compatible servers (Ollama included, when asked)
+      // send a final chunk carrying ONLY `usage`, with no `delta` at
+      // all — checked before the `!delta` guard below so that chunk
+      // isn't skipped before its usage is read.
+      let inputTokens = 0;
+      let outputTokens = 0;
+
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? ""; // keep a possibly-incomplete trailing line for the next chunk
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const data = line.slice(6).trim();
+          if (!data || data === "[DONE]") continue;
+          let parsed: any;
+          try {
+            parsed = JSON.parse(data);
+          } catch {
+            continue; // malformed/partial frame — skip rather than crash the stream
+          }
+
+          if (parsed.usage) {
+            inputTokens = parsed.usage.prompt_tokens ?? inputTokens;
+            outputTokens = parsed.usage.completion_tokens ?? outputTokens;
+          }
+
+          const delta = parsed.choices?.[0]?.delta;
+          if (!delta) continue;
+          if (typeof delta.content === "string" && delta.content) {
+            accumulated += delta.content;
+            onDelta(delta.content);
+          }
+          const toolCallDelta = delta.tool_calls?.[0];
+          if (toolCallDelta) {
+            if (toolCallDelta.function?.name) toolName = toolCallDelta.function.name;
+            if (toolCallDelta.function?.arguments) toolArgs += toolCallDelta.function.arguments;
+          }
+        }
+      }
+
+      const toolCall = toolName ? { name: toolName, args: JSON.parse(toolArgs || "{}") } : undefined;
+      const usage = inputTokens || outputTokens ? { inputTokens, outputTokens } : undefined;
+      return { content: accumulated, ...(toolCall ? { toolCall } : {}), ...(usage ? { usage } : {}) };
     },
   };
 }

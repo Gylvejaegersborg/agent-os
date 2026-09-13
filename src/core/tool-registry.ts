@@ -103,6 +103,31 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
       description: { type: "string", description: "Optional human-readable description of the artifact." },
     },
   },
+  {
+    name: "read_file",
+    description: "Reads a file's full text content from disk, subject to the session's SandboxPolicy (if one is configured).",
+    inputSchema: { path: { type: "string", required: true, description: "Path to the file, absolute or relative to the sandbox's workspaceRoot." } },
+  },
+  {
+    name: "edit_file",
+    description:
+      "Replaces an exact, unique occurrence of old_string with new_string in an existing file — the structured alternative to editing via shell redirection/sed. " +
+      "old_string must match exactly once in the file unless replace_all is set, otherwise the call fails with no write made (so a bad match never silently edits the wrong spot).",
+    inputSchema: {
+      path: { type: "string", required: true, description: "Path to the existing file to edit." },
+      old_string: { type: "string", required: true, description: "The exact text to replace. Must occur exactly once unless replace_all is true." },
+      new_string: { type: "string", required: true, description: "The replacement text." },
+      replace_all: { type: "boolean", description: "Replace every occurrence of old_string instead of requiring exactly one. Default false." },
+    },
+  },
+  {
+    name: "write_file",
+    description: "Creates a new file (or fully overwrites an existing one) with the given content. Creates parent directories as needed.",
+    inputSchema: {
+      path: { type: "string", required: true, description: "Path to the file to create or overwrite." },
+      content: { type: "string", required: true, description: "The full file content to write." },
+    },
+  },
 ];
 
 for (const def of BUILTIN_TOOL_DEFINITIONS) registerTool(def);

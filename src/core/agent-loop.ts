@@ -4,6 +4,8 @@
 // Every turn is written to the session's event stream, so resume/replay/
 // observability for free (see eventlog.ts).
 
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { appendEvent, project } from "./eventlog.js";
 import { publishEvent } from "./eventbus.js";
 import type { ModelAdapter, ModelMessage } from "./model.js";
@@ -17,6 +19,8 @@ import { ensureSession, isSessionCancelled, getSession } from "./session.js";
 import { getToolDefinition, withTimeout } from "./tool-registry.js";
 import type { ArtifactType } from "./artifacts.js";
 import type { EpisodicKind } from "./types.js";
+import { checkPathSandbox, type SandboxPolicy } from "./permissions.js";
+import { recordFileRevision } from "./file-revisions.js";
 
 export interface AgentTurnResult {
   sessionId: string;
@@ -26,6 +30,11 @@ export interface AgentTurnResult {
    *  was cancelled mid-run rather than completing normally — see
    *  cancelSession()'s doc comment for how a caller triggers this. */
   cancelled?: boolean;
+  /** Summed across every model call this turn made (a tool-calling turn
+   *  makes several) — omitted entirely when the model adapter never
+   *  reported usage at all (the stub model, or a provider response that
+   *  didn't carry it), never a fabricated {0,0}. */
+  usage?: { inputTokens: number; outputTokens: number };
 }
 
 export interface RunTurnOptions {
@@ -81,7 +90,36 @@ export interface RunTurnOptions {
    *  disable artifact recording for this turn, same opt-in pattern as
    *  enableSubagents/enableMemoryNominations. */
   enableArtifacts?: boolean;
+  /** When provided, read_file/edit_file/write_file (and, independently,
+   *  createSandboxedWorker-wrapped shell calls — see worker.ts) are
+   *  confined to this policy's workspace roots via permissions.ts's
+   *  checkPathSandbox(). Omitted means NO containment check runs for
+   *  these three tools specifically — matches this scaffold's existing
+   *  posture that sandboxing is something a caller (the gateway) opts
+   *  into by constructing a policy, not an implicit default baked into
+   *  agent-loop.ts itself. */
+  sandboxPolicy?: SandboxPolicy;
+  /** When true, the turn can inspect but not mutate anything —
+   *  ROADMAP.md's "plan / read-only mode" item. Enforced in the hop loop
+   *  itself (see PLAN_MODE_BLOCKED_TOOLS below), independent of and
+   *  checked BEFORE Layer A's PermissionPolicy, so an "allow" rule never
+   *  overrides it. Default false/omitted — every existing caller's
+   *  behavior is unchanged. */
+  planMode?: boolean;
 }
+
+/** Tools plan mode blocks outright, regardless of what Layer A's
+ *  PermissionPolicy would otherwise decide. shell/edit_file/write_file
+ *  can change the filesystem or run arbitrary commands; subagent can
+ *  itself mutate files via a delegated turn, so blocking it too is what
+ *  makes plan mode actually mean "nothing changes" rather than "nothing
+ *  changes, except through one level of indirection." Deliberately NOT
+ *  blocking read_file/skill/nominate-memory/record-artifact — none of
+ *  them mutate anything a plan-mode turn shouldn't be allowed to do
+ *  (a nomination has zero effect until a human approves it; recording
+ *  an artifact just registers metadata about something already
+ *  produced some other way). */
+const PLAN_MODE_BLOCKED_TOOLS = new Set(["shell", "edit_file", "write_file", "subagent"]);
 
 function sessionStream(sessionId: string): string {
   return `session:${sessionId}`;
@@ -91,6 +129,145 @@ export async function getSessionHistory(sessionId: string): Promise<ModelMessage
   return project<ModelMessage[]>(sessionStream(sessionId), [], (state, event) => {
     if (event.type === "session.message") {
       state.push(event.payload as unknown as ModelMessage);
+    }
+    return state;
+  });
+}
+
+// ---- Context compaction (ROADMAP.md's "context compaction" item) ----
+//
+// getSessionHistory() above is an unbounded, append-only projection — by
+// design, and that design is NOT changed here: the durable log (and
+// anything reading it directly, like a UI's full transcript view) keeps
+// seeing every message that ever happened, forever. What changes is
+// what gets FED TO THE MODEL on a long-running session: once history
+// grows past a threshold, everything older than the most recent
+// COMPACT_KEEP_RECENT messages is replaced, for the model's eyes only,
+// by one summary the model itself wrote — summarized via a real call to
+// the SAME model adapter already in use for the turn, not hardcoded
+// truncation. A `session.compacted` event records WHEN and THROUGH
+// WHICH message index compaction happened; it's additive, never
+// rewriting or deleting the session.message events it summarizes —
+// same "append, never mutate" posture as every other stream in this
+// codebase.
+
+/** Rough proxy for "getting close to a model's context window" — chars,
+ *  not real tokens (this scaffold has no tokenizer dependency for any
+ *  provider, and a rough proxy that's honest about being rough is better
+ *  than a precise-looking number that's actually wrong for half the
+ *  providers). Deliberately generous: triggering compaction too early
+ *  would throw away useful context for no benefit; too late risks an
+ *  actual provider error, which is the failure this exists to prevent. */
+const COMPACTION_TRIGGER_CHARS = 24_000;
+/** Never compact below this many messages — a short but verbose
+ *  conversation (a few long messages) shouldn't get summarized away
+ *  just because COMPACTION_TRIGGER_CHARS was crossed; compaction is for
+ *  conversations that have genuinely gone on a while. */
+const COMPACTION_MIN_MESSAGES = 12;
+/** How many of the MOST RECENT messages stay verbatim, never folded into
+ *  the summary — recent exchanges are exactly what a continuation needs
+ *  word-for-word (the user's last few asks, the model's last few
+ *  answers), unlike older context where a summary genuinely suffices. */
+const COMPACTION_KEEP_RECENT = 8;
+
+function totalChars(messages: ModelMessage[]): number {
+  return messages.reduce((sum, m) => sum + m.content.length, 0);
+}
+
+interface CompactionState {
+  /** How many of the session's session.message events the most recent
+   *  compaction already covers — 0 means "never compacted." */
+  throughIndex: number;
+  summary: string;
+}
+
+async function getCompactionState(sessionId: string): Promise<CompactionState> {
+  return project<CompactionState>(sessionStream(sessionId), { throughIndex: 0, summary: "" }, (state, event) => {
+    if (event.type === "session.compacted") {
+      const p = event.payload as { summary: string; throughIndex: number };
+      return { throughIndex: p.throughIndex, summary: p.summary };
+    }
+    return state;
+  });
+}
+
+/** The model-facing counterpart to getSessionHistory() — same durable
+ *  messages, but with anything already covered by a prior compaction
+ *  collapsed into that compaction's summary (one synthetic system
+ *  message) instead of being replayed in full. Falls back to the exact
+ *  full history, byte-for-byte, when the session has never been
+ *  compacted — so every existing caller/test that never triggers
+ *  compaction at all sees zero behavior change. */
+export async function getModelFacingHistory(sessionId: string): Promise<ModelMessage[]> {
+  const [full, compaction] = await Promise.all([getSessionHistory(sessionId), getCompactionState(sessionId)]);
+  if (compaction.throughIndex === 0) return full;
+  const remaining = full.slice(compaction.throughIndex);
+  return [{ role: "system", content: `[Summary of earlier conversation, compacted to stay within context limits]\n${compaction.summary}` }, ...remaining];
+}
+
+/** Checked once per turn (not per hop — a single turn's own tool-calling
+ *  hops don't usually grow history enough within themselves to matter,
+ *  and checking once keeps this cheap). If the model-facing history is
+ *  still over threshold, asks the SAME model adapter the turn is already
+ *  using to summarize everything except the most recent
+ *  COMPACTION_KEEP_RECENT messages, then records a session.compacted
+ *  event covering exactly what was summarized. A summarization call
+ *  that itself fails (model/provider error) is logged and swallowed —
+ *  compaction is a context-management nicety, not something that should
+ *  ever be able to take down a turn that would otherwise have succeeded
+ *  uncompacted (a provider that's already over its own limit will fail
+ *  on the REAL call moments later anyway, with its own real error). */
+async function maybeCompactSession(sessionId: string, model: ModelAdapter): Promise<void> {
+  const full = await getSessionHistory(sessionId);
+  if (full.length < COMPACTION_MIN_MESSAGES) return;
+  const compaction = await getCompactionState(sessionId);
+  const remaining = full.slice(compaction.throughIndex);
+  if (remaining.length <= COMPACTION_KEEP_RECENT) return; // nothing old enough left to fold in
+  if (totalChars(remaining) < COMPACTION_TRIGGER_CHARS) return;
+
+  const toSummarize = remaining.slice(0, remaining.length - COMPACTION_KEEP_RECENT);
+  const newThroughIndex = compaction.throughIndex + toSummarize.length;
+  const priorSummaryPart = compaction.summary ? `Previous summary of even earlier context:\n${compaction.summary}\n\n` : "";
+  const transcript = toSummarize.map((m) => `${m.role}: ${m.content}`).join("\n\n");
+
+  try {
+    const result = await model.complete([
+      {
+        role: "system",
+        content:
+          "Summarize the following conversation concisely but completely — preserve concrete facts, decisions, file paths, and anything a continuation would genuinely need. Prose is fine; do not editorialize or add commentary about the summarization itself.",
+      },
+      { role: "user", content: `${priorSummaryPart}Conversation to summarize:\n\n${transcript}` },
+    ]);
+    await appendEvent(sessionStream(sessionId), "session.compacted", { summary: result.content, throughIndex: newThroughIndex });
+  } catch (err) {
+    console.error(`[agent-loop] context compaction failed for session ${sessionId} (continuing uncompacted):`, err instanceof Error ? err.message : err);
+  }
+}
+
+export interface SessionUsage {
+  inputTokens: number;
+  outputTokens: number;
+  /** How many of this session's turns actually reported usage — lets a
+   *  caller distinguish "zero tokens used" (impossible in practice) from
+   *  "no turn in this session ever reported usage" (the honest default
+   *  for the stub model, or before any real provider was configured). */
+  turnsWithUsage: number;
+}
+
+/** Sums every agent.turn.end event's usage field across a session's whole
+ *  history — ROADMAP.md's "cost/token usage tracking" item. Pure
+ *  aggregation over durable events already being recorded (agent-loop.ts
+ *  above); no new stream, no new write path. */
+export async function getSessionUsage(sessionId: string): Promise<SessionUsage> {
+  return project<SessionUsage>(sessionStream(sessionId), { inputTokens: 0, outputTokens: 0, turnsWithUsage: 0 }, (state, event) => {
+    if (event.type === "agent.turn.end") {
+      const usage = (event.payload as any).usage as { inputTokens: number; outputTokens: number } | undefined;
+      if (usage) {
+        state.inputTokens += usage.inputTokens;
+        state.outputTokens += usage.outputTokens;
+        state.turnsWithUsage += 1;
+      }
     }
     return state;
   });
@@ -139,6 +316,89 @@ async function renderIdentityContext(agentId: string): Promise<string> {
   return `# Agent Identity\nYou are ${identity.name}. ${identity.persona}`;
 }
 
+/** Caps how much of a file read_file hands back to the model — without
+ *  this, one call on a large generated file (a lockfile, a build
+ *  artifact) could consume a huge share of the context window in one
+ *  hop. Mirrors the spirit of memory.ts's own retrieval-over-full-dump
+ *  posture, just as a blunt length cap rather than relevance ranking —
+ *  there's no query to rank against here, just a file. */
+const MAX_FILE_READ_CHARS = 100_000;
+
+/** The structured alternative to editing files via raw shell redirection
+ *  — read_file/edit_file/write_file, agent-loop.ts's own trio mirroring
+ *  the same primitives every major coding harness (Claude Code, Codex)
+ *  settled on independently. Unlike the shell tool (which delegates
+ *  filesystem containment to whatever Worker is wired in — see
+ *  worker.ts's createSandboxedWorker), these operate via direct fs
+ *  calls in-process, so containment is checked HERE, explicitly, against
+ *  the one sandboxPolicy the caller configured (no Worker layer to lean
+ *  on for these). No sandboxPolicy configured means no check runs at all
+ *  — same "opt-in, not implicit" posture as every other capability flag
+ *  in RunTurnOptions. */
+async function dispatchFileTool(
+  name: "read_file" | "edit_file" | "write_file",
+  args: Record<string, unknown>,
+  sandboxPolicy: SandboxPolicy | undefined,
+): Promise<ToolDispatchResult> {
+  const targetPath = String(args.path ?? "");
+  if (!targetPath) return { ok: false, output: "", error: `${name} tool call missing required 'path' argument` };
+
+  if (sandboxPolicy) {
+    const check = checkPathSandbox(sandboxPolicy, targetPath);
+    if (!check.allowed) return { ok: false, output: "", error: `sandbox rejected ${name}: ${check.reason}` };
+  }
+
+  try {
+    if (name === "read_file") {
+      const content = await fs.readFile(targetPath, "utf8");
+      const truncated = content.length > MAX_FILE_READ_CHARS;
+      const output = truncated ? content.slice(0, MAX_FILE_READ_CHARS) : content;
+      return { ok: true, output: truncated ? `${output}\n\n[...truncated — file is ${content.length} chars, showing first ${MAX_FILE_READ_CHARS}]` : output };
+    }
+
+    if (name === "write_file") {
+      const content = String(args.content ?? "");
+      // Recorded BEFORE the write — a revision captures what the file
+      // looked like immediately before THIS mutation, so restoring it
+      // later reverses exactly this write, not some other state.
+      // existedBefore distinguishes "overwrite" (restore = write the old
+      // content back) from "brand-new file" (restore = delete it).
+      const previousContent = await fs.readFile(targetPath, "utf8").catch(() => undefined);
+      await recordFileRevision({ path: targetPath, previousContent, existedBefore: previousContent !== undefined, tool: "write_file" });
+      await fs.mkdir(path.dirname(targetPath), { recursive: true });
+      await fs.writeFile(targetPath, content, "utf8");
+      return { ok: true, output: `Wrote ${content.length} chars to ${targetPath}.` };
+    }
+
+    // edit_file
+    const oldString = String(args.old_string ?? "");
+    const newString = String(args.new_string ?? "");
+    const replaceAll = args.replace_all === true;
+    if (!oldString) return { ok: false, output: "", error: "edit_file tool call missing required 'old_string' argument" };
+
+    const current = await fs.readFile(targetPath, "utf8");
+    const occurrences = current.split(oldString).length - 1;
+    if (occurrences === 0) {
+      return { ok: false, output: "", error: `old_string not found in ${targetPath} — no edit was made` };
+    }
+    if (occurrences > 1 && !replaceAll) {
+      return {
+        ok: false,
+        output: "",
+        error: `old_string occurs ${occurrences} times in ${targetPath}, not exactly once — no edit was made. Pass replace_all:true, or include more surrounding context to make old_string unique.`,
+      };
+    }
+    const updated = replaceAll ? current.split(oldString).join(newString) : current.replace(oldString, newString);
+    // edit_file requires the file to already exist (it was just read
+    // above), so existedBefore is always true here, unlike write_file.
+    await recordFileRevision({ path: targetPath, previousContent: current, existedBefore: true, tool: "edit_file" });
+    await fs.writeFile(targetPath, updated, "utf8");
+    return { ok: true, output: `Replaced ${replaceAll ? occurrences : 1} occurrence(s) in ${targetPath}.` };
+  } catch (err) {
+    return { ok: false, output: "", error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 interface ToolDispatchResult {
   ok: boolean;
   output: string;
@@ -156,10 +416,14 @@ async function dispatchTool(
     enableSubagents?: boolean;
     enableMemoryNominations?: boolean;
     enableArtifacts?: boolean;
+    sandboxPolicy?: SandboxPolicy;
   },
 ): Promise<ToolDispatchResult> {
   if (toolCall.name === "shell") {
     return ctx.worker.run(String(toolCall.args.command));
+  }
+  if (toolCall.name === "read_file" || toolCall.name === "edit_file" || toolCall.name === "write_file") {
+    return dispatchFileTool(toolCall.name, toolCall.args, ctx.sandboxPolicy);
   }
   if (toolCall.name === "skill") {
     if (!ctx.skills) return { ok: false, output: "", error: "no skill registry configured for this session" };
@@ -233,7 +497,7 @@ async function dispatchTool(
 }
 
 export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
-  const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents, enableMemoryNominations, enableArtifacts } = opts;
+  const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents, enableMemoryNominations, enableArtifacts, sandboxPolicy, planMode } = opts;
   const injectMemory = opts.injectMemory ?? true;
   const maxHops = opts.maxToolHops ?? 3;
 
@@ -258,11 +522,27 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   let hops = 0;
   let finalContent = "";
   let cancelled = false;
+  // Summed across every hop in this turn — a tool-calling turn makes
+  // several model calls, and the cost/usage that matters is the whole
+  // turn's total, not just the last hop's. Only ever reflects what the
+  // provider actually reported (see ModelResponse.usage's own doc
+  // comment) — stays {0,0} and is omitted from agent.turn.end entirely
+  // when nothing ever reported usage (the stub model, or a provider that
+  // doesn't report it), rather than claiming a fabricated zero.
+  let usageInputTokens = 0;
+  let usageOutputTokens = 0;
+  let sawUsage = false;
 
   // Fetched once per turn, outside the hop loop — see renderIdentityContext's
   // own doc comment for why (unlike memory/skills, identity isn't expected
   // to change mid-turn).
   const personaText = await renderIdentityContext(agentId);
+
+  // Checked once per turn, BEFORE the hop loop builds its first set of
+  // messages — so if this turn is the one that pushes history over
+  // threshold, the compaction already applies to THIS turn's own model
+  // calls via getModelFacingHistory() below, not just the next one.
+  await maybeCompactSession(sessionId, model);
 
   // A model/provider error (rate limit, network blip, bad key, ...)
   // thrown anywhere in the hop loop below used to just propagate
@@ -288,7 +568,12 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       cancelled = true;
       break;
     }
-    const history = await getSessionHistory(sessionId);
+    const history = await getModelFacingHistory(sessionId);
+    const planModeText = planMode
+      ? "PLAN MODE IS ACTIVE: you can inspect (read_file, shell commands that only read/list, skill) but calling shell/edit_file/write_file/subagent " +
+        "will be blocked outright by the harness regardless of anything else — this is not a suggestion you can reason your way around. Investigate, " +
+        "then describe the concrete plan (what you'd read/change/run and why) for the operator to review; they'll turn plan mode off to actually execute it."
+      : "";
     const catalogText = skills ? renderSkillCatalog(skills.listMetadata()) : "";
     const subagentText = enableSubagents
       ? "You can delegate a focused sub-task to an isolated subagent by calling the `subagent` tool with {goal}. The subagent runs independently and only its final result returns to you — its own reasoning and tool calls stay isolated."
@@ -299,6 +584,13 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     const artifactText = enableArtifacts
       ? "When you produce a real output worth attaching to this task (a file you wrote, a report, a plan), call the `record-artifact` tool with {type, location, description?} to register it. This does not create the content itself — produce it first (e.g. via the shell tool), then record where it lives."
       : "";
+    const fileToolsText =
+      "Prefer `read_file`/`edit_file`/`write_file` over shell redirection or `sed` for reading or changing a file's content — " +
+      "`edit_file` takes {path, old_string, new_string} and fails with no write made if old_string isn't found or isn't unique in the file " +
+      "(pass replace_all:true to replace every occurrence instead), rather than silently touching the wrong spot." +
+      (sandboxPolicy
+        ? " These are confined to the same sandboxed workspace as the shell tool, and a mutating call (edit_file/write_file) still requires approval the same way a mutating shell command does."
+        : "");
     // Re-read fresh every turn (not cached) — see injectMemory's own doc
     // comment for why. Only ever populated by the dreaming pass
     // (memory.ts), never by this turn's own conversation, so a chatty
@@ -307,7 +599,9 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     // personaText first — "who you are" precedes "what you remember/can do"
     // in the assembled system message, matching how a human-written system
     // prompt would order identity before capability context.
-    const systemParts = [personaText, memoryText, catalogText, subagentText, nominationText, artifactText].filter(Boolean);
+    const systemParts = [personaText, memoryText, catalogText, subagentText, nominationText, artifactText, fileToolsText, planModeText].filter(
+      Boolean,
+    );
     const messages: ModelMessage[] = systemParts.length
       ? [{ role: "system", content: systemParts.join("\n\n") }, ...history]
       : history;
@@ -328,8 +622,32 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
         })
       : await model.complete(messages);
 
+    if (response.usage) {
+      sawUsage = true;
+      usageInputTokens += response.usage.inputTokens;
+      usageOutputTokens += response.usage.outputTokens;
+    }
+
     if (response.toolCall) {
       toolCalled = response.toolCall.name;
+
+      // Plan mode is a HARD harness-level override, not a prompt
+      // suggestion — checked before Layer A's own PermissionPolicy, and
+      // not overridable by it (an "allow" rule for e.g. read_file still
+      // has no bearing here). This is what ROADMAP.md's "plan / read-only
+      // mode" item actually asked for: a mode the model is IN, not one
+      // it's merely told about. subagent is blocked too — a delegated
+      // subagent can itself mutate files, so plan mode has to cover it
+      // too to mean anything.
+      if (planMode && PLAN_MODE_BLOCKED_TOOLS.has(response.toolCall.name)) {
+        finalContent = `Tool call blocked: plan mode is active — "${response.toolCall.name}" would change something, and plan mode only allows read-only inspection. Describe what you'd do instead; the operator can turn plan mode off to actually execute it.`;
+        await appendEvent(sessionStream(sessionId), "session.message", {
+          role: "assistant",
+          content: finalContent,
+        });
+        break;
+      }
+
       const blockDecision = await fireHook("tool.before", {
         agentId,
         sessionId,
@@ -364,6 +682,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
           enableSubagents,
           enableMemoryNominations,
           enableArtifacts,
+          sandboxPolicy,
         }),
         toolDef?.timeoutMs,
         () => ({
@@ -399,10 +718,11 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     finalContent = `⚠ ${message}`;
+    const usage = sawUsage ? { inputTokens: usageInputTokens, outputTokens: usageOutputTokens } : undefined;
     await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent, error: true });
-    await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled, error: message });
-    await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled, error: message } });
-    await publishEvent("agent.turn.end", { sessionId, agentId, finalContent, toolCalled, cancelled, error: message });
+    await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled, error: message, usage });
+    await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled, error: message, usage } });
+    await publishEvent("agent.turn.end", { sessionId, agentId, finalContent, toolCalled, cancelled, error: message, usage });
     throw err;
   }
 
@@ -415,11 +735,12 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     });
   }
 
-  await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled });
-  await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled } });
-  await publishEvent("agent.turn.end", { sessionId, agentId, finalContent, toolCalled, cancelled });
+  const usage = sawUsage ? { inputTokens: usageInputTokens, outputTokens: usageOutputTokens } : undefined;
+  await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled, usage });
+  await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled, usage } });
+  await publishEvent("agent.turn.end", { sessionId, agentId, finalContent, toolCalled, cancelled, usage });
 
-  return { sessionId, finalContent, toolCalled, cancelled: cancelled || undefined };
+  return { sessionId, finalContent, toolCalled, cancelled: cancelled || undefined, usage };
 }
 
 export function newSessionId(): string {

@@ -14,7 +14,7 @@
 // convention is already respected by discoverSkills(), just not yet
 // exposed as its own loader.
 
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { appendEvent } from "./eventlog.js";
 
@@ -160,6 +160,19 @@ export async function writeSkill(
   return parsed;
 }
 
+/** Removes a skill's entire directory (<rootDir>/<name>/) from disk —
+ *  the inverse of writeSkill(). A no-op (not an error) if the skill
+ *  doesn't exist, matching writeSkill()'s own "creates or overwrites,
+ *  never fails on absence" posture. Records skill.deleted for the same
+ *  audit reason writeSkill() records skill.written. Does NOT touch a
+ *  SkillRegistry's in-memory copy — callers that also hold one (the
+ *  gateway) should pair this with registry.remove(name). */
+export async function deleteSkill(rootDir: string, name: string, ctx?: { agentId?: string }): Promise<void> {
+  const dirPath = path.join(rootDir, name);
+  await rm(dirPath, { recursive: true, force: true });
+  await appendEvent("skills", "skill.deleted", { skillName: name, agentId: ctx?.agentId, dirPath });
+}
+
 /** Normalizes CRLF to LF. Pre-existing bug, unrelated to observability:
  *  on a Windows checkout with core.autocrlf enabled, this repo's
  *  LF-committed SKILL.md files land on disk as CRLF; the frontmatter
@@ -278,6 +291,28 @@ export class SkillRegistry {
 
   has(name: string): boolean {
     return this.skills.has(name);
+  }
+
+  /** Full record (description AND body) with no side effects — unlike
+   *  loadBody(), this doesn't record a skill.loaded event, because it's
+   *  for an administrative "view/edit this skill's source" use case (a
+   *  settings UI), not an agent actually consuming it mid-turn. */
+  get(name: string): SkillFull | undefined {
+    return this.skills.get(name);
+  }
+
+  /** Hot-registers a skill without restarting the gateway — the
+   *  in-memory counterpart to writeSkill() persisting it to disk. A
+   *  settings UI calls both together: writeSkill() to make it durable,
+   *  then add() so the very next turn's catalog already reflects it. */
+  add(skill: SkillFull): void {
+    this.skills.set(skill.name, skill);
+  }
+
+  /** The in-memory counterpart to deleteSkill() removing the file from
+   *  disk. Returns whether a skill by that name was actually present. */
+  remove(name: string): boolean {
+    return this.skills.delete(name);
   }
 }
 

@@ -47,6 +47,7 @@ import {
   runTurn,
   createModelForAgent,
   getSessionHistory,
+  getSessionUsage,
   newSessionId,
   listTasks,
   getTask,
@@ -75,8 +76,17 @@ import {
   approveAgentMemory,
   rejectAgentMemory,
   listDreamingPasses,
+  writeSkill,
+  deleteSkill,
+  parseSkillFile,
+  listFileRevisions,
+  getFileRevision,
+  restoreFileRevision,
 } from "../core/index.js";
+import { checkPathSandbox } from "../core/permissions.js";
 import type { SessionStatus, ApprovalStatus, TaskStatus, NominationStatus } from "../core/types.js";
+import type { SandboxPolicy } from "../core/permissions.js";
+import type { ConfiguredHook } from "../core/configured-hooks.js";
 import type { ArtifactType } from "../core/artifacts.js";
 import type { FlowStepDefinition } from "../core/flow-engine.js";
 
@@ -84,10 +94,22 @@ export interface GatewayDeps {
   model: ModelAdapter;
   worker: Worker;
   skills?: SkillRegistry;
+  /** Root directory writeSkill()/deleteSkill() persist to — separate from
+   *  `skills` (the in-memory catalog) because the registry itself doesn't
+   *  know where it was loaded from. Both must be set for POST/DELETE
+   *  /skills to work; GET works with just `skills`. */
+  skillsDir?: string;
   enableSubagents?: boolean;
   enableMemoryNominations?: boolean;
   enableArtifacts?: boolean;
   maxToolHops?: number;
+  sandboxPolicy?: SandboxPolicy;
+  /** Purely for GET /hooks's visibility — the hooks themselves are
+   *  already live (loadConfiguredHooks() registered them directly with
+   *  hooks.ts before the gateway even started); this is just so a
+   *  settings UI can show what's configured without re-reading the file
+   *  itself. */
+  configuredHooks?: ConfiguredHook[];
 }
 
 export interface GatewayHandle {
@@ -295,6 +317,159 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
     }
   }
 
+  // ---- Configured hooks — read-only visibility into what's actually
+  // loaded (configured-hooks.ts). No write endpoint: hooks.ts's registry
+  // has no removal-by-source mechanism, so there's nothing to safely
+  // hot-swap — editing hooks.json and restarting the gateway (or asking
+  // the Engineer agent to edit the file, since it already has real
+  // file-tool access) is the honest contract. ----
+  if (segments[0] === "hooks" && method === "GET" && segments.length === 1) {
+    sendJson(res, 200, { hooks: deps.configuredHooks ?? [] });
+    return;
+  }
+
+  // ---- File revisions — per-file undo for read_file/edit_file/write_file
+  // mutations (file-revisions.ts). ROADMAP.md's "checkpoint / rewind"
+  // item, scoped down honestly: this undoes ONE file's mutations, not a
+  // full conversation+files rewind to an arbitrary point in time. A
+  // restore is a human-triggered action (this is an HTTP route, not a
+  // model tool call) — still checked against the gateway's own
+  // sandboxPolicy when one is configured, so a restore can't write
+  // outside the same workspace the file tools themselves are confined
+  // to. ----
+  if (segments[0] === "files" && segments[1] === "revisions") {
+    if (method === "GET" && segments.length === 2) {
+      const revisions = await listFileRevisions(url.searchParams.get("path") ?? undefined);
+      sendJson(res, 200, { revisions });
+      return;
+    }
+    if (method === "POST" && segments.length === 4 && segments[3] === "restore") {
+      const revision = await getFileRevision(segments[2]!);
+      if (!revision) {
+        sendJson(res, 404, { error: `no such file revision: ${segments[2]}` });
+        return;
+      }
+      if (deps.sandboxPolicy) {
+        const check = checkPathSandbox(deps.sandboxPolicy, revision.path);
+        if (!check.allowed) {
+          sendJson(res, 403, { error: `sandbox rejected restore: ${check.reason}` });
+          return;
+        }
+      }
+      try {
+        await restoreFileRevision(segments[2]!);
+        sendJson(res, 200, { ok: true });
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+  }
+
+  // ---- Skills — agentskills.io-format instructions (skills.ts), human-
+  // managed: a settings UI writes these, not an agent. Every agent shares
+  // the SAME catalog (unlike shell/file tools, there's no execution
+  // capability in a skill itself — just more context the model can
+  // choose to load — so there's no equivalent of ENGINEER_AGENT_ID-style
+  // restriction here). A gateway started with no `skills`/`skillsDir`
+  // configured (gateway/cli.ts always configures both today, but this
+  // guards the general case) reports 501 rather than crashing. ----
+  if (segments[0] === "skills") {
+    if (method === "GET" && segments.length === 1) {
+      if (!deps.skills) {
+        sendJson(res, 200, { skills: [] });
+        return;
+      }
+      sendJson(res, 200, { skills: deps.skills.listMetadata() });
+      return;
+    }
+    if (method === "GET" && segments.length === 2) {
+      const skill = deps.skills?.get(segments[1]!);
+      if (!skill) {
+        sendJson(res, 404, { error: `no such skill: ${segments[1]}` });
+        return;
+      }
+      sendJson(res, 200, skill);
+      return;
+    }
+    if (method === "POST" && segments.length === 1) {
+      if (!deps.skills || !deps.skillsDir) {
+        sendJson(res, 501, { error: "this gateway has no skills directory configured" });
+        return;
+      }
+      const body = await readRequestBody(req);
+      if (typeof body.name !== "string" || typeof body.description !== "string" || typeof body.body !== "string") {
+        sendJson(res, 400, { error: "name, description, and body (all strings) are required" });
+        return;
+      }
+      try {
+        const skill = await writeSkill(deps.skillsDir, {
+          name: body.name,
+          description: body.description,
+          body: body.body,
+          license: typeof body.license === "string" ? body.license : undefined,
+          compatibility: typeof body.compatibility === "string" ? body.compatibility : undefined,
+          metadata: typeof body.metadata === "object" && body.metadata !== null ? (body.metadata as Record<string, string>) : undefined,
+          allowedTools: Array.isArray(body.allowedTools) ? body.allowedTools.filter((t: unknown) => typeof t === "string") : undefined,
+        });
+        deps.skills.add(skill);
+        sendJson(res, 201, skill);
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+    if (method === "DELETE" && segments.length === 2) {
+      if (!deps.skills || !deps.skillsDir) {
+        sendJson(res, 501, { error: "this gateway has no skills directory configured" });
+        return;
+      }
+      await deleteSkill(deps.skillsDir, segments[1]!);
+      deps.skills.remove(segments[1]!);
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    // Install a skill FROM elsewhere — ROADMAP.md's "skill marketplace /
+    // install-from-elsewhere" item, scoped to the smallest useful version
+    // of that: fetch a raw SKILL.md-shaped document from any URL (a
+    // GitHub raw link, a gist, a shared file server — no registry
+    // protocol assumed, since there isn't a standard one to assume),
+    // validate it with the EXACT same parseSkillFile() a hand-authored
+    // one goes through, then persist + hot-register it exactly like
+    // POST /skills above. A human-triggered settings action, same trust
+    // level as the rest of this route — no new gating beyond what
+    // POST/DELETE /skills already have none of.
+    if (method === "POST" && segments.length === 2 && segments[1] === "install") {
+      if (!deps.skills || !deps.skillsDir) {
+        sendJson(res, 501, { error: "this gateway has no skills directory configured" });
+        return;
+      }
+      const body = await readRequestBody(req);
+      if (typeof body.url !== "string" || !body.url) {
+        sendJson(res, 400, { error: "url (string) is required" });
+        return;
+      }
+      try {
+        const fetchRes = await fetch(body.url, { signal: AbortSignal.timeout(10_000) });
+        if (!fetchRes.ok) {
+          sendJson(res, 400, { error: `could not fetch ${body.url}: HTTP ${fetchRes.status}` });
+          return;
+        }
+        const raw = await fetchRes.text();
+        // parseSkillFile needs a dirPath only for its own error messages
+        // — there's no real directory yet until writeSkill() below
+        // actually creates one, so the source URL stands in for it.
+        const parsed = parseSkillFile(raw, body.url);
+        const skill = await writeSkill(deps.skillsDir, parsed);
+        deps.skills.add(skill);
+        sendJson(res, 201, skill);
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+  }
+
   // ---- Agent memory — "what has this agent learned" surfaced to a
   // client (see memory.ts for the full model: fast-path episodic writes,
   // a deterministic dreaming pass that's the ONLY thing allowed to write
@@ -392,6 +567,15 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
       sendJson(res, 200, { history });
       return;
     }
+    if (method === "GET" && segments.length === 3 && segments[2] === "usage") {
+      const session = await getSession(segments[1]!);
+      if (!session) {
+        sendJson(res, 404, { error: `no such session: ${segments[1]}` });
+        return;
+      }
+      sendJson(res, 200, await getSessionUsage(segments[1]!));
+      return;
+    }
     if (method === "POST" && segments.length === 3 && segments[2] === "cancel") {
       const body = await readRequestBody(req);
       try {
@@ -443,7 +627,13 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         enableSubagents: deps.enableSubagents,
         enableMemoryNominations: deps.enableMemoryNominations,
         enableArtifacts: deps.enableArtifacts,
+        sandboxPolicy: deps.sandboxPolicy,
         maxToolHops: deps.maxToolHops,
+        // Per-REQUEST, not a gateway-wide deps default like the flags
+        // above — plan mode is something a client toggles per message,
+        // same as a Claude Code user flipping into plan mode for one
+        // turn at a time.
+        planMode: body.planMode === true,
       });
       sendJson(res, 200, result);
       return;
@@ -513,6 +703,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         enableSubagents: deps.enableSubagents,
         enableMemoryNominations: deps.enableMemoryNominations,
         enableArtifacts: deps.enableArtifacts,
+        sandboxPolicy: deps.sandboxPolicy,
       }).catch((err) => {
         console.error(`[gateway] flow ${flow.id} driving failed:`, err instanceof Error ? err.message : err);
       });
@@ -539,6 +730,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         enableSubagents: deps.enableSubagents,
         enableMemoryNominations: deps.enableMemoryNominations,
         enableArtifacts: deps.enableArtifacts,
+        sandboxPolicy: deps.sandboxPolicy,
       }).catch((err) => {
         console.error(`[gateway] flow ${flow.id} resume failed:`, err instanceof Error ? err.message : err);
       });

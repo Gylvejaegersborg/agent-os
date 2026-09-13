@@ -359,6 +359,14 @@ function isContained(root: string, candidate: string): boolean {
  *  See the block comment above ("HONEST LIMITATIONS") for exactly what
  *  this check does and does not guarantee — read it before treating this
  *  function as a real security boundary. */
+function allowedRootsFor(policy: SandboxPolicy): string[] {
+  const allowedRoots = [path.resolve(policy.workspaceRoot), ...(policy.additionalRoots ?? []).map((r) => path.resolve(r))];
+  if (policy.filesystemScope === "workspace-and-temp") {
+    allowedRoots.push(path.resolve(os.tmpdir()));
+  }
+  return allowedRoots;
+}
+
 export function checkSandbox(policy: SandboxPolicy, command: string): SandboxCheckResult {
   for (const pattern of policy.hardBlocklist) {
     if (pattern.test(command)) {
@@ -368,10 +376,7 @@ export function checkSandbox(policy: SandboxPolicy, command: string): SandboxChe
 
   if (policy.filesystemScope === "unrestricted") return { allowed: true };
 
-  const allowedRoots = [path.resolve(policy.workspaceRoot), ...(policy.additionalRoots ?? []).map((r) => path.resolve(r))];
-  if (policy.filesystemScope === "workspace-and-temp") {
-    allowedRoots.push(path.resolve(os.tmpdir()));
-  }
+  const allowedRoots = allowedRootsFor(policy);
 
   for (const token of tokenizeCommand(command)) {
     if (!looksLikePath(token)) continue;
@@ -387,6 +392,27 @@ export function checkSandbox(policy: SandboxPolicy, command: string): SandboxChe
     }
   }
 
+  return { allowed: true };
+}
+
+/** Same containment check as checkSandbox(), but for a tool that already
+ *  hands over a single, explicit target path (read_file/edit_file/
+ *  write_file — agent-loop.ts) instead of a raw shell command string to
+ *  tokenize. No hardBlocklist check here: those patterns are shaped
+ *  around shell syntax (`rm -rf /`, a fork bomb, ...), not meaningful
+ *  against a bare path. Everything else — workspaceRoot/additionalRoots/
+ *  tmpdir, symlink resolution, case-folding on Windows — is identical. */
+export function checkPathSandbox(policy: SandboxPolicy, targetPath: string): SandboxCheckResult {
+  if (policy.filesystemScope === "unrestricted") return { allowed: true };
+  const allowedRoots = allowedRootsFor(policy);
+  const resolved = resolveCandidate(policy.workspaceRoot, targetPath);
+  const withinAnyRoot = allowedRoots.some((root) => isContained(root, resolved));
+  if (!withinAnyRoot) {
+    return {
+      allowed: false,
+      reason: `path "${targetPath}" resolves to "${resolved}", which is not inside ${allowedRoots.join(" or ")}`,
+    };
+  }
   return { allowed: true };
 }
 

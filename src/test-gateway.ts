@@ -9,8 +9,18 @@
 // Run with: node dist/test-gateway.js
 
 import "./test-helpers/isolate.js";
+import path from "node:path";
 import { startGateway } from "./gateway/server.js";
-import { createStubModel, createStubWorker, installPermissionPolicy, createArtifact, writeEpisodic, nominateAgentMemory, runDreamingPass } from "./core/index.js";
+import {
+  createStubModel,
+  createStubWorker,
+  installPermissionPolicy,
+  createArtifact,
+  writeEpisodic,
+  nominateAgentMemory,
+  runDreamingPass,
+  SkillRegistry,
+} from "./core/index.js";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) {
@@ -22,9 +32,13 @@ function assert(cond: boolean, msg: string): void {
 }
 
 async function main(): Promise<void> {
+  const skillsDir = path.join(process.env.AGENT_OS_DATA_DIR!, "skills");
   const gateway = await startGateway({
     model: createStubModel(),
     worker: createStubWorker(),
+    skills: await SkillRegistry.fromDirectory(skillsDir),
+    skillsDir,
+    configuredHooks: [{ event: "session.start", command: "true", label: "test hook" }],
   });
   const base = `http://127.0.0.1:${gateway.port}`;
 
@@ -78,6 +92,31 @@ async function main(): Promise<void> {
     assert(
       history.history.some((m: any) => m.role === "user" && m.content === "hello from an HTTP client"),
       "GET /sessions/:id/history reflects the message that was actually sent",
+    );
+
+    const usageRes = await fetch(`${base}/sessions/${session.id}/usage`);
+    assert(usageRes.status === 200, "GET /sessions/:id/usage returns 200");
+    const usage = (await usageRes.json()) as any;
+    assert(usage.turnsWithUsage === 0, "the stub model never reports usage, so turnsWithUsage is honestly 0, not a fabricated figure");
+
+    const missingUsageRes = await fetch(`${base}/sessions/no-such-session/usage`);
+    assert(missingUsageRes.status === 404, "GET /sessions/:id/usage returns 404 for an unknown session");
+
+    const planModeSessionRes = await fetch(`${base}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agentId: "gateway-plan-mode-agent" }),
+    });
+    const planModeSession = (await planModeSessionRes.json()) as any;
+    const planModeTurnRes = await fetch(`${base}/sessions/${planModeSession.id}/turns`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ userMessage: "run shell: echo hi", planMode: true }),
+    });
+    const planModeResult = (await planModeTurnRes.json()) as any;
+    assert(
+      planModeResult.finalContent.includes("plan mode"),
+      `POST /sessions/:id/turns with planMode:true blocks a mutating tool call (got: "${planModeResult.finalContent}")`,
     );
 
     console.log("\n-- 4. Cancelling a session over real HTTP --");
@@ -339,7 +378,57 @@ async function main(): Promise<void> {
     const memRejectRes = await fetch(`${base}/agents/${memAgentId}/memory/nominations/${nomination2.id}/reject`, { method: "POST" });
     assert(memRejectRes.status === 200, "POST .../nominations/:id/reject returns 200");
 
-    console.log("\n-- 12. Unknown routes return 404, not a crash --");
+    console.log("\n-- 12. Configured-hooks visibility endpoint --");
+    const hooksRes = await fetch(`${base}/hooks`);
+    assert(hooksRes.status === 200, "GET /hooks returns 200");
+    const hooksBody = (await hooksRes.json()) as any;
+    assert(
+      hooksBody.hooks.some((h: any) => h.label === "test hook"),
+      "GET /hooks reflects what this gateway was actually configured with",
+    );
+
+    console.log("\n-- 13. Skill endpoints over real HTTP --");
+    const emptySkillsRes = await fetch(`${base}/skills`);
+    assert(emptySkillsRes.status === 200, "GET /skills returns 200 before any skill exists");
+    assert(((await emptySkillsRes.json()) as any).skills.length === 0, "the catalog starts empty");
+
+    const createSkillRes = await fetch(`${base}/skills`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "test-skill", description: "A skill created over HTTP for integration testing.", body: "Do the thing." }),
+    });
+    assert(createSkillRes.status === 201, "POST /skills returns 201");
+    const createdSkill = (await createSkillRes.json()) as any;
+    assert(createdSkill.name === "test-skill", "the created skill's name round-trips through the API");
+
+    const listAfterCreateRes = await fetch(`${base}/skills`);
+    const listAfterCreate = (await listAfterCreateRes.json()) as any;
+    assert(
+      listAfterCreate.skills.some((s: any) => s.name === "test-skill"),
+      "the new skill shows up in the catalog immediately — no gateway restart needed",
+    );
+
+    const getSkillRes = await fetch(`${base}/skills/test-skill`);
+    assert(getSkillRes.status === 200, "GET /skills/:name returns 200 for a real skill");
+    assert(((await getSkillRes.json()) as any).body === "Do the thing.", "GET /skills/:name includes the full body, not just metadata");
+
+    const getMissingSkillRes = await fetch(`${base}/skills/no-such-skill`);
+    assert(getMissingSkillRes.status === 404, "GET /skills/:name returns 404 for an unknown skill");
+
+    const badSkillRes = await fetch(`${base}/skills`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Not A Valid Name!", description: "x", body: "y" }),
+    });
+    assert(badSkillRes.status === 400, "POST /skills with an invalid name returns 400, not 500");
+
+    const deleteSkillRes = await fetch(`${base}/skills/test-skill`, { method: "DELETE" });
+    assert(deleteSkillRes.status === 200, "DELETE /skills/:name returns 200");
+    const listAfterDeleteRes = await fetch(`${base}/skills`);
+    const listAfterDelete = (await listAfterDeleteRes.json()) as any;
+    assert(!listAfterDelete.skills.some((s: any) => s.name === "test-skill"), "the deleted skill no longer shows up in the catalog");
+
+    console.log("\n-- 14. Unknown routes return 404, not a crash --");
     const notFoundRes = await fetch(`${base}/no-such-route`);
     assert(notFoundRes.status === 404, "an unknown route returns 404");
   } finally {
