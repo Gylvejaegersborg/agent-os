@@ -29,6 +29,11 @@ export interface AgentTurnResult {
    *  was cancelled mid-run rather than completing normally — see
    *  cancelSession()'s doc comment for how a caller triggers this. */
   cancelled?: boolean;
+  /** Summed across every model call this turn made (a tool-calling turn
+   *  makes several) — omitted entirely when the model adapter never
+   *  reported usage at all (the stub model, or a provider response that
+   *  didn't carry it), never a fabricated {0,0}. */
+  usage?: { inputTokens: number; outputTokens: number };
 }
 
 export interface RunTurnOptions {
@@ -103,6 +108,34 @@ export async function getSessionHistory(sessionId: string): Promise<ModelMessage
   return project<ModelMessage[]>(sessionStream(sessionId), [], (state, event) => {
     if (event.type === "session.message") {
       state.push(event.payload as unknown as ModelMessage);
+    }
+    return state;
+  });
+}
+
+export interface SessionUsage {
+  inputTokens: number;
+  outputTokens: number;
+  /** How many of this session's turns actually reported usage — lets a
+   *  caller distinguish "zero tokens used" (impossible in practice) from
+   *  "no turn in this session ever reported usage" (the honest default
+   *  for the stub model, or before any real provider was configured). */
+  turnsWithUsage: number;
+}
+
+/** Sums every agent.turn.end event's usage field across a session's whole
+ *  history — ROADMAP.md's "cost/token usage tracking" item. Pure
+ *  aggregation over durable events already being recorded (agent-loop.ts
+ *  above); no new stream, no new write path. */
+export async function getSessionUsage(sessionId: string): Promise<SessionUsage> {
+  return project<SessionUsage>(sessionStream(sessionId), { inputTokens: 0, outputTokens: 0, turnsWithUsage: 0 }, (state, event) => {
+    if (event.type === "agent.turn.end") {
+      const usage = (event.payload as any).usage as { inputTokens: number; outputTokens: number } | undefined;
+      if (usage) {
+        state.inputTokens += usage.inputTokens;
+        state.outputTokens += usage.outputTokens;
+        state.turnsWithUsage += 1;
+      }
     }
     return state;
   });
@@ -347,6 +380,16 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   let hops = 0;
   let finalContent = "";
   let cancelled = false;
+  // Summed across every hop in this turn — a tool-calling turn makes
+  // several model calls, and the cost/usage that matters is the whole
+  // turn's total, not just the last hop's. Only ever reflects what the
+  // provider actually reported (see ModelResponse.usage's own doc
+  // comment) — stays {0,0} and is omitted from agent.turn.end entirely
+  // when nothing ever reported usage (the stub model, or a provider that
+  // doesn't report it), rather than claiming a fabricated zero.
+  let usageInputTokens = 0;
+  let usageOutputTokens = 0;
+  let sawUsage = false;
 
   // Fetched once per turn, outside the hop loop — see renderIdentityContext's
   // own doc comment for why (unlike memory/skills, identity isn't expected
@@ -424,6 +467,12 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
         })
       : await model.complete(messages);
 
+    if (response.usage) {
+      sawUsage = true;
+      usageInputTokens += response.usage.inputTokens;
+      usageOutputTokens += response.usage.outputTokens;
+    }
+
     if (response.toolCall) {
       toolCalled = response.toolCall.name;
       const blockDecision = await fireHook("tool.before", {
@@ -496,10 +545,11 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     finalContent = `⚠ ${message}`;
+    const usage = sawUsage ? { inputTokens: usageInputTokens, outputTokens: usageOutputTokens } : undefined;
     await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent, error: true });
-    await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled, error: message });
-    await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled, error: message } });
-    await publishEvent("agent.turn.end", { sessionId, agentId, finalContent, toolCalled, cancelled, error: message });
+    await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled, error: message, usage });
+    await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled, error: message, usage } });
+    await publishEvent("agent.turn.end", { sessionId, agentId, finalContent, toolCalled, cancelled, error: message, usage });
     throw err;
   }
 
@@ -512,11 +562,12 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     });
   }
 
-  await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled });
-  await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled } });
-  await publishEvent("agent.turn.end", { sessionId, agentId, finalContent, toolCalled, cancelled });
+  const usage = sawUsage ? { inputTokens: usageInputTokens, outputTokens: usageOutputTokens } : undefined;
+  await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled, usage });
+  await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled, usage } });
+  await publishEvent("agent.turn.end", { sessionId, agentId, finalContent, toolCalled, cancelled, usage });
 
-  return { sessionId, finalContent, toolCalled, cancelled: cancelled || undefined };
+  return { sessionId, finalContent, toolCalled, cancelled: cancelled || undefined, usage };
 }
 
 export function newSessionId(): string {

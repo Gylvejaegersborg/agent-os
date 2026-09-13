@@ -98,10 +98,14 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
 
       const textBlock = json.content?.find((b: any) => b.type === "text");
       const toolBlock = json.content?.find((b: any) => b.type === "tool_use");
+      const usage = json.usage
+        ? { inputTokens: json.usage.input_tokens ?? 0, outputTokens: json.usage.output_tokens ?? 0 }
+        : undefined;
 
       return {
         content: textBlock?.text ?? "",
         ...(toolBlock ? { toolCall: { name: toolBlock.name, args: toolBlock.input } } : {}),
+        ...(usage ? { usage } : {}),
       };
     },
 
@@ -158,6 +162,12 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
       let toolName: string | undefined;
       let toolJson = "";
       let toolCall: { name: string; args: Record<string, unknown> } | undefined;
+      // Anthropic splits usage across two event types: input_tokens
+      // arrives once, up front, on message_start; output_tokens is
+      // cumulative and updates on each message_delta (the LAST one
+      // received is the final total — not a delta to sum).
+      let inputTokens = 0;
+      let outputTokens = 0;
 
       for (;;) {
         const { done, value } = await reader.read();
@@ -177,7 +187,9 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
             continue; // malformed/partial frame — skip rather than crash the stream
           }
 
-          if (parsed.type === "content_block_start" && parsed.content_block?.type === "tool_use") {
+          if (parsed.type === "message_start") {
+            inputTokens = parsed.message?.usage?.input_tokens ?? 0;
+          } else if (parsed.type === "content_block_start" && parsed.content_block?.type === "tool_use") {
             toolName = parsed.content_block.name;
             toolJson = "";
           } else if (parsed.type === "content_block_delta") {
@@ -194,11 +206,14 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
               toolCall = { name: toolName, args: {} };
             }
             toolName = undefined;
+          } else if (parsed.type === "message_delta") {
+            if (typeof parsed.usage?.output_tokens === "number") outputTokens = parsed.usage.output_tokens;
           }
         }
       }
 
-      return { content: accumulated, ...(toolCall ? { toolCall } : {}) };
+      const usage = inputTokens || outputTokens ? { inputTokens, outputTokens } : undefined;
+      return { content: accumulated, ...(toolCall ? { toolCall } : {}), ...(usage ? { usage } : {}) };
     },
   };
 }
@@ -242,12 +257,16 @@ export function createOpenAiModel(opts: OpenAiOptions): ModelAdapter {
 
       const choice = json.choices?.[0]?.message;
       const toolCall = choice?.tool_calls?.[0];
+      const usage = json.usage
+        ? { inputTokens: json.usage.prompt_tokens ?? 0, outputTokens: json.usage.completion_tokens ?? 0 }
+        : undefined;
 
       return {
         content: choice?.content ?? "",
         ...(toolCall
           ? { toolCall: { name: toolCall.function.name, args: JSON.parse(toolCall.function.arguments || "{}") } }
           : {}),
+        ...(usage ? { usage } : {}),
       };
     },
   };
@@ -326,12 +345,16 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
 
       const choice = json.choices?.[0]?.message;
       const toolCall = choice?.tool_calls?.[0];
+      const usage = json.usage
+        ? { inputTokens: json.usage.prompt_tokens ?? 0, outputTokens: json.usage.completion_tokens ?? 0 }
+        : undefined;
 
       return {
         content: choice?.content ?? "",
         ...(toolCall
           ? { toolCall: { name: toolCall.function.name, args: JSON.parse(toolCall.function.arguments || "{}") } }
           : {}),
+        ...(usage ? { usage } : {}),
       };
     },
 
@@ -381,6 +404,12 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
       let accumulated = "";
       let toolName: string | undefined;
       let toolArgs = "";
+      // Some OpenAI-compatible servers (Ollama included, when asked)
+      // send a final chunk carrying ONLY `usage`, with no `delta` at
+      // all — checked before the `!delta` guard below so that chunk
+      // isn't skipped before its usage is read.
+      let inputTokens = 0;
+      let outputTokens = 0;
 
       for (;;) {
         const { done, value } = await reader.read();
@@ -400,6 +429,11 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
             continue; // malformed/partial frame — skip rather than crash the stream
           }
 
+          if (parsed.usage) {
+            inputTokens = parsed.usage.prompt_tokens ?? inputTokens;
+            outputTokens = parsed.usage.completion_tokens ?? outputTokens;
+          }
+
           const delta = parsed.choices?.[0]?.delta;
           if (!delta) continue;
           if (typeof delta.content === "string" && delta.content) {
@@ -415,7 +449,8 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
       }
 
       const toolCall = toolName ? { name: toolName, args: JSON.parse(toolArgs || "{}") } : undefined;
-      return { content: accumulated, ...(toolCall ? { toolCall } : {}) };
+      const usage = inputTokens || outputTokens ? { inputTokens, outputTokens } : undefined;
+      return { content: accumulated, ...(toolCall ? { toolCall } : {}), ...(usage ? { usage } : {}) };
     },
   };
 }

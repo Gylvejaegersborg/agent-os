@@ -13,6 +13,16 @@ export interface ModelMessage {
 export interface ModelResponse {
   content: string;
   toolCall?: { name: string; args: Record<string, unknown> };
+  /** Token counts for this one call, when the provider reports them —
+   *  ROADMAP.md's "cost/token usage tracking" item. Best-effort and
+   *  provider-shaped (Anthropic/OpenAI/Ollama all report this slightly
+   *  differently, see each adapter in models/real.ts), never fabricated:
+   *  omitted entirely rather than guessed when a provider's response
+   *  doesn't carry it. Deliberately raw counts, not a dollar estimate —
+   *  per-model pricing changes and varies by provider/tier in ways this
+   *  scaffold has no reliable source of truth for; inventing a cost
+   *  figure would be worse than not showing one. */
+  usage?: { inputTokens: number; outputTokens: number };
 }
 
 export interface ModelAdapter {
@@ -24,9 +34,10 @@ export interface ModelAdapter {
    *  full response resolves — this is what lets a caller (agent-loop.ts's
    *  runTurn()) publish live token-by-token progress instead of only
    *  ever having the complete text once the whole call finishes. Not
-   *  every adapter implements this (OpenAI/Ollama adapters here don't
-   *  yet — documented future work, see models/real.ts); callers MUST
-   *  check for its presence and fall back to complete() otherwise, which
+   *  every adapter implements this (the OpenAI adapter here doesn't yet
+   *  — documented future work, see models/real.ts; Anthropic and Ollama
+   *  both do); callers MUST check for its presence and fall back to
+   *  complete() otherwise, which
    *  is exactly what runTurn() does — a model without this behaves
    *  byte-for-byte as before this field existed. `onDelta` is
    *  deliberately synchronous (no return value) — an adapter's read loop

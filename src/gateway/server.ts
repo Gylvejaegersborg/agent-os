@@ -47,6 +47,7 @@ import {
   runTurn,
   createModelForAgent,
   getSessionHistory,
+  getSessionUsage,
   newSessionId,
   listTasks,
   getTask,
@@ -464,6 +465,15 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
       }
       const history = await getSessionHistory(segments[1]!);
       sendJson(res, 200, { history });
+      return;
+    }
+    if (method === "GET" && segments.length === 3 && segments[2] === "usage") {
+      const session = await getSession(segments[1]!);
+      if (!session) {
+        sendJson(res, 404, { error: `no such session: ${segments[1]}` });
+        return;
+      }
+      sendJson(res, 200, await getSessionUsage(segments[1]!));
       return;
     }
     if (method === "POST" && segments.length === 3 && segments[2] === "cancel") {

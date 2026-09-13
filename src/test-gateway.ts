@@ -93,6 +93,14 @@ async function main(): Promise<void> {
       "GET /sessions/:id/history reflects the message that was actually sent",
     );
 
+    const usageRes = await fetch(`${base}/sessions/${session.id}/usage`);
+    assert(usageRes.status === 200, "GET /sessions/:id/usage returns 200");
+    const usage = (await usageRes.json()) as any;
+    assert(usage.turnsWithUsage === 0, "the stub model never reports usage, so turnsWithUsage is honestly 0, not a fabricated figure");
+
+    const missingUsageRes = await fetch(`${base}/sessions/no-such-session/usage`);
+    assert(missingUsageRes.status === 404, "GET /sessions/:id/usage returns 404 for an unknown session");
+
     console.log("\n-- 4. Cancelling a session over real HTTP --");
     const cancelRes = await fetch(`${base}/sessions/${session.id}/cancel`, {
       method: "POST",
