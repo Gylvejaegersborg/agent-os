@@ -75,6 +75,8 @@ import {
   approveAgentMemory,
   rejectAgentMemory,
   listDreamingPasses,
+  writeSkill,
+  deleteSkill,
 } from "../core/index.js";
 import type { SessionStatus, ApprovalStatus, TaskStatus, NominationStatus } from "../core/types.js";
 import type { SandboxPolicy } from "../core/permissions.js";
@@ -85,6 +87,11 @@ export interface GatewayDeps {
   model: ModelAdapter;
   worker: Worker;
   skills?: SkillRegistry;
+  /** Root directory writeSkill()/deleteSkill() persist to — separate from
+   *  `skills` (the in-memory catalog) because the registry itself doesn't
+   *  know where it was loaded from. Both must be set for POST/DELETE
+   *  /skills to work; GET works with just `skills`. */
+  skillsDir?: string;
   enableSubagents?: boolean;
   enableMemoryNominations?: boolean;
   enableArtifacts?: boolean;
@@ -293,6 +300,71 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         return;
       }
       sendJson(res, 200, updated);
+      return;
+    }
+  }
+
+  // ---- Skills — agentskills.io-format instructions (skills.ts), human-
+  // managed: a settings UI writes these, not an agent. Every agent shares
+  // the SAME catalog (unlike shell/file tools, there's no execution
+  // capability in a skill itself — just more context the model can
+  // choose to load — so there's no equivalent of ENGINEER_AGENT_ID-style
+  // restriction here). A gateway started with no `skills`/`skillsDir`
+  // configured (gateway/cli.ts always configures both today, but this
+  // guards the general case) reports 501 rather than crashing. ----
+  if (segments[0] === "skills") {
+    if (method === "GET" && segments.length === 1) {
+      if (!deps.skills) {
+        sendJson(res, 200, { skills: [] });
+        return;
+      }
+      sendJson(res, 200, { skills: deps.skills.listMetadata() });
+      return;
+    }
+    if (method === "GET" && segments.length === 2) {
+      const skill = deps.skills?.get(segments[1]!);
+      if (!skill) {
+        sendJson(res, 404, { error: `no such skill: ${segments[1]}` });
+        return;
+      }
+      sendJson(res, 200, skill);
+      return;
+    }
+    if (method === "POST" && segments.length === 1) {
+      if (!deps.skills || !deps.skillsDir) {
+        sendJson(res, 501, { error: "this gateway has no skills directory configured" });
+        return;
+      }
+      const body = await readRequestBody(req);
+      if (typeof body.name !== "string" || typeof body.description !== "string" || typeof body.body !== "string") {
+        sendJson(res, 400, { error: "name, description, and body (all strings) are required" });
+        return;
+      }
+      try {
+        const skill = await writeSkill(deps.skillsDir, {
+          name: body.name,
+          description: body.description,
+          body: body.body,
+          license: typeof body.license === "string" ? body.license : undefined,
+          compatibility: typeof body.compatibility === "string" ? body.compatibility : undefined,
+          metadata: typeof body.metadata === "object" && body.metadata !== null ? (body.metadata as Record<string, string>) : undefined,
+          allowedTools: Array.isArray(body.allowedTools) ? body.allowedTools.filter((t: unknown) => typeof t === "string") : undefined,
+        });
+        deps.skills.add(skill);
+        sendJson(res, 201, skill);
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+    if (method === "DELETE" && segments.length === 2) {
+      if (!deps.skills || !deps.skillsDir) {
+        sendJson(res, 501, { error: "this gateway has no skills directory configured" });
+        return;
+      }
+      await deleteSkill(deps.skillsDir, segments[1]!);
+      deps.skills.remove(segments[1]!);
+      sendJson(res, 200, { ok: true });
       return;
     }
   }

@@ -6,6 +6,7 @@
 // Ollama instance, falling back to the deterministic stub so the gateway
 // is always runnable with zero configuration), then starts listening.
 
+import * as path from "node:path";
 import {
   createModelFromEnvOrOllama,
   createStubModel,
@@ -19,6 +20,7 @@ import {
   registerHook,
   installPermissionPolicy,
   DEFAULT_HARD_BLOCKLIST,
+  SkillRegistry,
   type SandboxPolicy,
 } from "../core/index.js";
 import { startGateway } from "./server.js";
@@ -106,6 +108,21 @@ async function main(): Promise<void> {
   // nothing newly eligible to phrase.
   startMemoryDreamingSweeper();
 
+  // Skills (skills.ts) previously had ZERO wiring into the live gateway —
+  // SkillRegistry.fromDirectory() existed, was tested, and had a full
+  // HTTP surface (GET/POST/DELETE /skills on server.ts) as of this same
+  // round of fixes, but nothing ever constructed one here, so the skill
+  // catalog was never injected into any turn and the `skill` tool could
+  // never find anything to load — same pattern as subagents/memory/
+  // dreaming before those got turned on. Defaults to a `skills/`
+  // directory next to this process's own cwd (agent-os's own tree, per
+  // start.sh); override with AGENT_OS_SKILLS_DIR. Safe on a totally fresh
+  // checkout: discoverSkills() treats a missing directory as "zero
+  // skills," not an error.
+  const skillsDir = process.env.AGENT_OS_SKILLS_DIR ?? path.join(process.cwd(), "skills");
+  const skills = await SkillRegistry.fromDirectory(skillsDir);
+  console.log(`[gateway] skills catalog ready: ${skills.listMetadata().length} skill(s) from ${skillsDir}`);
+
   const model = (await createModelFromEnvOrOllama()) ?? createStubModel();
   if (model.id === "stub-model") {
     console.log(
@@ -171,7 +188,7 @@ async function main(): Promise<void> {
   // claims some of these (e.g. "subagent-delegation"), so leaving them
   // off made that claim false in practice.
   const handle = await startGateway(
-    { model, worker, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true, sandboxPolicy },
+    { model, worker, skills, skillsDir, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true, sandboxPolicy },
     port,
   );
   console.log(`[gateway] listening on http://127.0.0.1:${handle.port}`);
