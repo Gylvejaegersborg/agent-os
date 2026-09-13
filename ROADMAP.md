@@ -40,6 +40,15 @@ into the LIVE gateway, not just what exists somewhere in the codebase).
       Events-tab line — **[UI]** `TasksTab.tsx`/`FlowTab.tsx`.
 - [x] Flows can be saved as drafts instead of only started immediately —
       **[UI]** `NewFlowModal.tsx`.
+- [x] Streaming for every provider. CORRECTION to the original
+      comparison: real token-by-token streaming already existed
+      end-to-end for Anthropic before this round — it was wrong to call
+      streaming "missing" generally. What was actually true: Ollama's
+      adapter had no `completeStream`, so the Codespace's actual default
+      provider fell back to a single non-streamed response. Added, using
+      the same `/v1/chat/completions?stream=true` OpenAI-compatible SSE
+      shape the non-streaming path already spoke — **[core]**
+      `models/real.ts`.
 
 ## Open
 
@@ -62,16 +71,6 @@ checked — see the correction below.
       `edit_file`/`write_file` lands (even approved), there's no undo
       beyond `git`. Claude Code can roll back conversation + files
       together to an earlier point. **[core]**
-- [ ] **Streaming for every provider, not just Anthropic.** CORRECTION
-      to the original comparison: real token-by-token streaming already
-      exists end-to-end (`models/real.ts`'s Anthropic adapter's
-      `completeStream` → `agent.turn.delta` over the event bus → the
-      gateway's SSE → `useAgentOsChat`'s `streamingText`) — it was wrong
-      to call this missing. What's actually true: `createOllamaModel()`
-      has no `completeStream`, so the Codespace's actual default
-      provider (Ollama) still falls back to a single non-streamed
-      response. Add streaming to the Ollama adapter (its own
-      `/v1/chat/completions` supports `stream: true`). **[core]**
 - [ ] **MCP (Model Context Protocol) support.** The tool registry is
       closed — `shell`/`skill`/`subagent`/`nominate-memory`/
       `record-artifact`/`read_file`/`edit_file`/`write_file`, nothing

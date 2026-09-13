@@ -334,6 +334,89 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
           : {}),
       };
     },
+
+    // Real token streaming, via the same OpenAI-compatible endpoint's
+    // `stream: true` mode — ROADMAP.md flagged this as the one adapter
+    // missing it (Anthropic's already had it). OpenAI-style SSE frames:
+    // `data: {"choices":[{"delta":{...}}]}` per chunk, terminated by a
+    // literal `data: [DONE]` line. A tool call's `function.arguments`
+    // streams incrementally across multiple chunks at the same index;
+    // this scaffold only ever surfaces ONE tool call per turn (same
+    // assumption the non-streaming path above makes via `tool_calls?.[0]`),
+    // so only index 0 is tracked.
+    async completeStream(messages: ModelMessage[], onDelta: (deltaText: string) => void): Promise<ModelResponse> {
+      const ollamaMessages = messages.map((m) => ({
+        role: m.role === "tool" ? "user" : m.role,
+        content: m.content,
+      }));
+
+      const body: Record<string, unknown> = { model, messages: ollamaMessages, stream: true };
+      if (opts.tools?.length) {
+        body.tools = opts.tools.map((t) => ({
+          type: "function",
+          function: { name: t.name, description: t.description, parameters: t.parameters },
+        }));
+      }
+
+      let res: Response;
+      try {
+        res = await fetch(baseUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      } catch (err) {
+        throw new Error(
+          `Could not reach Ollama at ${baseUrl} — is it running? ('ollama serve', or 'ollama pull ${model}' if the model isn't installed yet). Original error: ${err}`,
+        );
+      }
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(`Ollama API error ${res.status}: ${JSON.stringify(errJson).slice(0, 500)}`);
+      }
+
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let accumulated = "";
+      let toolName: string | undefined;
+      let toolArgs = "";
+
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? ""; // keep a possibly-incomplete trailing line for the next chunk
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const data = line.slice(6).trim();
+          if (!data || data === "[DONE]") continue;
+          let parsed: any;
+          try {
+            parsed = JSON.parse(data);
+          } catch {
+            continue; // malformed/partial frame — skip rather than crash the stream
+          }
+
+          const delta = parsed.choices?.[0]?.delta;
+          if (!delta) continue;
+          if (typeof delta.content === "string" && delta.content) {
+            accumulated += delta.content;
+            onDelta(delta.content);
+          }
+          const toolCallDelta = delta.tool_calls?.[0];
+          if (toolCallDelta) {
+            if (toolCallDelta.function?.name) toolName = toolCallDelta.function.name;
+            if (toolCallDelta.function?.arguments) toolArgs += toolCallDelta.function.arguments;
+          }
+        }
+      }
+
+      const toolCall = toolName ? { name: toolName, args: JSON.parse(toolArgs || "{}") } : undefined;
+      return { content: accumulated, ...(toolCall ? { toolCall } : {}) };
+    },
   };
 }
 
