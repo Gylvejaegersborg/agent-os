@@ -63,8 +63,20 @@ into the LIVE gateway, not just what exists somewhere in the codebase).
       none of them mutate anything. Per-request, not a gateway-wide
       default — a client toggles it per message. **[core]**
       `agent-loop.ts`'s `PLAN_MODE_BLOCKED_TOOLS`; **[gateway]**
-      `POST /sessions/:id/turns`'s `planMode` body field. No UI toggle
-      yet — that's the natural next step, not done in this pass.
+      `POST /sessions/:id/turns`'s `planMode` body field; **[UI]** an eye
+      icon in `ConversationPane.tsx`'s composer, per-message.
+- [x] User-configurable hooks — a plain JSON file (`hooks.json`) any
+      operator can edit without touching code, each entry shelling out
+      to a command when its event fires (exit 0 = allow, nonzero =
+      block with stdout as the reason, for decision events like
+      `tool.before`). Deliberately file-based and restart-required, not
+      hot-reloadable — `hooks.ts`'s registry has no removal-by-source
+      mechanism, so there's nothing safe to hot-swap; editing the file
+      (directly, or by asking the Engineer agent, which already has
+      real file-tool access) plus a gateway restart is the honest
+      contract. **[core]** `configured-hooks.ts`; **[gateway]**
+      `GET /hooks` (read-only visibility, no write endpoint for the
+      same reason); **[UI]** a read-only list in `SettingsModal.tsx`.
 
 ## Open
 
@@ -87,11 +99,6 @@ checked — see the correction below.
       closed — `shell`/`skill`/`subagent`/`nominate-memory`/
       `record-artifact`/`read_file`/`edit_file`/`write_file`, nothing
       pluggable in from an external server. **[core]**
-- [ ] **User-configurable hooks.** `hooks.ts`'s hook points
-      (`tool.before`, `session.start`, ...) are real but only addressable
-      from code you write and redeploy — Claude Code's hooks are a
-      settings file any operator can edit without a rebuild. **[core]**
-      **[UI]** (a settings-file editor, alongside the new Skills section)
 - [ ] **Skill marketplace / install-from-elsewhere.** `SkillRegistry` +
       the new Settings UI cover hand-authoring a skill; there's still no
       way to pull one in from outside (a URL, a shared registry). **[core]**

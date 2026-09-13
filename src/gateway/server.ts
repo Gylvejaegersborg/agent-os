@@ -81,6 +81,7 @@ import {
 } from "../core/index.js";
 import type { SessionStatus, ApprovalStatus, TaskStatus, NominationStatus } from "../core/types.js";
 import type { SandboxPolicy } from "../core/permissions.js";
+import type { ConfiguredHook } from "../core/configured-hooks.js";
 import type { ArtifactType } from "../core/artifacts.js";
 import type { FlowStepDefinition } from "../core/flow-engine.js";
 
@@ -98,6 +99,12 @@ export interface GatewayDeps {
   enableArtifacts?: boolean;
   maxToolHops?: number;
   sandboxPolicy?: SandboxPolicy;
+  /** Purely for GET /hooks's visibility — the hooks themselves are
+   *  already live (loadConfiguredHooks() registered them directly with
+   *  hooks.ts before the gateway even started); this is just so a
+   *  settings UI can show what's configured without re-reading the file
+   *  itself. */
+  configuredHooks?: ConfiguredHook[];
 }
 
 export interface GatewayHandle {
@@ -303,6 +310,17 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
       sendJson(res, 200, updated);
       return;
     }
+  }
+
+  // ---- Configured hooks — read-only visibility into what's actually
+  // loaded (configured-hooks.ts). No write endpoint: hooks.ts's registry
+  // has no removal-by-source mechanism, so there's nothing to safely
+  // hot-swap — editing hooks.json and restarting the gateway (or asking
+  // the Engineer agent to edit the file, since it already has real
+  // file-tool access) is the honest contract. ----
+  if (segments[0] === "hooks" && method === "GET" && segments.length === 1) {
+    sendJson(res, 200, { hooks: deps.configuredHooks ?? [] });
+    return;
   }
 
   // ---- Skills — agentskills.io-format instructions (skills.ts), human-

@@ -38,6 +38,7 @@ async function main(): Promise<void> {
     worker: createStubWorker(),
     skills: await SkillRegistry.fromDirectory(skillsDir),
     skillsDir,
+    configuredHooks: [{ event: "session.start", command: "true", label: "test hook" }],
   });
   const base = `http://127.0.0.1:${gateway.port}`;
 
@@ -377,7 +378,16 @@ async function main(): Promise<void> {
     const memRejectRes = await fetch(`${base}/agents/${memAgentId}/memory/nominations/${nomination2.id}/reject`, { method: "POST" });
     assert(memRejectRes.status === 200, "POST .../nominations/:id/reject returns 200");
 
-    console.log("\n-- 12. Skill endpoints over real HTTP --");
+    console.log("\n-- 12. Configured-hooks visibility endpoint --");
+    const hooksRes = await fetch(`${base}/hooks`);
+    assert(hooksRes.status === 200, "GET /hooks returns 200");
+    const hooksBody = (await hooksRes.json()) as any;
+    assert(
+      hooksBody.hooks.some((h: any) => h.label === "test hook"),
+      "GET /hooks reflects what this gateway was actually configured with",
+    );
+
+    console.log("\n-- 13. Skill endpoints over real HTTP --");
     const emptySkillsRes = await fetch(`${base}/skills`);
     assert(emptySkillsRes.status === 200, "GET /skills returns 200 before any skill exists");
     assert(((await emptySkillsRes.json()) as any).skills.length === 0, "the catalog starts empty");
@@ -418,7 +428,7 @@ async function main(): Promise<void> {
     const listAfterDelete = (await listAfterDeleteRes.json()) as any;
     assert(!listAfterDelete.skills.some((s: any) => s.name === "test-skill"), "the deleted skill no longer shows up in the catalog");
 
-    console.log("\n-- 13. Unknown routes return 404, not a crash --");
+    console.log("\n-- 14. Unknown routes return 404, not a crash --");
     const notFoundRes = await fetch(`${base}/no-such-route`);
     assert(notFoundRes.status === 404, "an unknown route returns 404");
   } finally {

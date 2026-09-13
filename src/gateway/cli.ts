@@ -21,6 +21,7 @@ import {
   installPermissionPolicy,
   DEFAULT_HARD_BLOCKLIST,
   SkillRegistry,
+  loadConfiguredHooks,
   type SandboxPolicy,
 } from "../core/index.js";
 import { startGateway } from "./server.js";
@@ -123,6 +124,15 @@ async function main(): Promise<void> {
   const skills = await SkillRegistry.fromDirectory(skillsDir);
   console.log(`[gateway] skills catalog ready: ${skills.listMetadata().length} skill(s) from ${skillsDir}`);
 
+  // User-configurable hooks (configured-hooks.ts) — a plain JSON file any
+  // operator can edit without touching this file, unlike the hardcoded
+  // hooks registered a few lines below. Missing file is zero hooks, not
+  // an error; a malformed one throws loudly (a silently-dropped hook is a
+  // security-relevant bug waiting to happen).
+  const hooksFile = process.env.AGENT_OS_HOOKS_FILE ?? path.join(process.cwd(), "hooks.json");
+  const configuredHooks = await loadConfiguredHooks(hooksFile);
+  console.log(`[gateway] configured hooks: ${configuredHooks.length} loaded from ${hooksFile}`);
+
   const model = (await createModelFromEnvOrOllama()) ?? createStubModel();
   if (model.id === "stub-model") {
     console.log(
@@ -188,7 +198,7 @@ async function main(): Promise<void> {
   // claims some of these (e.g. "subagent-delegation"), so leaving them
   // off made that claim false in practice.
   const handle = await startGateway(
-    { model, worker, skills, skillsDir, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true, sandboxPolicy },
+    { model, worker, skills, skillsDir, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true, sandboxPolicy, configuredHooks },
     port,
   );
   console.log(`[gateway] listening on http://127.0.0.1:${handle.port}`);
