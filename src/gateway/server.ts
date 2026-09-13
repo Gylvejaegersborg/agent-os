@@ -529,6 +529,11 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         enableArtifacts: deps.enableArtifacts,
         sandboxPolicy: deps.sandboxPolicy,
         maxToolHops: deps.maxToolHops,
+        // Per-REQUEST, not a gateway-wide deps default like the flags
+        // above — plan mode is something a client toggles per message,
+        // same as a Claude Code user flipping into plan mode for one
+        // turn at a time.
+        planMode: body.planMode === true,
       });
       sendJson(res, 200, result);
       return;

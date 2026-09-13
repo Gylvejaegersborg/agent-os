@@ -101,6 +101,23 @@ async function main(): Promise<void> {
     const missingUsageRes = await fetch(`${base}/sessions/no-such-session/usage`);
     assert(missingUsageRes.status === 404, "GET /sessions/:id/usage returns 404 for an unknown session");
 
+    const planModeSessionRes = await fetch(`${base}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agentId: "gateway-plan-mode-agent" }),
+    });
+    const planModeSession = (await planModeSessionRes.json()) as any;
+    const planModeTurnRes = await fetch(`${base}/sessions/${planModeSession.id}/turns`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ userMessage: "run shell: echo hi", planMode: true }),
+    });
+    const planModeResult = (await planModeTurnRes.json()) as any;
+    assert(
+      planModeResult.finalContent.includes("plan mode"),
+      `POST /sessions/:id/turns with planMode:true blocks a mutating tool call (got: "${planModeResult.finalContent}")`,
+    );
+
     console.log("\n-- 4. Cancelling a session over real HTTP --");
     const cancelRes = await fetch(`${base}/sessions/${session.id}/cancel`, {
       method: "POST",

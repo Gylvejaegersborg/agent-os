@@ -98,7 +98,27 @@ export interface RunTurnOptions {
    *  into by constructing a policy, not an implicit default baked into
    *  agent-loop.ts itself. */
   sandboxPolicy?: SandboxPolicy;
+  /** When true, the turn can inspect but not mutate anything —
+   *  ROADMAP.md's "plan / read-only mode" item. Enforced in the hop loop
+   *  itself (see PLAN_MODE_BLOCKED_TOOLS below), independent of and
+   *  checked BEFORE Layer A's PermissionPolicy, so an "allow" rule never
+   *  overrides it. Default false/omitted — every existing caller's
+   *  behavior is unchanged. */
+  planMode?: boolean;
 }
+
+/** Tools plan mode blocks outright, regardless of what Layer A's
+ *  PermissionPolicy would otherwise decide. shell/edit_file/write_file
+ *  can change the filesystem or run arbitrary commands; subagent can
+ *  itself mutate files via a delegated turn, so blocking it too is what
+ *  makes plan mode actually mean "nothing changes" rather than "nothing
+ *  changes, except through one level of indirection." Deliberately NOT
+ *  blocking read_file/skill/nominate-memory/record-artifact — none of
+ *  them mutate anything a plan-mode turn shouldn't be allowed to do
+ *  (a nomination has zero effect until a human approves it; recording
+ *  an artifact just registers metadata about something already
+ *  produced some other way). */
+const PLAN_MODE_BLOCKED_TOOLS = new Set(["shell", "edit_file", "write_file", "subagent"]);
 
 function sessionStream(sessionId: string): string {
   return `session:${sessionId}`;
@@ -355,7 +375,7 @@ async function dispatchTool(
 }
 
 export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
-  const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents, enableMemoryNominations, enableArtifacts, sandboxPolicy } = opts;
+  const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents, enableMemoryNominations, enableArtifacts, sandboxPolicy, planMode } = opts;
   const injectMemory = opts.injectMemory ?? true;
   const maxHops = opts.maxToolHops ?? 3;
 
@@ -421,6 +441,11 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       break;
     }
     const history = await getSessionHistory(sessionId);
+    const planModeText = planMode
+      ? "PLAN MODE IS ACTIVE: you can inspect (read_file, shell commands that only read/list, skill) but calling shell/edit_file/write_file/subagent " +
+        "will be blocked outright by the harness regardless of anything else — this is not a suggestion you can reason your way around. Investigate, " +
+        "then describe the concrete plan (what you'd read/change/run and why) for the operator to review; they'll turn plan mode off to actually execute it."
+      : "";
     const catalogText = skills ? renderSkillCatalog(skills.listMetadata()) : "";
     const subagentText = enableSubagents
       ? "You can delegate a focused sub-task to an isolated subagent by calling the `subagent` tool with {goal}. The subagent runs independently and only its final result returns to you — its own reasoning and tool calls stay isolated."
@@ -446,7 +471,9 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     // personaText first — "who you are" precedes "what you remember/can do"
     // in the assembled system message, matching how a human-written system
     // prompt would order identity before capability context.
-    const systemParts = [personaText, memoryText, catalogText, subagentText, nominationText, artifactText, fileToolsText].filter(Boolean);
+    const systemParts = [personaText, memoryText, catalogText, subagentText, nominationText, artifactText, fileToolsText, planModeText].filter(
+      Boolean,
+    );
     const messages: ModelMessage[] = systemParts.length
       ? [{ role: "system", content: systemParts.join("\n\n") }, ...history]
       : history;
@@ -475,6 +502,24 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
 
     if (response.toolCall) {
       toolCalled = response.toolCall.name;
+
+      // Plan mode is a HARD harness-level override, not a prompt
+      // suggestion — checked before Layer A's own PermissionPolicy, and
+      // not overridable by it (an "allow" rule for e.g. read_file still
+      // has no bearing here). This is what ROADMAP.md's "plan / read-only
+      // mode" item actually asked for: a mode the model is IN, not one
+      // it's merely told about. subagent is blocked too — a delegated
+      // subagent can itself mutate files, so plan mode has to cover it
+      // too to mean anything.
+      if (planMode && PLAN_MODE_BLOCKED_TOOLS.has(response.toolCall.name)) {
+        finalContent = `Tool call blocked: plan mode is active — "${response.toolCall.name}" would change something, and plan mode only allows read-only inspection. Describe what you'd do instead; the operator can turn plan mode off to actually execute it.`;
+        await appendEvent(sessionStream(sessionId), "session.message", {
+          role: "assistant",
+          content: finalContent,
+        });
+        break;
+      }
+
       const blockDecision = await fireHook("tool.before", {
         agentId,
         sessionId,

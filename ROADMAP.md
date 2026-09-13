@@ -49,6 +49,22 @@ into the LIVE gateway, not just what exists somewhere in the codebase).
       the same `/v1/chat/completions?stream=true` OpenAI-compatible SSE
       shape the non-streaming path already spoke — **[core]**
       `models/real.ts`.
+- [x] Cost/token usage tracking — as raw token counts, deliberately not
+      a dollar estimate (no reliable source of truth for current
+      per-model pricing). `ModelResponse.usage`, summed per turn and
+      aggregated per session — **[core]** `agent-loop.ts`'s
+      `getSessionUsage()`; **[gateway]** `GET /sessions/:id/usage`;
+      **[UI]** a small badge in `ThreadHeader.tsx`.
+- [x] Plan / read-only mode — a real harness-level block, not a prompt
+      suggestion: `shell`/`edit_file`/`write_file`/`subagent` are
+      refused outright when `planMode` is set, checked BEFORE Layer A's
+      `PermissionPolicy` so no "allow" rule overrides it; `read_file`/
+      `skill`/`nominate-memory`/`record-artifact` stay available since
+      none of them mutate anything. Per-request, not a gateway-wide
+      default — a client toggles it per message. **[core]**
+      `agent-loop.ts`'s `PLAN_MODE_BLOCKED_TOOLS`; **[gateway]**
+      `POST /sessions/:id/turns`'s `planMode` body field. No UI toggle
+      yet — that's the natural next step, not done in this pass.
 
 ## Open
 
@@ -63,10 +79,6 @@ checked — see the correction below.
       long-running session will eventually blow the model's context
       window with no graceful degradation. Claude Code auto-summarizes
       near the limit. **[core]**
-- [ ] **Plan / read-only mode.** No hard mode switch separating
-      "explore and propose" from "actually execute" — Layer A's
-      `PermissionPolicy` gates by command *pattern*, not by a mode the
-      model itself knows it's in. **[core]**
 - [ ] **Checkpoint / rewind.** No file snapshotting at all — once
       `edit_file`/`write_file` lands (even approved), there's no undo
       beyond `git`. Claude Code can roll back conversation + files
@@ -75,10 +87,6 @@ checked — see the correction below.
       closed — `shell`/`skill`/`subagent`/`nominate-memory`/
       `record-artifact`/`read_file`/`edit_file`/`write_file`, nothing
       pluggable in from an external server. **[core]**
-- [ ] **Cost/token usage tracking.** Nowhere in the runtime or the UI —
-      no token counts recorded per turn, no running cost shown anywhere.
-      Claude Code's `/cost` and session total are the bar. **[core]**
-      **[UI]**
 - [ ] **User-configurable hooks.** `hooks.ts`'s hook points
       (`tool.before`, `session.start`, ...) are real but only addressable
       from code you write and redeploy — Claude Code's hooks are a

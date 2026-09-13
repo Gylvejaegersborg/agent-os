@@ -37,6 +37,7 @@
     "test-file-tools": "tsc -b && node dist/test-file-tools.js",
     "test-ollama-streaming": "tsc -b && node dist/test-ollama-streaming.js",
     "test-usage-tracking": "tsc -b && node dist/test-usage-tracking.js",
+    "test-plan-mode": "tsc -b && node dist/test-plan-mode.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {
