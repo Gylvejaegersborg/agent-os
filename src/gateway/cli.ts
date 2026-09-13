@@ -35,15 +35,28 @@ import { startGateway } from "./server.js";
 // aspirational.
 const ENGINEER_AGENT_ID = "claude";
 
+// Every tool that can touch the filesystem or a real shell — restricted to
+// ENGINEER_AGENT_ID below, same reasoning as the shell-only version this
+// replaced. read_file/edit_file/write_file (agent-loop.ts) are the
+// structured alternative to editing via shell redirection — same
+// capability, same restriction, just a cleaner primitive for the model
+// (and a diff-able one for the Approvals tab) instead of an opaque
+// command string.
+const FILESYSTEM_TOOLS = ["shell", "read_file", "edit_file", "write_file"];
+
 /** Builds the Layer-A PermissionPolicy for ENGINEER_AGENT_ID. Read-only
- *  inspection commands are pre-approved so diagnosing a problem doesn't
- *  require a round trip through the Approvals tab for every `git diff` or
- *  `cat`; genuinely mutating commands (edits, `git add`/`commit`, installs)
- *  fall through to the policy's default "ask" — there is no "allow"
- *  rule for writes anywhere in this list, on purpose. `git push` (or
- *  anything else that reaches GitHub) is never special-cased into "allow"
- *  either, so it always lands in the Approvals tab too, regardless of
- *  what else this policy permits. */
+ *  inspection (shell's own safe-command list, plus read_file uncondition-
+ *  ally — a file read carries the same risk profile as `cat`) is
+ *  pre-approved so diagnosing a problem doesn't require a round trip
+ *  through the Approvals tab for every lookup; genuinely mutating calls
+ *  (shell edits, `git add`/`commit`, installs, edit_file, write_file) fall
+ *  through to the policy's default "ask" — there is no "allow" rule for
+ *  writes anywhere in this list, on purpose. `git push` (or anything else
+ *  that reaches GitHub) is never special-cased into "allow" either, so it
+ *  always lands in the Approvals tab too, regardless of what else this
+ *  policy permits. The infra-path rule uses tool:"*" so it catches
+ *  edit_file/write_file touching .github/.devcontainer/scripts the same
+ *  way it already caught a shell command mentioning them. */
 function buildEngineerPolicy() {
   const SAFE_READONLY = /"command":\s*"\s*(git (status|diff|log|show|branch\b[^&|;]*--list)|ls\b|cat\b|head\b|tail\b|grep\b|rg\b|wc\b|pwd\b|npm run (typecheck|build|test[\w-]*)\b|tsc\b)/;
   const INFRA_PATHS = /\.github\/|\.devcontainer\/|(^|[\s"'/])scripts\//;
@@ -51,16 +64,18 @@ function buildEngineerPolicy() {
     agentId: ENGINEER_AGENT_ID,
     rules: [
       {
-        tool: "shell",
+        tool: "*",
         decision: "ask" as const,
         argsPattern: INFRA_PATHS,
         label:
           "touches CI/infra (.github/, .devcontainer/, or scripts/) — these run with elevated trust " +
-          "(Actions secrets, the devcontainer itself), so they're always reviewed regardless of what the command does.",
+          "(Actions secrets, the devcontainer itself), so they're always reviewed regardless of what the call does.",
       },
       { tool: "shell", decision: "allow" as const, argsPattern: SAFE_READONLY },
-      // No further rules: anything else (edits, git add/commit/push,
-      // npm/apt installs, rm, ...) falls through to the default "ask".
+      { tool: "read_file", decision: "allow" as const },
+      // No further rules: anything else (shell edits, git add/commit/push,
+      // npm/apt installs, rm, edit_file, write_file, ...) falls through to
+      // the default "ask".
     ],
   };
 }
@@ -125,11 +140,12 @@ async function main(): Promise<void> {
   // discussion this came out of: one agent owns harness maintenance, not
   // "whichever agent happens to be open."
   registerHook("tool.before", async (ctx) => {
-    if (String(ctx.payload.name ?? "") !== "shell") return;
+    const toolName = String(ctx.payload.name ?? "");
+    if (!FILESYSTEM_TOOLS.includes(toolName)) return;
     if (ctx.agentId === ENGINEER_AGENT_ID) return;
     return {
       block: true,
-      reason: `shell access is restricted to the "${ENGINEER_AGENT_ID}" agent — ask it directly if you need something inspected or fixed.`,
+      reason: `"${toolName}" is restricted to the "${ENGINEER_AGENT_ID}" agent — ask it directly if you need something inspected or fixed.`,
     };
   });
   // Layer A, part 2: ENGINEER_AGENT_ID's own rules (see buildEngineerPolicy
@@ -155,7 +171,7 @@ async function main(): Promise<void> {
   // claims some of these (e.g. "subagent-delegation"), so leaving them
   // off made that claim false in practice.
   const handle = await startGateway(
-    { model, worker, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true },
+    { model, worker, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true, sandboxPolicy },
     port,
   );
   console.log(`[gateway] listening on http://127.0.0.1:${handle.port}`);

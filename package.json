@@ -34,6 +34,7 @@
     "test-identity-wiring": "tsc -b && node dist/test-identity-wiring.js",
     "test-memory-embeddings": "tsc -b && node dist/test-memory-embeddings.js",
     "test-observability": "tsc -b && node dist/test-observability.js",
+    "test-file-tools": "tsc -b && node dist/test-file-tools.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {

@@ -4,6 +4,8 @@
 // Every turn is written to the session's event stream, so resume/replay/
 // observability for free (see eventlog.ts).
 
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { appendEvent, project } from "./eventlog.js";
 import { publishEvent } from "./eventbus.js";
 import type { ModelAdapter, ModelMessage } from "./model.js";
@@ -17,6 +19,7 @@ import { ensureSession, isSessionCancelled, getSession } from "./session.js";
 import { getToolDefinition, withTimeout } from "./tool-registry.js";
 import type { ArtifactType } from "./artifacts.js";
 import type { EpisodicKind } from "./types.js";
+import { checkPathSandbox, type SandboxPolicy } from "./permissions.js";
 
 export interface AgentTurnResult {
   sessionId: string;
@@ -81,6 +84,15 @@ export interface RunTurnOptions {
    *  disable artifact recording for this turn, same opt-in pattern as
    *  enableSubagents/enableMemoryNominations. */
   enableArtifacts?: boolean;
+  /** When provided, read_file/edit_file/write_file (and, independently,
+   *  createSandboxedWorker-wrapped shell calls — see worker.ts) are
+   *  confined to this policy's workspace roots via permissions.ts's
+   *  checkPathSandbox(). Omitted means NO containment check runs for
+   *  these three tools specifically — matches this scaffold's existing
+   *  posture that sandboxing is something a caller (the gateway) opts
+   *  into by constructing a policy, not an implicit default baked into
+   *  agent-loop.ts itself. */
+  sandboxPolicy?: SandboxPolicy;
 }
 
 function sessionStream(sessionId: string): string {
@@ -139,6 +151,79 @@ async function renderIdentityContext(agentId: string): Promise<string> {
   return `# Agent Identity\nYou are ${identity.name}. ${identity.persona}`;
 }
 
+/** Caps how much of a file read_file hands back to the model — without
+ *  this, one call on a large generated file (a lockfile, a build
+ *  artifact) could consume a huge share of the context window in one
+ *  hop. Mirrors the spirit of memory.ts's own retrieval-over-full-dump
+ *  posture, just as a blunt length cap rather than relevance ranking —
+ *  there's no query to rank against here, just a file. */
+const MAX_FILE_READ_CHARS = 100_000;
+
+/** The structured alternative to editing files via raw shell redirection
+ *  — read_file/edit_file/write_file, agent-loop.ts's own trio mirroring
+ *  the same primitives every major coding harness (Claude Code, Codex)
+ *  settled on independently. Unlike the shell tool (which delegates
+ *  filesystem containment to whatever Worker is wired in — see
+ *  worker.ts's createSandboxedWorker), these operate via direct fs
+ *  calls in-process, so containment is checked HERE, explicitly, against
+ *  the one sandboxPolicy the caller configured (no Worker layer to lean
+ *  on for these). No sandboxPolicy configured means no check runs at all
+ *  — same "opt-in, not implicit" posture as every other capability flag
+ *  in RunTurnOptions. */
+async function dispatchFileTool(
+  name: "read_file" | "edit_file" | "write_file",
+  args: Record<string, unknown>,
+  sandboxPolicy: SandboxPolicy | undefined,
+): Promise<ToolDispatchResult> {
+  const targetPath = String(args.path ?? "");
+  if (!targetPath) return { ok: false, output: "", error: `${name} tool call missing required 'path' argument` };
+
+  if (sandboxPolicy) {
+    const check = checkPathSandbox(sandboxPolicy, targetPath);
+    if (!check.allowed) return { ok: false, output: "", error: `sandbox rejected ${name}: ${check.reason}` };
+  }
+
+  try {
+    if (name === "read_file") {
+      const content = await fs.readFile(targetPath, "utf8");
+      const truncated = content.length > MAX_FILE_READ_CHARS;
+      const output = truncated ? content.slice(0, MAX_FILE_READ_CHARS) : content;
+      return { ok: true, output: truncated ? `${output}\n\n[...truncated — file is ${content.length} chars, showing first ${MAX_FILE_READ_CHARS}]` : output };
+    }
+
+    if (name === "write_file") {
+      const content = String(args.content ?? "");
+      await fs.mkdir(path.dirname(targetPath), { recursive: true });
+      await fs.writeFile(targetPath, content, "utf8");
+      return { ok: true, output: `Wrote ${content.length} chars to ${targetPath}.` };
+    }
+
+    // edit_file
+    const oldString = String(args.old_string ?? "");
+    const newString = String(args.new_string ?? "");
+    const replaceAll = args.replace_all === true;
+    if (!oldString) return { ok: false, output: "", error: "edit_file tool call missing required 'old_string' argument" };
+
+    const current = await fs.readFile(targetPath, "utf8");
+    const occurrences = current.split(oldString).length - 1;
+    if (occurrences === 0) {
+      return { ok: false, output: "", error: `old_string not found in ${targetPath} — no edit was made` };
+    }
+    if (occurrences > 1 && !replaceAll) {
+      return {
+        ok: false,
+        output: "",
+        error: `old_string occurs ${occurrences} times in ${targetPath}, not exactly once — no edit was made. Pass replace_all:true, or include more surrounding context to make old_string unique.`,
+      };
+    }
+    const updated = replaceAll ? current.split(oldString).join(newString) : current.replace(oldString, newString);
+    await fs.writeFile(targetPath, updated, "utf8");
+    return { ok: true, output: `Replaced ${replaceAll ? occurrences : 1} occurrence(s) in ${targetPath}.` };
+  } catch (err) {
+    return { ok: false, output: "", error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 interface ToolDispatchResult {
   ok: boolean;
   output: string;
@@ -156,10 +241,14 @@ async function dispatchTool(
     enableSubagents?: boolean;
     enableMemoryNominations?: boolean;
     enableArtifacts?: boolean;
+    sandboxPolicy?: SandboxPolicy;
   },
 ): Promise<ToolDispatchResult> {
   if (toolCall.name === "shell") {
     return ctx.worker.run(String(toolCall.args.command));
+  }
+  if (toolCall.name === "read_file" || toolCall.name === "edit_file" || toolCall.name === "write_file") {
+    return dispatchFileTool(toolCall.name, toolCall.args, ctx.sandboxPolicy);
   }
   if (toolCall.name === "skill") {
     if (!ctx.skills) return { ok: false, output: "", error: "no skill registry configured for this session" };
@@ -233,7 +322,7 @@ async function dispatchTool(
 }
 
 export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
-  const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents, enableMemoryNominations, enableArtifacts } = opts;
+  const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents, enableMemoryNominations, enableArtifacts, sandboxPolicy } = opts;
   const injectMemory = opts.injectMemory ?? true;
   const maxHops = opts.maxToolHops ?? 3;
 
@@ -299,6 +388,13 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     const artifactText = enableArtifacts
       ? "When you produce a real output worth attaching to this task (a file you wrote, a report, a plan), call the `record-artifact` tool with {type, location, description?} to register it. This does not create the content itself — produce it first (e.g. via the shell tool), then record where it lives."
       : "";
+    const fileToolsText =
+      "Prefer `read_file`/`edit_file`/`write_file` over shell redirection or `sed` for reading or changing a file's content — " +
+      "`edit_file` takes {path, old_string, new_string} and fails with no write made if old_string isn't found or isn't unique in the file " +
+      "(pass replace_all:true to replace every occurrence instead), rather than silently touching the wrong spot." +
+      (sandboxPolicy
+        ? " These are confined to the same sandboxed workspace as the shell tool, and a mutating call (edit_file/write_file) still requires approval the same way a mutating shell command does."
+        : "");
     // Re-read fresh every turn (not cached) — see injectMemory's own doc
     // comment for why. Only ever populated by the dreaming pass
     // (memory.ts), never by this turn's own conversation, so a chatty
@@ -307,7 +403,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     // personaText first — "who you are" precedes "what you remember/can do"
     // in the assembled system message, matching how a human-written system
     // prompt would order identity before capability context.
-    const systemParts = [personaText, memoryText, catalogText, subagentText, nominationText, artifactText].filter(Boolean);
+    const systemParts = [personaText, memoryText, catalogText, subagentText, nominationText, artifactText, fileToolsText].filter(Boolean);
     const messages: ModelMessage[] = systemParts.length
       ? [{ role: "system", content: systemParts.join("\n\n") }, ...history]
       : history;
@@ -364,6 +460,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
           enableSubagents,
           enableMemoryNominations,
           enableArtifacts,
+          sandboxPolicy,
         }),
         toolDef?.timeoutMs,
         () => ({

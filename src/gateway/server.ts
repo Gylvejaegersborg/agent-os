@@ -77,6 +77,7 @@ import {
   listDreamingPasses,
 } from "../core/index.js";
 import type { SessionStatus, ApprovalStatus, TaskStatus, NominationStatus } from "../core/types.js";
+import type { SandboxPolicy } from "../core/permissions.js";
 import type { ArtifactType } from "../core/artifacts.js";
 import type { FlowStepDefinition } from "../core/flow-engine.js";
 
@@ -88,6 +89,7 @@ export interface GatewayDeps {
   enableMemoryNominations?: boolean;
   enableArtifacts?: boolean;
   maxToolHops?: number;
+  sandboxPolicy?: SandboxPolicy;
 }
 
 export interface GatewayHandle {
@@ -443,6 +445,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         enableSubagents: deps.enableSubagents,
         enableMemoryNominations: deps.enableMemoryNominations,
         enableArtifacts: deps.enableArtifacts,
+        sandboxPolicy: deps.sandboxPolicy,
         maxToolHops: deps.maxToolHops,
       });
       sendJson(res, 200, result);
@@ -513,6 +516,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         enableSubagents: deps.enableSubagents,
         enableMemoryNominations: deps.enableMemoryNominations,
         enableArtifacts: deps.enableArtifacts,
+        sandboxPolicy: deps.sandboxPolicy,
       }).catch((err) => {
         console.error(`[gateway] flow ${flow.id} driving failed:`, err instanceof Error ? err.message : err);
       });
@@ -539,6 +543,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         enableSubagents: deps.enableSubagents,
         enableMemoryNominations: deps.enableMemoryNominations,
         enableArtifacts: deps.enableArtifacts,
+        sandboxPolicy: deps.sandboxPolicy,
       }).catch((err) => {
         console.error(`[gateway] flow ${flow.id} resume failed:`, err instanceof Error ? err.message : err);
       });

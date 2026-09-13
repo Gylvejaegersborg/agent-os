@@ -56,6 +56,7 @@ import type { ModelAdapter } from "./model.js";
 import type { Worker } from "./worker.js";
 import type { SkillRegistry } from "./skills.js";
 import type { Flow, TaskStatus } from "./types.js";
+import type { SandboxPolicy } from "./permissions.js";
 
 export interface FlowStepDefinition {
   id: string;
@@ -86,6 +87,7 @@ export interface DriveFlowOptions {
   enableSubagents?: boolean;
   enableMemoryNominations?: boolean;
   enableArtifacts?: boolean;
+  sandboxPolicy?: SandboxPolicy;
 }
 
 export interface FlowStepResult {
@@ -170,6 +172,7 @@ async function runStepOnce(
       enableSubagents: opts.enableSubagents,
       enableMemoryNominations: opts.enableMemoryNominations,
       enableArtifacts: opts.enableArtifacts,
+      sandboxPolicy: opts.sandboxPolicy,
     });
     await transitionTask(task.id, "succeeded", { output: { finalContent: result.finalContent } });
     await publishEvent("flow.step.completed", { flowId, stepId: step.id, agentId: step.agentId, taskId: task.id, status: "succeeded" });
