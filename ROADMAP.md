@@ -113,8 +113,8 @@ into the LIVE gateway, not just what exists somewhere in the codebase).
       that's the real remaining gap if full checkpoint/rewind is ever
       built. **[core]** `file-revisions.ts`; **[gateway]**
       `GET /files/revisions`, `POST /files/revisions/:id/restore`
-      (sandbox-checked). No UI yet — a revision browser/restore button
-      is the natural next step.
+      (sandbox-checked); **[UI]** a "Files" tab in the Workbench listing
+      revisions with a Restore button per entry.
 
 ## Open
 
