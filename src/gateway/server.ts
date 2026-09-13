@@ -78,6 +78,7 @@ import {
   listDreamingPasses,
   writeSkill,
   deleteSkill,
+  parseSkillFile,
 } from "../core/index.js";
 import type { SessionStatus, ApprovalStatus, TaskStatus, NominationStatus } from "../core/types.js";
 import type { SandboxPolicy } from "../core/permissions.js";
@@ -384,6 +385,45 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
       await deleteSkill(deps.skillsDir, segments[1]!);
       deps.skills.remove(segments[1]!);
       sendJson(res, 200, { ok: true });
+      return;
+    }
+    // Install a skill FROM elsewhere — ROADMAP.md's "skill marketplace /
+    // install-from-elsewhere" item, scoped to the smallest useful version
+    // of that: fetch a raw SKILL.md-shaped document from any URL (a
+    // GitHub raw link, a gist, a shared file server — no registry
+    // protocol assumed, since there isn't a standard one to assume),
+    // validate it with the EXACT same parseSkillFile() a hand-authored
+    // one goes through, then persist + hot-register it exactly like
+    // POST /skills above. A human-triggered settings action, same trust
+    // level as the rest of this route — no new gating beyond what
+    // POST/DELETE /skills already have none of.
+    if (method === "POST" && segments.length === 2 && segments[1] === "install") {
+      if (!deps.skills || !deps.skillsDir) {
+        sendJson(res, 501, { error: "this gateway has no skills directory configured" });
+        return;
+      }
+      const body = await readRequestBody(req);
+      if (typeof body.url !== "string" || !body.url) {
+        sendJson(res, 400, { error: "url (string) is required" });
+        return;
+      }
+      try {
+        const fetchRes = await fetch(body.url, { signal: AbortSignal.timeout(10_000) });
+        if (!fetchRes.ok) {
+          sendJson(res, 400, { error: `could not fetch ${body.url}: HTTP ${fetchRes.status}` });
+          return;
+        }
+        const raw = await fetchRes.text();
+        // parseSkillFile needs a dirPath only for its own error messages
+        // — there's no real directory yet until writeSkill() below
+        // actually creates one, so the source URL stands in for it.
+        const parsed = parseSkillFile(raw, body.url);
+        const skill = await writeSkill(deps.skillsDir, parsed);
+        deps.skills.add(skill);
+        sendJson(res, 201, skill);
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
       return;
     }
   }

@@ -77,6 +77,15 @@ into the LIVE gateway, not just what exists somewhere in the codebase).
       contract. **[core]** `configured-hooks.ts`; **[gateway]**
       `GET /hooks` (read-only visibility, no write endpoint for the
       same reason); **[UI]** a read-only list in `SettingsModal.tsx`.
+- [x] Skill marketplace / install-from-elsewhere — scoped to its
+      smallest useful version: fetch a raw SKILL.md from any URL (a
+      GitHub raw link, a gist, a shared file server — no registry
+      protocol assumed, since there isn't a standard one to assume),
+      validated through the EXACT same `parseSkillFile()` a
+      hand-authored skill goes through, then persisted + hot-registered
+      the same way `POST /skills` already does. A human-triggered
+      settings action; no new gating beyond what the rest of `/skills`
+      already has none of. **[gateway]** `POST /skills/install`.
 
 ## Open
 
@@ -99,10 +108,6 @@ checked — see the correction below.
       closed — `shell`/`skill`/`subagent`/`nominate-memory`/
       `record-artifact`/`read_file`/`edit_file`/`write_file`, nothing
       pluggable in from an external server. **[core]**
-- [ ] **Skill marketplace / install-from-elsewhere.** `SkillRegistry` +
-      the new Settings UI cover hand-authoring a skill; there's still no
-      way to pull one in from outside (a URL, a shared registry). **[core]**
-      **[UI]**
 - [ ] **Multimodal input.** The Workbench chat is text-only — no
       image/screenshot attachment support in `useAgentOsChat`/
       `ConversationPane`, and no corresponding support in `model.ts`'s

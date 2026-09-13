@@ -39,6 +39,7 @@
     "test-usage-tracking": "tsc -b && node dist/test-usage-tracking.js",
     "test-plan-mode": "tsc -b && node dist/test-plan-mode.js",
     "test-configured-hooks": "tsc -b && node dist/test-configured-hooks.js",
+    "test-skill-install": "tsc -b && node dist/test-skill-install.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {
