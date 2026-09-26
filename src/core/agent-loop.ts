@@ -4,6 +4,8 @@
 // Every turn is written to the session's event stream, so resume/replay/
 // observability for free (see eventlog.ts).
 
+import { hindsightConfigured, hindsightRecall, hindsightReflect, hindsightRetain } from "./hindsight.js";
+import { addOverlayItem, readSnapshotSection, type OverlayKind } from "./basespace.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { appendEvent, project } from "./eventlog.js";
@@ -90,6 +92,10 @@ export interface RunTurnOptions {
    *  disable artifact recording for this turn, same opt-in pattern as
    *  enableSubagents/enableMemoryNominations. */
   enableArtifacts?: boolean;
+  /** Tell the agent about the BaseSpace bridge (basespace.ts) in its system
+   *  message — on for the live gateway, off by default so a bare runTurn()
+   *  keeps producing exactly the system message it always did. */
+  enableBaseSpace?: boolean;
   /** When provided, read_file/edit_file/write_file (and, independently,
    *  createSandboxedWorker-wrapped shell calls — see worker.ts) are
    *  confined to this policy's workspace roots via permissions.ts's
@@ -297,6 +303,12 @@ async function renderMemoryContext(agentId: string, queryText: string): Promise<
       : "";
     parts.push(`# USER.md (user profile/preferences learned over time)${note}\n${retrieved.userProfileLines.join("\n")}`);
   }
+  // Optional Hindsight layer (hindsight.ts) — empty unless HINDSIGHT_URL is
+  // set and reachable.
+  const recalled = await hindsightRecall(agentId, queryText);
+  if (recalled.length > 0) {
+    parts.push(`# Recalled from long-term memory (Hindsight)\n${recalled.map((l) => `- ${l}`).join("\n")}`);
+  }
   return parts.join("\n\n");
 }
 
@@ -493,11 +505,32 @@ async function dispatchTool(
     });
     return { ok: true, output: `Artifact ${artifact.id} (${type}) recorded at "${location}".` };
   }
+  if (toolCall.name === "recall-memory") {
+    if (!hindsightConfigured()) return { ok: false, output: "", error: "long-term memory (Hindsight) is not configured on this gateway" };
+    const query = String(toolCall.args.query ?? "");
+    if (!query) return { ok: false, output: "", error: "recall-memory needs a 'query'" };
+    if (toolCall.args.deep === true) {
+      const text = await hindsightReflect(ctx.agentId, query);
+      return text ? { ok: true, output: text } : { ok: false, output: "", error: "reflect returned nothing (Hindsight unreachable or empty bank)" };
+    }
+    const lines = await hindsightRecall(ctx.agentId, query);
+    return { ok: true, output: lines.length ? lines.map((l) => `- ${l}`).join("\n") : "Nothing relevant remembered." };
+  }
+  if (toolCall.name === "basespace") {
+    const section = String(toolCall.args.section ?? "summary");
+    const query = typeof toolCall.args.query === "string" ? toolCall.args.query : undefined;
+    const id = typeof toolCall.args.id === "string" ? toolCall.args.id : undefined;
+    return readSnapshotSection(section, { query, id });
+  }
+  if (toolCall.name === "basespace-add") {
+    const kind = String(toolCall.args.kind ?? "") as OverlayKind;
+    return addOverlayItem(kind, toolCall.args, ctx.agentId);
+  }
   return { ok: false, output: "", error: `unknown tool: ${toolCall.name}` };
 }
 
 export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
-  const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents, enableMemoryNominations, enableArtifacts, sandboxPolicy, planMode } = opts;
+  const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents, enableMemoryNominations, enableArtifacts, enableBaseSpace, sandboxPolicy, planMode } = opts;
   const injectMemory = opts.injectMemory ?? true;
   const maxHops = opts.maxToolHops ?? 3;
 
@@ -584,6 +617,12 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     const artifactText = enableArtifacts
       ? "When you produce a real output worth attaching to this task (a file you wrote, a report, a plan), call the `record-artifact` tool with {type, location, description?} to register it. This does not create the content itself — produce it first (e.g. via the shell tool), then record where it lives."
       : "";
+    const baseSpaceText = !enableBaseSpace
+      ? ""
+      : "The operator runs a dashboard called BaseSpace (notes, projects, todos, calendar, cron jobs, teams). Read it with the `basespace` tool " +
+      "(start with section \"summary\") before answering questions about their work, and use `basespace-add` to leave a note, a todo or a " +
+      "project update there — that's how your work shows up for them. Only add things they'd want to see." +
+      (hindsightConfigured() ? " Use `recall-memory` to look up what you've learned in earlier conversations." : "");
     const fileToolsText =
       "Prefer `read_file`/`edit_file`/`write_file` over shell redirection or `sed` for reading or changing a file's content — " +
       "`edit_file` takes {path, old_string, new_string} and fails with no write made if old_string isn't found or isn't unique in the file " +
@@ -599,7 +638,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     // personaText first — "who you are" precedes "what you remember/can do"
     // in the assembled system message, matching how a human-written system
     // prompt would order identity before capability context.
-    const systemParts = [personaText, memoryText, catalogText, subagentText, nominationText, artifactText, fileToolsText, planModeText].filter(
+    const systemParts = [personaText, memoryText, catalogText, subagentText, nominationText, artifactText, baseSpaceText, fileToolsText, planModeText].filter(
       Boolean,
     );
     const messages: ModelMessage[] = systemParts.length
@@ -736,6 +775,11 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   }
 
   const usage = sawUsage ? { inputTokens: usageInputTokens, outputTokens: usageOutputTokens } : undefined;
+  if (!cancelled && finalContent) {
+    // Every completed exchange goes to Hindsight (when configured) so it can
+    // extract facts/experiences from it; no-op otherwise.
+    void hindsightRetain(agentId, `User: ${userMessage}\n\n${agentId}: ${finalContent}`, { context: "conversation turn", tags: ["turn"] });
+  }
   await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled, usage });
   await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled, usage } });
   await publishEvent("agent.turn.end", { sessionId, agentId, finalContent, toolCalled, cancelled, usage });

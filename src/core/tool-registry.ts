@@ -68,6 +68,7 @@ export function listToolDefinitions(): ToolDefinition[] {
 export function resetToolRegistry(): void {
   registry.clear();
   for (const def of BUILTIN_TOOL_DEFINITIONS) registerTool(def);
+  if (process.env.HINDSIGHT_URL) registerTool(RECALL_MEMORY_TOOL);
 }
 
 export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
@@ -104,6 +105,35 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
   {
+    name: "basespace",
+    description:
+      "Reads the operator's BaseSpace dashboard (a snapshot it syncs here): section = summary | notes | projects | todos | events | crons | teams. " +
+      "Use query to filter by text; use id to get one item in full (notes are listed without their text until you ask for one by id).",
+    inputSchema: {
+      section: { type: "string", required: true, description: "summary, notes, projects, todos, events, crons or teams." },
+      query: { type: "string", description: "Only items containing this text." },
+      id: { type: "string", description: "Return this one item in full (for a note: its whole text)." },
+    },
+  },
+  {
+    name: "basespace-add",
+    description:
+      "Adds something to the operator's BaseSpace: kind = note {title, body, folder?} | todo {title, due? YYYY-MM-DD, time? HH:MM, priority? high|med|low, notes?} | " +
+      "project-update {projectId, text}. Internal to their own dashboard — use approvals for anything that goes outside it.",
+    inputSchema: {
+      kind: { type: "string", required: true, description: "note, todo or project-update." },
+      title: { type: "string", description: "Note or todo title." },
+      body: { type: "string", description: "Note text (markdown)." },
+      folder: { type: "string", description: "Note folder, e.g. Team/Meetings. Defaults to Agents/<your name>." },
+      due: { type: "string", description: "Todo due date, YYYY-MM-DD." },
+      time: { type: "string", description: "Todo time, HH:MM (the operator gets a notification then)." },
+      priority: { type: "string", description: "Todo priority: high, med or low." },
+      notes: { type: "string", description: "Todo details." },
+      projectId: { type: "string", description: "Project id (from the basespace tool) for a project-update." },
+      text: { type: "string", description: "The project update." },
+    },
+  },
+  {
     name: "read_file",
     description: "Reads a file's full text content from disk, subject to the session's SandboxPolicy (if one is configured).",
     inputSchema: { path: { type: "string", required: true, description: "Path to the file, absolute or relative to the sandbox's workspaceRoot." } },
@@ -130,7 +160,21 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
 ];
 
+/** Registered only when HINDSIGHT_URL is set (see hindsight.ts), so models
+ *  aren't offered a tool that can only fail. */
+export const RECALL_MEMORY_TOOL: ToolDefinition = {
+  name: "recall-memory",
+  description:
+    "Searches your long-term memory (Hindsight) for what you know about something. Set deep=true for a reasoned answer across everything you remember (slower).",
+  inputSchema: {
+    query: { type: "string", required: true, description: "What you want to remember, as a question or topic." },
+    deep: { type: "boolean", description: "Reflect across all memories instead of a quick lookup. Default false." },
+  },
+  timeoutMs: 70_000,
+};
+
 for (const def of BUILTIN_TOOL_DEFINITIONS) registerTool(def);
+if (process.env.HINDSIGHT_URL) registerTool(RECALL_MEMORY_TOOL);
 
 /** Races `promise` against a timer of `timeoutMs`, returning `onTimeout()`'s
  *  result if the timer wins. `timeoutMs` undefined (the default for every

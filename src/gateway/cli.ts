@@ -25,6 +25,7 @@ import {
   type SandboxPolicy,
 } from "../core/index.js";
 import { startGateway } from "./server.js";
+import { startBaseSpaceCronRunner } from "./basespace-crons.js";
 
 // The one agent allowed to touch a real shell at all. Deliberately a
 // single, well-known id rather than a config knob: this whole feature
@@ -198,13 +199,21 @@ async function main(): Promise<void> {
   // claims some of these (e.g. "subagent-delegation"), so leaving them
   // off made that claim false in practice.
   const handle = await startGateway(
-    { model, worker, skills, skillsDir, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true, sandboxPolicy, configuredHooks },
+    { model, worker, skills, skillsDir, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true, enableBaseSpace: true, sandboxPolicy, configuredHooks },
     port,
   );
   console.log(`[gateway] listening on http://127.0.0.1:${handle.port}`);
 
+  // Team meetings scheduled in BaseSpace (see basespace-crons.ts).
+  const baseSpaceCrons = startBaseSpaceCronRunner({ model, worker, skills });
+  console.log(
+    `[gateway] BaseSpace team crons ${process.env.AGENT_OS_BASESPACE_CRONS === "off" ? "disabled" : "enabled"}; ` +
+      `Hindsight memory ${process.env.HINDSIGHT_URL ? `on (${process.env.HINDSIGHT_URL})` : "off (set HINDSIGHT_URL to enable)"}`,
+  );
+
   const shutdown = async (): Promise<void> => {
     console.log("\n[gateway] shutting down...");
+    baseSpaceCrons.stop();
     await handle.stop();
     process.exit(0);
   };

@@ -82,6 +82,10 @@ import {
   listFileRevisions,
   getFileRevision,
   restoreFileRevision,
+  saveSnapshot,
+  loadSnapshot,
+  loadOverlay,
+  removeOverlayItem,
 } from "../core/index.js";
 import { checkPathSandbox } from "../core/permissions.js";
 import type { SessionStatus, ApprovalStatus, TaskStatus, NominationStatus } from "../core/types.js";
@@ -102,6 +106,8 @@ export interface GatewayDeps {
   enableSubagents?: boolean;
   enableMemoryNominations?: boolean;
   enableArtifacts?: boolean;
+  /** Tell agents about the BaseSpace bridge in their system message. */
+  enableBaseSpace?: boolean;
   maxToolHops?: number;
   sandboxPolicy?: SandboxPolicy;
   /** Purely for GET /hooks's visibility — the hooks themselves are
@@ -118,11 +124,20 @@ export interface GatewayHandle {
   stop: () => Promise<void>;
 }
 
-function readRequestBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+function readRequestBody(req: IncomingMessage, maxBytes = 1024 * 1024): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
     let raw = "";
     req.on("data", (chunk) => {
       raw += chunk;
+      // Stop buffering past the limit and answer with an empty body (every
+      // route validates its input, so this reads as a bad request).
+      if (raw.length > maxBytes) {
+        raw = "";
+        req.removeAllListeners("data");
+        req.removeAllListeners("end");
+        req.resume();
+        resolve({});
+      }
     });
     req.on("end", () => {
       if (!raw.trim()) {
@@ -231,6 +246,38 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
   if (method === "GET" && segments.length === 1 && segments[0] === "tools") {
     sendJson(res, 200, { tools: listToolDefinitions() });
     return;
+  }
+
+  // ---- BaseSpace bridge (basespace.ts) — BaseSpace pushes a snapshot of
+  // its state for the agents to read, and reads back what agents added. ----
+  if (segments[0] === "basespace") {
+    if (segments[1] === "snapshot" && segments.length === 2) {
+      if (method === "POST") {
+        try {
+          sendJson(res, 200, { ok: true, ...(await saveSnapshot(await readRequestBody(req, 8 * 1024 * 1024))) });
+        } catch (err) {
+          sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+        }
+        return;
+      }
+      if (method === "GET") {
+        const snap = await loadSnapshot();
+        if (!snap) sendJson(res, 404, { error: "no snapshot yet" });
+        else sendJson(res, 200, snap);
+        return;
+      }
+    }
+    if (segments[1] === "overlay") {
+      if (method === "GET" && segments.length === 2) {
+        sendJson(res, 200, await loadOverlay());
+        return;
+      }
+      if (method === "DELETE" && segments.length === 4) {
+        const removed = await removeOverlayItem(segments[2], decodeURIComponent(segments[3]));
+        sendJson(res, removed ? 200 : 404, removed ? { ok: true } : { error: "no such overlay item" });
+        return;
+      }
+    }
   }
 
   // ---- Artifacts (artifacts.ts) — produced outputs attached to a
@@ -627,6 +674,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         enableSubagents: deps.enableSubagents,
         enableMemoryNominations: deps.enableMemoryNominations,
         enableArtifacts: deps.enableArtifacts,
+        enableBaseSpace: deps.enableBaseSpace,
         sandboxPolicy: deps.sandboxPolicy,
         maxToolHops: deps.maxToolHops,
         // Per-REQUEST, not a gateway-wide deps default like the flags
