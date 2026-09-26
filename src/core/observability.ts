@@ -75,6 +75,16 @@ export interface TurnLatencyMetrics {
   maxMs: number | null;
 }
 
+/** Model token usage summed from agent.turn.end events (only turns whose
+ *  model adapter reported usage count toward the token totals). */
+export interface UsageMetrics {
+  turns: number;
+  turnsWithUsage: number;
+  inputTokens: number;
+  outputTokens: number;
+  lastTurnAt: string | null;
+}
+
 export interface MetricsSnapshot {
   generatedAt: string;
   scope: { agentId?: string };
@@ -82,6 +92,7 @@ export interface MetricsSnapshot {
   automations: AutomationMetrics;
   dreaming: DreamingMetrics;
   turnLatency: TurnLatencyMetrics;
+  usage: UsageMetrics;
 }
 
 function emptyStatusCounts(): Record<TaskStatus, number> {
@@ -174,9 +185,10 @@ async function computeDreamingMetrics(agentId?: string): Promise<DreamingMetrics
  *  delta in ms for every completed turn found. Session streams on disk
  *  are named `session_<id>` (':' sanitized to '_' by eventlog.ts), the
  *  same pattern agentfs.ts's fsList("/agent/sessions") already relies on. */
-async function computeTurnLatencyMetrics(agentId?: string): Promise<TurnLatencyMetrics> {
+async function computeTurnMetrics(agentId?: string): Promise<{ turnLatency: TurnLatencyMetrics; usage: UsageMetrics }> {
   const streamIds = (await listStreamIds()).filter((s) => s.startsWith("session_"));
   const diffs: number[] = [];
+  const usage: UsageMetrics = { turns: 0, turnsWithUsage: 0, inputTokens: 0, outputTokens: 0, lastTurnAt: null };
 
   for (const streamId of streamIds) {
     const events = await readStream(streamId);
@@ -186,17 +198,29 @@ async function computeTurnLatencyMetrics(agentId?: string): Promise<TurnLatencyM
       if (e.type === "agent.turn.start") {
         startTs = new Date(e.timestamp).getTime();
         startAgentId = (e.payload as { agentId?: string }).agentId;
-      } else if (e.type === "agent.turn.end" && startTs !== null) {
-        const endTs = new Date(e.timestamp).getTime();
-        if (!agentId || startAgentId === agentId) diffs.push(endTs - startTs);
+      } else if (e.type === "agent.turn.end") {
+        const p = e.payload as { agentId?: string; usage?: { inputTokens?: number; outputTokens?: number } };
+        const who = p.agentId ?? startAgentId;
+        if (!agentId || who === agentId) {
+          if (startTs !== null) diffs.push(new Date(e.timestamp).getTime() - startTs);
+          usage.turns++;
+          if (p.usage) {
+            usage.turnsWithUsage++;
+            usage.inputTokens += p.usage.inputTokens ?? 0;
+            usage.outputTokens += p.usage.outputTokens ?? 0;
+          }
+          if (!usage.lastTurnAt || e.timestamp > usage.lastTurnAt) usage.lastTurnAt = e.timestamp;
+        }
         startTs = null;
       }
     }
   }
 
-  if (diffs.length === 0) return { sampleCount: 0, avgMs: null, minMs: null, maxMs: null };
-  const sum = diffs.reduce((a, b) => a + b, 0);
-  return { sampleCount: diffs.length, avgMs: sum / diffs.length, minMs: Math.min(...diffs), maxMs: Math.max(...diffs) };
+  const turnLatency: TurnLatencyMetrics =
+    diffs.length === 0
+      ? { sampleCount: 0, avgMs: null, minMs: null, maxMs: null }
+      : { sampleCount: diffs.length, avgMs: diffs.reduce((a, b) => a + b, 0) / diffs.length, minMs: Math.min(...diffs), maxMs: Math.max(...diffs) };
+  return { turnLatency, usage };
 }
 
 /** The one entry point: a fresh, purely-derived snapshot of everything
@@ -206,11 +230,11 @@ async function computeTurnLatencyMetrics(agentId?: string): Promise<TurnLatencyM
  *  counters. Pass an agentId to scope tasks/automations/dreaming/turn-
  *  latency to a single agent; omit it for a whole-system view. */
 export async function computeMetricsSnapshot(agentId?: string): Promise<MetricsSnapshot> {
-  const [tasks, automations, dreaming, turnLatency] = await Promise.all([
+  const [tasks, automations, dreaming, turns] = await Promise.all([
     computeTaskMetrics(agentId),
     computeAutomationMetrics(agentId),
     computeDreamingMetrics(agentId),
-    computeTurnLatencyMetrics(agentId),
+    computeTurnMetrics(agentId),
   ]);
-  return { generatedAt: new Date().toISOString(), scope: { agentId }, tasks, automations, dreaming, turnLatency };
+  return { generatedAt: new Date().toISOString(), scope: { agentId }, tasks, automations, dreaming, ...turns };
 }

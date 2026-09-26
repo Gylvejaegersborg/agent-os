@@ -22,6 +22,7 @@ import {
   DEFAULT_HARD_BLOCKLIST,
   SkillRegistry,
   loadConfiguredHooks,
+  seedAllowRules,
   type SandboxPolicy,
 } from "../core/index.js";
 import { startGateway } from "./server.js";
@@ -187,6 +188,16 @@ async function main(): Promise<void> {
   // /agents return real data on a fresh data dir instead of an empty list.
   const roster = await seedDefaultAgents();
   console.log(`[gateway] agent registry ready: ${roster.map((a) => a.id).join(", ")}`);
+
+  // Default "always allow" entries (allowlist.ts): every agent may read and
+  // write BaseSpace without an approval, and Claude — the one agent whose
+  // policy asks by default — may also use the other harness tools that
+  // can't touch files or a shell. Editable per agent from the Workbench.
+  const seededRules = await seedAllowRules([
+    ...roster.flatMap((a) => ["basespace", "basespace-add"].map((toolName) => ({ agentId: a.id, toolName }))),
+    ...["recall-memory", "skill", "nominate-memory", "record-artifact"].map((toolName) => ({ agentId: ENGINEER_AGENT_ID, toolName })),
+  ]);
+  if (seededRules) console.log(`[gateway] allowlist: seeded ${seededRules} default rule(s)`);
 
   // These three are each independently tested and already safety-scoped
   // on their own terms (agent-loop.ts): subagents don't recursively spawn
