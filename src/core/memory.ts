@@ -30,6 +30,7 @@
 //
 // See /docs/architecture.md §3 for the full design rationale.
 
+import { hindsightRetain } from "./hindsight.js";
 import { project, appendEvent } from "./eventlog.js";
 import { generateId } from "./id.js";
 import type {
@@ -86,6 +87,9 @@ export async function writeEpisodic(input: {
     agentFlaggedImportant: input.agentFlaggedImportant ?? false,
   };
   await appendEvent(episodicStream(input.agentId), "memory.episodic.write", entry as any);
+  // Mirror into Hindsight when it's configured (no-op otherwise; never
+  // blocks or fails the write — see hindsight.ts).
+  void hindsightRetain(input.agentId, input.content, { context: `episodic ${input.kind}`, tags: [input.kind], timestamp: entry.timestamp });
   return entry;
 }
 

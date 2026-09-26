@@ -954,6 +954,71 @@ assertions total). `npm run demo`'s "9. Observability" section then
 prints a live snapshot aggregated over everything the earlier demo
 sections generated.
 
+## BaseSpace bridge — agents see and add to the operator's dashboard
+
+BaseSpace (the BaseOStest repo) is the operator's dashboard: notes, projects,
+todos, calendar, cron jobs and teams. `src/core/basespace.ts` connects it to the
+agents with two JSON files under the data dir:
+
+| File | Written by | Read by |
+| --- | --- | --- |
+| `basespace/snapshot.json` | BaseSpace, `POST /basespace/snapshot`, a few seconds after anything changes | agents, via the `basespace` tool |
+| `basespace/overlay.json` | agents, via the `basespace-add` tool | BaseSpace, `GET /basespace/overlay` (polled every 30 s) |
+
+- `basespace` — `section` = summary · notes · projects · todos · events · crons · teams,
+  plus optional `query` (text filter) or `id` (one item in full; notes are listed without
+  their text until asked for by id). Read-only: agents never rewrite the operator's items.
+- `basespace-add` — `kind` = `note` {title, body, folder?} · `todo` {title, due?, time?,
+  priority?, notes?} · `project-update` {projectId, text}. Internal to the operator's own
+  dashboard, so not approval-gated; anything outward-facing still goes through approvals.
+- `DELETE /basespace/overlay/:kind/:id` removes an agent-added item.
+
+The gateway tells agents about these in their system message (`enableBaseSpace`).
+
+**Team meetings.** Cron jobs that BaseSpace tags with a team (Workbench → Teams →
+Schedule standup) are run here by `src/gateway/basespace-crons.ts`: at each slot the
+team lead chairs a turn that reads BaseSpace and writes the minutes back as a note in
+`Team/Meetings`, plus todos for the operator. Runs are ordinary `cron` Tasks. Missed
+slots older than 15 minutes aren't replayed. BaseSpace's other cron jobs are
+descriptive and are not executed. Turn it off with `AGENT_OS_BASESPACE_CRONS=off`.
+
+**Tools reach real models now.** Before this, the gateway created its model adapters
+without a tool list, so Anthropic/OpenAI/Ollama models were never told any tool existed
+(only the stub model ever "called" one). Adapters now fall back to every tool in the
+registry (`registryToolSpecs()` in `models/real.ts`).
+
+## Hindsight — optional long-term memory
+
+[Hindsight](https://github.com/vectorize-io/hindsight) (MIT) is an agent memory service:
+it extracts facts, entities and experiences from what you give it (retain), finds what's
+relevant later (recall) and reasons over it (reflect). `src/core/hindsight.ts` adds it
+next to the built-in episodic → dreaming → curated pipeline. It's off unless
+`HINDSIGHT_URL` is set, and every call has a short timeout and fails quietly, so a
+down Hindsight never breaks a turn.
+
+When it's on:
+
+- every completed exchange and every episodic memory write is retained into the
+  agent's own bank (`<HINDSIGHT_BANK_PREFIX or "agent-os">-<agentId>`);
+- each turn's system message gets a "Recalled from long-term memory" block for the
+  user's message;
+- agents get a `recall-memory` tool ({query, deep?}; `deep` uses reflect).
+
+Run it (one container with its own embedded Postgres; it needs an LLM key for fact
+extraction):
+
+```bash
+docker run -d --name hindsight --restart unless-stopped -p 8888:8888 -p 9999:9999 \
+  -e HINDSIGHT_API_LLM_API_KEY=$OPENAI_API_KEY \
+  -v hindsight-data:/home/hindsight/.pg0 \
+  ghcr.io/vectorize-io/hindsight:latest
+
+HINDSIGHT_URL=http://127.0.0.1:8888 npm run gateway
+```
+
+Optional: `HINDSIGHT_API_KEY` (Bearer token), `HINDSIGHT_BANK_PREFIX`,
+`HINDSIGHT_RECALL_TOKENS` (default 600). The Hindsight UI is on port 9999.
+
 ## Repo layout
 
 ```

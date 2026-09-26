@@ -4,6 +4,8 @@ export * from "./eventlog.js";
 export * from "./session.js";
 export * from "./tasks.js";
 export * from "./memory.js";
+export * from "./hindsight.js";
+export * from "./basespace.js";
 export * from "./text-similarity.js";
 export * from "./hooks.js";
 export * from "./configured-hooks.js";

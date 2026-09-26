@@ -10,6 +10,7 @@
 // carry multiple tool calls — that's a deliberate scaffold limitation, not
 // an oversight.
 
+import { listToolDefinitions } from "../tool-registry.js";
 import type { ModelAdapter, ModelMessage, ModelResponse } from "../model.js";
 import { appendEvent, project } from "../eventlog.js";
 
@@ -18,6 +19,28 @@ export interface ToolSpec {
   description: string;
   /** JSON Schema for the tool's arguments. */
   parameters: Record<string, unknown>;
+}
+
+/** Every tool in the registry (tool-registry.ts), as the JSON-Schema specs
+ *  the provider APIs take. Used whenever an adapter isn't given an explicit
+ *  `tools` list — before this, the gateway created its adapters without
+ *  one, so real models were never told any tool existed and every tool
+ *  call path only ran against the stub model. Read at call time, so tools
+ *  registered after the adapter was created are included. */
+export function registryToolSpecs(): ToolSpec[] {
+  return listToolDefinitions().map((d) => ({
+    name: d.name,
+    description: d.description,
+    parameters: {
+      type: "object",
+      properties: Object.fromEntries(
+        Object.entries(d.inputSchema).map(([k, v]) => [k, { type: v.type, ...(v.description ? { description: v.description } : {}) }]),
+      ),
+      required: Object.entries(d.inputSchema)
+        .filter(([, v]) => v.required)
+        .map(([k]) => k),
+    },
+  }));
 }
 
 interface AnthropicOptions {
@@ -82,8 +105,9 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
         messages: anthropicMessages,
         ...(system ? { system } : {}),
       };
-      if (opts.tools?.length) {
-        body.tools = opts.tools.map((t) => ({
+      const tools = opts.tools ?? registryToolSpecs();
+      if (tools.length) {
+        body.tools = tools.map((t) => ({
           name: t.name,
           description: t.description,
           input_schema: t.parameters,
@@ -141,8 +165,9 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
         stream: true,
         ...(system ? { system } : {}),
       };
-      if (opts.tools?.length) {
-        body.tools = opts.tools.map((t) => ({
+      const tools = opts.tools ?? registryToolSpecs();
+      if (tools.length) {
+        body.tools = tools.map((t) => ({
           name: t.name,
           description: t.description,
           input_schema: t.parameters,
@@ -238,8 +263,9 @@ export function createOpenAiModel(opts: OpenAiOptions): ModelAdapter {
       }));
 
       const body: Record<string, unknown> = { model, messages: openAiMessages };
-      if (opts.tools?.length) {
-        body.tools = opts.tools.map((t) => ({
+      const tools = opts.tools ?? registryToolSpecs();
+      if (tools.length) {
+        body.tools = tools.map((t) => ({
           type: "function",
           function: { name: t.name, description: t.description, parameters: t.parameters },
         }));
@@ -346,8 +372,9 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
       }));
 
       const body: Record<string, unknown> = { model, messages: ollamaMessages, stream: false };
-      if (opts.tools?.length) {
-        body.tools = opts.tools.map((t) => ({
+      const tools = opts.tools ?? registryToolSpecs();
+      if (tools.length) {
+        body.tools = tools.map((t) => ({
           type: "function",
           function: { name: t.name, description: t.description, parameters: t.parameters },
         }));
@@ -394,8 +421,9 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
       }));
 
       const body: Record<string, unknown> = { model, messages: ollamaMessages, stream: true };
-      if (opts.tools?.length) {
-        body.tools = opts.tools.map((t) => ({
+      const tools = opts.tools ?? registryToolSpecs();
+      if (tools.length) {
+        body.tools = tools.map((t) => ({
           type: "function",
           function: { name: t.name, description: t.description, parameters: t.parameters },
         }));

@@ -22,6 +22,7 @@
     "test-tool-registry": "tsc -b && node dist/test-tool-registry.js",
     "gateway": "tsc -b && node dist/gateway/cli.js",
     "test-gateway": "tsc -b && node dist/test-gateway.js",
+    "test-basespace": "tsc -b && node dist/test-basespace.js",
     "test-agents": "tsc -b && node dist/test-agents.js",
     "test-artifacts": "tsc -b && node dist/test-artifacts.js",
     "test-flow-engine": "tsc -b && node dist/test-flow-engine.js",
