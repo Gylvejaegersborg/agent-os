@@ -299,6 +299,33 @@ interface OllamaOptions {
   tools?: ToolSpec[];
 }
 
+/** Retries ONLY a connection-level failure (fetch() itself throwing —
+ *  "ECONNREFUSED"/"fetch failed" — Ollama's server not accepting
+ *  connections yet) a few times with a short delay, never an HTTP error
+ *  RESPONSE (a real 4xx/5xx from a server that's actually up is not a
+ *  "try again" situation). This exists specifically for the startup
+ *  race start.sh's own readiness-polling loop doesn't fully close: that
+ *  loop waits for Ollama's HTTP server to accept connections before the
+ *  gateway even starts, but the model can still be mid-load into memory
+ *  for a few more seconds after the server itself is already accepting
+ *  connections — a turn that lands in that narrow window would
+ *  otherwise surface a raw connection error to the user for something
+ *  that resolves itself a couple seconds later. */
+export async function fetchWithOllamaRetry(baseUrl: string, init: RequestInit, model: string, attempts = 3, delayMs = 1500): Promise<Response> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await fetch(baseUrl, init);
+    } catch (err) {
+      lastErr = err;
+      if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw new Error(
+    `Could not reach Ollama at ${baseUrl} after ${attempts} attempts — is it running? ('ollama serve', or 'ollama pull ${model}' if the model isn't installed yet). Original error: ${lastErr}`,
+  );
+}
+
 /** Ollama's OpenAI-compatible endpoint (/v1/chat/completions) — same
  *  request/response shape as createOpenAiModel above, no API key needed
  *  since it's a local (or self-hosted) server. This is the adapter you
@@ -326,18 +353,11 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
         }));
       }
 
-      let res: Response;
-      try {
-        res = await fetch(baseUrl, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(body),
-        });
-      } catch (err) {
-        throw new Error(
-          `Could not reach Ollama at ${baseUrl} — is it running? ('ollama serve', or 'ollama pull ${model}' if the model isn't installed yet). Original error: ${err}`,
-        );
-      }
+      const res = await fetchWithOllamaRetry(
+        baseUrl,
+        { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) },
+        model,
+      );
       const json: any = await res.json();
       if (!res.ok) {
         throw new Error(`Ollama API error ${res.status}: ${JSON.stringify(json).slice(0, 500)}`);
@@ -381,18 +401,11 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
         }));
       }
 
-      let res: Response;
-      try {
-        res = await fetch(baseUrl, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(body),
-        });
-      } catch (err) {
-        throw new Error(
-          `Could not reach Ollama at ${baseUrl} — is it running? ('ollama serve', or 'ollama pull ${model}' if the model isn't installed yet). Original error: ${err}`,
-        );
-      }
+      const res = await fetchWithOllamaRetry(
+        baseUrl,
+        { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) },
+        model,
+      );
       if (!res.ok) {
         const errJson = await res.json().catch(() => ({}));
         throw new Error(`Ollama API error ${res.status}: ${JSON.stringify(errJson).slice(0, 500)}`);

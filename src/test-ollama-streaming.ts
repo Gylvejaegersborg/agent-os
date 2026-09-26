@@ -19,7 +19,7 @@
 // Run with: node dist/test-ollama-streaming.js
 
 import "./test-helpers/isolate.js";
-import { createOllamaModel } from "./core/models/real.js";
+import { createOllamaModel, fetchWithOllamaRetry } from "./core/models/real.js";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) {
@@ -115,11 +115,73 @@ async function testFrameSplitAcrossChunks(): Promise<void> {
   assert(result.content === "split-frame-ok", `a frame split mid-JSON across two chunks still parses correctly (got "${result.content}")`);
 }
 
+async function testRetriesConnectionFailureThenSucceeds(): Promise<void> {
+  console.log("\n-- 5. fetchWithOllamaRetry() retries a connection-level failure, then succeeds --");
+  const real = global.fetch;
+  let calls = 0;
+  global.fetch = (async () => {
+    calls++;
+    if (calls < 3) throw new TypeError("fetch failed"); // simulates Ollama's server not accepting connections YET
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const res = await fetchWithOllamaRetry("http://localhost:11434/v1/chat/completions", {}, "test-model", 3, 10);
+    assert(res.status === 200, "the retried call eventually succeeds once the connection stops failing");
+    assert(calls === 3, `fetch was actually retried (attempted exactly 3 times before succeeding, got ${calls})`);
+  } finally {
+    global.fetch = real;
+  }
+}
+
+async function testRetriesExhaustedThrowsClearError(): Promise<void> {
+  console.log("\n-- 6. Exhausting all retry attempts throws a clear, actionable error --");
+  const real = global.fetch;
+  let calls = 0;
+  global.fetch = (async () => {
+    calls++;
+    throw new TypeError("fetch failed");
+  }) as typeof fetch;
+  try {
+    let threw = false;
+    try {
+      await fetchWithOllamaRetry("http://localhost:11434/v1/chat/completions", {}, "test-model", 3, 10);
+    } catch (err) {
+      threw = true;
+      assert((err as Error).message.includes("after 3 attempts"), `the error names how many attempts were made (got: "${(err as Error).message}")`);
+      assert((err as Error).message.includes("ollama serve"), "the error still gives the same actionable troubleshooting hint as before retry existed");
+    }
+    assert(threw, "exhausting all attempts throws rather than hanging or silently resolving");
+    assert(calls === 3, `fetch was attempted exactly 3 times, not more or fewer (got ${calls})`);
+  } finally {
+    global.fetch = real;
+  }
+}
+
+async function testHttpErrorResponseIsNotRetried(): Promise<void> {
+  console.log("\n-- 7. A real HTTP error RESPONSE (server up, request rejected) is NOT retried --");
+  const real = global.fetch;
+  let calls = 0;
+  global.fetch = (async () => {
+    calls++;
+    return new Response(JSON.stringify({ error: "model not found" }), { status: 404 });
+  }) as typeof fetch;
+  try {
+    const res = await fetchWithOllamaRetry("http://localhost:11434/v1/chat/completions", {}, "test-model", 3, 10);
+    assert(res.status === 404, "the 404 response is returned as-is");
+    assert(calls === 1, `an HTTP error response is NOT retried — only connection-level failures are (got ${calls} call(s))`);
+  } finally {
+    global.fetch = real;
+  }
+}
+
 async function main(): Promise<void> {
   await testTextStreaming();
   await testToolCallStreaming();
   await testMalformedFrameSkipped();
   await testFrameSplitAcrossChunks();
+  await testRetriesConnectionFailureThenSucceeds();
+  await testRetriesExhaustedThrowsClearError();
+  await testHttpErrorResponseIsNotRetried();
 
   if (process.exitCode === 1) {
     console.error("\nSome ollama-streaming tests FAILED.");
