@@ -22,6 +22,7 @@ import {
   DEFAULT_HARD_BLOCKLIST,
   SkillRegistry,
   loadConfiguredHooks,
+  seedAllowRules,
   type SandboxPolicy,
 } from "../core/index.js";
 import { startGateway } from "./server.js";
@@ -77,13 +78,6 @@ function buildEngineerPolicy() {
       },
       { tool: "shell", decision: "allow" as const, argsPattern: SAFE_READONLY },
       { tool: "read_file", decision: "allow" as const },
-      // Harness tools that can't touch the filesystem or a shell — the same
-      // ones every other agent uses freely. Without these, Claude's first
-      // `basespace` read in a chat sat in the Approvals queue.
-      ...["basespace", "basespace-add", "recall-memory", "skill", "nominate-memory", "record-artifact"].map((tool) => ({
-        tool,
-        decision: "allow" as const,
-      })),
       // No further rules: anything else (shell edits, git add/commit/push,
       // npm/apt installs, rm, edit_file, write_file, ...) falls through to
       // the default "ask".
@@ -194,6 +188,16 @@ async function main(): Promise<void> {
   // /agents return real data on a fresh data dir instead of an empty list.
   const roster = await seedDefaultAgents();
   console.log(`[gateway] agent registry ready: ${roster.map((a) => a.id).join(", ")}`);
+
+  // Default "always allow" entries (allowlist.ts): every agent may read and
+  // write BaseSpace without an approval, and Claude — the one agent whose
+  // policy asks by default — may also use the other harness tools that
+  // can't touch files or a shell. Editable per agent from the Workbench.
+  const seededRules = await seedAllowRules([
+    ...roster.flatMap((a) => ["basespace", "basespace-add"].map((toolName) => ({ agentId: a.id, toolName }))),
+    ...["recall-memory", "skill", "nominate-memory", "record-artifact"].map((toolName) => ({ agentId: ENGINEER_AGENT_ID, toolName })),
+  ]);
+  if (seededRules) console.log(`[gateway] allowlist: seeded ${seededRules} default rule(s)`);
 
   // These three are each independently tested and already safety-scoped
   // on their own terms (agent-loop.ts): subagents don't recursively spawn

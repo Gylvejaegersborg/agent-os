@@ -27,6 +27,10 @@ import {
   newSessionId,
   createStubModel,
   createStubWorker,
+  addAllowRule,
+  removeAllowRule,
+  listAllowRules,
+  seedAllowRules,
 } from "./core/index.js";
 
 function assert(cond: boolean, msg: string): void {
@@ -185,12 +189,41 @@ async function testApprovedCallGoesThroughOnce(): Promise<void> {
   assert(/waiting for approval/i.test(fourth.finalContent), "a rejected request never lets the call through");
 }
 
+async function testAllowlist(): Promise<void> {
+  console.log("\n-- 6. per-agent allowlist ('always allow') --");
+  const agentId = "approvals-demo-allowlist";
+  installPermissionPolicy({ agentId, rules: [{ tool: "shell", decision: "ask" }] });
+  const run = (cmd: string) =>
+    runTurn({ sessionId: newSessionId(), agentId, userMessage: `run shell: ${cmd}`, model: createStubModel(), worker: createStubWorker() });
+
+  await assertThrows(() => addAllowRule({ agentId, toolName: "shell" }), "shell can't be always-allowed for every call");
+  await assertThrows(() => addAllowRule({ agentId, toolName: "shell", args: { command: "git push origin main" } }), "git push can never be allowlisted");
+
+  const rule = await addAllowRule({ agentId, toolName: "shell", args: { command: "echo hi" } });
+  const again = await addAllowRule({ agentId, toolName: "shell", args: { command: "echo hi" } });
+  assert(rule.id === again.id, "adding the same rule twice keeps one rule");
+  assert(!/waiting for approval/i.test((await run("echo hi")).finalContent), "an allowlisted exact call runs without approval");
+  assert(/waiting for approval/i.test((await run("echo bye")).finalContent), "a different call still asks");
+  assert((await listApprovals({ status: "pending", agentId })).length === 1, "only the non-allowlisted call created an approval");
+
+  await removeAllowRule(rule.id);
+  assert(/waiting for approval/i.test((await run("echo hi")).finalContent), "removing the rule makes the call ask again");
+
+  const other = "approvals-demo-seed";
+  assert((await seedAllowRules([{ agentId: other, toolName: "basespace" }])) === 1, "seeding adds a default rule");
+  assert((await seedAllowRules([{ agentId: other, toolName: "basespace" }])) === 0, "seeding is idempotent");
+  const [seeded] = await listAllowRules(other);
+  await removeAllowRule(seeded!.id);
+  assert((await seedAllowRules([{ agentId: other, toolName: "basespace" }])) === 0, "a default the operator removed isn't re-added");
+}
+
 async function main(): Promise<void> {
   await testRegistryBasics();
   await testTerminalStatusSticks();
   await testAskWithoutOnAskCreatesDurableApproval();
   await testAskWithOnAskStaysSynchronousAndDurable();
   await testApprovedCallGoesThroughOnce();
+  await testAllowlist();
 
   if (process.exitCode === 1) {
     console.error("\nSome approvals tests FAILED.");

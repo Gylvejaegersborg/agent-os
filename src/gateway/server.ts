@@ -86,6 +86,10 @@ import {
   loadSnapshot,
   loadOverlay,
   removeOverlayItem,
+  listAllowRules,
+  addAllowRule,
+  removeAllowRule,
+  EXACT_ONLY_TOOLS,
 } from "../core/index.js";
 import { checkPathSandbox } from "../core/permissions.js";
 import type { SessionStatus, ApprovalStatus, ApprovalRequest, TaskStatus, NominationStatus } from "../core/types.js";
@@ -239,8 +243,8 @@ async function resumeAfterDecision(deps: GatewayDeps, approval: ApprovalRequest)
     const call = `${approval.toolName} ${JSON.stringify(approval.args)}`.slice(0, 400);
     const userMessage =
       approval.status === "approved"
-        ? `[Approvals] Approved: ${call}. Go ahead and run exactly that call now, then carry on with what you were doing.`
-        : `[Approvals] Rejected: ${call}. Don't run it. Say what you'd do instead, or ask what the operator wants.`;
+        ? `[Approvals] Approved ${approval.id}: ${call}. Go ahead and run exactly that call now, then carry on with what you were doing.`
+        : `[Approvals] Rejected ${approval.id}: ${call}. Don't run it. Say what you'd do instead, or ask what the operator wants.`;
     const model = (await createModelForAgent(session.agentId)) ?? deps.model;
     await runTurn({
       sessionId: session.id,
@@ -857,6 +861,20 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         note: typeof body.note === "string" ? body.note : undefined,
       };
       try {
+        // {always: "tool"} also allowlists every call of this tool for the
+        // agent, {always: "exact"} just this exact call — added before the
+        // approval so an unsafe "always" fails without approving anything.
+        if (segments[2] === "approve" && (body.always === "tool" || body.always === "exact")) {
+          const pending = await getApproval(segments[1]!);
+          if (!pending) throw new Error(`no such approval request: ${segments[1]}`);
+          await addAllowRule({
+            agentId: pending.agentId,
+            toolName: pending.toolName,
+            args: body.always === "exact" ? pending.args : undefined,
+            note: `from approval ${pending.id}`,
+            createdBy: extra.resolvedBy,
+          });
+        }
         const resolved =
           segments[2] === "approve" ? await approveRequest(segments[1]!, extra) : await rejectRequest(segments[1]!, extra);
         sendJson(res, 200, resolved);
@@ -867,6 +885,39 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
       } catch (err) {
         sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
       }
+      return;
+    }
+  }
+
+  // ---- Allowlist (allowlist.ts) — per-agent "always allow" rules ----
+  if (segments[0] === "allowlist") {
+    if (method === "GET" && segments.length === 1) {
+      sendJson(res, 200, { rules: await listAllowRules(url.searchParams.get("agentId") ?? undefined), exactOnlyTools: EXACT_ONLY_TOOLS });
+      return;
+    }
+    if (method === "POST" && segments.length === 1) {
+      const body = await readRequestBody(req);
+      if (typeof body.agentId !== "string" || typeof body.toolName !== "string") {
+        sendJson(res, 400, { error: "agentId and toolName are required" });
+        return;
+      }
+      try {
+        const rule = await addAllowRule({
+          agentId: body.agentId,
+          toolName: body.toolName,
+          args: body.args && typeof body.args === "object" ? (body.args as Record<string, unknown>) : undefined,
+          note: typeof body.note === "string" ? body.note : undefined,
+          createdBy: typeof body.createdBy === "string" ? body.createdBy : undefined,
+        });
+        sendJson(res, 201, rule);
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+    if (method === "DELETE" && segments.length === 2) {
+      const removed = await removeAllowRule(segments[1]!);
+      sendJson(res, removed ? 200 : 404, removed ? { ok: true } : { error: "no such rule" });
       return;
     }
   }

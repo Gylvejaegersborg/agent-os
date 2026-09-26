@@ -120,6 +120,9 @@ export function installPermissionPolicy(policy: PermissionPolicy): void {
     // same way agent-loop.ts's dispatchTool() does for subagent.js/
     // memory.js — approvals.ts has no need to import permissions.ts, but
     // keeping this edge lazy means adding one never risks a cycle.
+    // On the agent's allowlist ("always allow") — no approval needed.
+    const { findAllowRule } = await import("./allowlist.js");
+    if (await findAllowRule(ctx.agentId, toolName, args)) return;
     const { requestApproval, consumeApproval } = await import("./approvals.js");
     // Already approved by the operator (the Approvals tab) — let exactly
     // that call through once instead of asking again.

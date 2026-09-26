@@ -16,6 +16,7 @@ import { project, appendEvent } from "./eventlog.js";
 import { publishEvent } from "./eventbus.js";
 import { generateId } from "./id.js";
 import type { ApprovalRequest, ApprovalStatus } from "./types.js";
+import { stableJson } from "./allowlist.js";
 
 const APPROVALS_STREAM = "approvals";
 
@@ -116,18 +117,6 @@ export async function approveRequest(id: string, extra: { resolvedBy?: string; n
 
 export async function rejectRequest(id: string, extra: { resolvedBy?: string; note?: string } = {}): Promise<ApprovalRequest> {
   return resolveApproval(id, "rejected", extra);
-}
-
-/** Key-order-independent JSON, so {a,b} and {b,a} count as the same args. */
-function stableJson(v: unknown): string {
-  if (Array.isArray(v)) return `[${v.map(stableJson).join(",")}]`;
-  if (v && typeof v === "object") {
-    return `{${Object.keys(v as object)
-      .sort()
-      .map((k) => `${JSON.stringify(k)}:${stableJson((v as Record<string, unknown>)[k])}`)
-      .join(",")}}`;
-  }
-  return JSON.stringify(v);
 }
 
 /** If the operator already approved exactly this call (same agent, tool and
