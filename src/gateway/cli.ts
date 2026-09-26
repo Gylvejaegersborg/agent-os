@@ -77,6 +77,13 @@ function buildEngineerPolicy() {
       },
       { tool: "shell", decision: "allow" as const, argsPattern: SAFE_READONLY },
       { tool: "read_file", decision: "allow" as const },
+      // Harness tools that can't touch the filesystem or a shell — the same
+      // ones every other agent uses freely. Without these, Claude's first
+      // `basespace` read in a chat sat in the Approvals queue.
+      ...["basespace", "basespace-add", "recall-memory", "skill", "nominate-memory", "record-artifact"].map((tool) => ({
+        tool,
+        decision: "allow" as const,
+      })),
       // No further rules: anything else (shell edits, git add/commit/push,
       // npm/apt installs, rm, edit_file, write_file, ...) falls through to
       // the default "ask".

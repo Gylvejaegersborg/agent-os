@@ -123,7 +123,7 @@ async function testAskWithoutOnAskCreatesDurableApproval(): Promise<void> {
   });
 
   assert(
-    /blocked pending approval/i.test(result.finalContent),
+    /waiting for approval/i.test(result.finalContent),
     `the tool call is blocked with a reference to the pending approval (got: "${result.finalContent}")`,
   );
 
@@ -155,7 +155,7 @@ async function testAskWithOnAskStaysSynchronousAndDurable(): Promise<void> {
   });
 
   assert(onAskCalls === 1, `the synchronous onAsk callback was invoked exactly once (got ${onAskCalls})`);
-  assert(!/blocked pending approval/i.test(result.finalContent), "no durable-approval block message appears");
+  assert(!/waiting for approval/i.test(result.finalContent), "no durable-approval block message appears");
 
   const anyForSession = await listApprovals({ agentId, sessionId });
   assert(anyForSession.length === 0, "no ApprovalRequest was created when a synchronous onAsk callback handled it");

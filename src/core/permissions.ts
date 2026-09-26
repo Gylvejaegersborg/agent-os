@@ -132,9 +132,9 @@ export function installPermissionPolicy(policy: PermissionPolicy): void {
     return {
       block: true,
       reason:
-        `blocked pending approval: tool "${toolName}" requires approval — request ${request.id} has been ` +
-        `recorded (status: pending). Call approveRequest()/rejectRequest() (approvals.ts) to resolve it, then ` +
-        `issue a new turn/tool call.`,
+        `waiting for approval: "${toolName}" needs the operator's OK (request ${request.id}). ` +
+        `Approve or reject it in the Workbench's Approvals tab — replying "approved" in chat doesn't resolve it — ` +
+        `then ask again.`,
     };
   });
 }
