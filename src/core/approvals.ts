@@ -67,6 +67,10 @@ async function projectApprovals(): Promise<ApprovalProjectionState> {
         resolvedBy: p.resolvedBy,
         resolutionNote: p.note,
       });
+    } else if (event.type === "approval.consumed") {
+      const p = event.payload as any;
+      const existing = state.approvals.get(p.approvalId);
+      if (existing) state.approvals.set(p.approvalId, { ...existing, usedAt: event.timestamp });
     }
     return state;
   });
@@ -112,4 +116,34 @@ export async function approveRequest(id: string, extra: { resolvedBy?: string; n
 
 export async function rejectRequest(id: string, extra: { resolvedBy?: string; note?: string } = {}): Promise<ApprovalRequest> {
   return resolveApproval(id, "rejected", extra);
+}
+
+/** Key-order-independent JSON, so {a,b} and {b,a} count as the same args. */
+function stableJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(stableJson).join(",")}]`;
+  if (v && typeof v === "object") {
+    return `{${Object.keys(v as object)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${stableJson((v as Record<string, unknown>)[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(v);
+}
+
+/** If the operator already approved exactly this call (same agent, tool and
+ *  arguments) and it hasn't been used yet, mark it used and return it — the
+ *  permission hook then lets the call through. One approval covers one
+ *  call; anything different asks again. */
+export async function consumeApproval(input: {
+  agentId: string;
+  toolName: string;
+  args: Record<string, unknown>;
+}): Promise<ApprovalRequest | undefined> {
+  const wanted = stableJson(input.args);
+  const match = (await listApprovals({ status: "approved", agentId: input.agentId })).find(
+    (a) => !a.usedAt && a.toolName === input.toolName && stableJson(a.args) === wanted,
+  );
+  if (!match) return undefined;
+  await appendEvent(APPROVALS_STREAM, "approval.consumed", { approvalId: match.id });
+  return match;
 }

@@ -113,6 +113,9 @@ export interface ApprovalRequest {
    *  for where real auth is expected to live, once a gateway exists). */
   resolvedBy?: string;
   resolutionNote?: string;
+  /** When an approved request was used up by the tool call it approved
+   *  (see approvals.ts's consumeApproval). One approval = one call. */
+  usedAt?: string;
 }
 
 export type WorkerLifecycleStatus = "starting" | "running" | "stopped" | "error";

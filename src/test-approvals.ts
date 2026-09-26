@@ -161,11 +161,36 @@ async function testAskWithOnAskStaysSynchronousAndDurable(): Promise<void> {
   assert(anyForSession.length === 0, "no ApprovalRequest was created when a synchronous onAsk callback handled it");
 }
 
+async function testApprovedCallGoesThroughOnce(): Promise<void> {
+  console.log("\n-- 5. once approved, the same call goes through — exactly once --");
+  const agentId = "approvals-demo-consume";
+  installPermissionPolicy({ agentId, rules: [{ tool: "shell", decision: "ask" }] });
+  const run = () => runTurn({ sessionId: newSessionId(), agentId, userMessage: "run shell: echo hi", model: createStubModel(), worker: createStubWorker() });
+
+  await run();
+  const [first] = await listApprovals({ status: "pending", agentId });
+  assert(!!first, "the first attempt is parked as a pending approval");
+  await approveRequest(first!.id);
+
+  const second = await run();
+  assert(!/waiting for approval/i.test(second.finalContent), "after approval, the identical call runs instead of asking again");
+  const used = await getApproval(first!.id);
+  assert(!!used?.usedAt, "the approval is marked used by that call");
+
+  const third = await run();
+  assert(/waiting for approval/i.test(third.finalContent), "a used approval doesn't cover a second call — it asks again");
+
+  await rejectRequest((await listApprovals({ status: "pending", agentId }))[0]!.id);
+  const fourth = await run();
+  assert(/waiting for approval/i.test(fourth.finalContent), "a rejected request never lets the call through");
+}
+
 async function main(): Promise<void> {
   await testRegistryBasics();
   await testTerminalStatusSticks();
   await testAskWithoutOnAskCreatesDurableApproval();
   await testAskWithOnAskStaysSynchronousAndDurable();
+  await testApprovedCallGoesThroughOnce();
 
   if (process.exitCode === 1) {
     console.error("\nSome approvals tests FAILED.");

@@ -88,7 +88,7 @@ import {
   removeOverlayItem,
 } from "../core/index.js";
 import { checkPathSandbox } from "../core/permissions.js";
-import type { SessionStatus, ApprovalStatus, TaskStatus, NominationStatus } from "../core/types.js";
+import type { SessionStatus, ApprovalStatus, ApprovalRequest, TaskStatus, NominationStatus } from "../core/types.js";
 import type { SandboxPolicy } from "../core/permissions.js";
 import type { ConfiguredHook } from "../core/configured-hooks.js";
 import type { ArtifactType } from "../core/artifacts.js";
@@ -226,6 +226,39 @@ export function startGateway(deps: GatewayDeps, port = 0): Promise<GatewayHandle
       });
     });
   });
+}
+
+/** Runs one follow-up turn in the session whose tool call was waiting on
+ *  an approval. On approve the agent re-issues the call, which the
+ *  permission hook lets through once (approvals.ts's consumeApproval); on
+ *  reject it's told not to. Best effort: errors are logged, not thrown. */
+async function resumeAfterDecision(deps: GatewayDeps, approval: ApprovalRequest): Promise<void> {
+  try {
+    const session = await getSession(approval.sessionId);
+    if (!session || session.status === "cancelled") return;
+    const call = `${approval.toolName} ${JSON.stringify(approval.args)}`.slice(0, 400);
+    const userMessage =
+      approval.status === "approved"
+        ? `[Approvals] Approved: ${call}. Go ahead and run exactly that call now, then carry on with what you were doing.`
+        : `[Approvals] Rejected: ${call}. Don't run it. Say what you'd do instead, or ask what the operator wants.`;
+    const model = (await createModelForAgent(session.agentId)) ?? deps.model;
+    await runTurn({
+      sessionId: session.id,
+      agentId: session.agentId,
+      userMessage,
+      model,
+      worker: deps.worker,
+      skills: deps.skills,
+      enableSubagents: deps.enableSubagents,
+      enableMemoryNominations: deps.enableMemoryNominations,
+      enableArtifacts: deps.enableArtifacts,
+      enableBaseSpace: deps.enableBaseSpace,
+      sandboxPolicy: deps.sandboxPolicy,
+      maxToolHops: deps.maxToolHops,
+    });
+  } catch (err) {
+    console.error(`[gateway] resuming session ${approval.sessionId} after approval ${approval.id} failed:`, err instanceof Error ? err.message : err);
+  }
 }
 
 async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDeps): Promise<void> {
@@ -827,6 +860,10 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         const resolved =
           segments[2] === "approve" ? await approveRequest(segments[1]!, extra) : await rejectRequest(segments[1]!, extra);
         sendJson(res, 200, resolved);
+        // Resume the conversation that was waiting on this — approving in
+        // the Approvals tab shouldn't also require typing "go ahead".
+        // Opt out per request with {"resume": false}.
+        if (body.resume !== false) void resumeAfterDecision(deps, resolved);
       } catch (err) {
         sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
       }

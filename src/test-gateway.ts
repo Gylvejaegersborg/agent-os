@@ -177,6 +177,19 @@ async function main(): Promise<void> {
     const reApproveRes = await fetch(`${base}/approvals/${approvalId}/approve`, { method: "POST" });
     assert(reApproveRes.status === 409, "re-approving an already-resolved request returns 409, not 500");
 
+    // Approving resumes the waiting conversation on its own (a follow-up
+    // turn in that session) — wait for it so it can't bleed into the SSE
+    // checks below.
+    let resumed = false;
+    for (let i = 0; i < 50 && !resumed; i++) {
+      const hist = (await (await fetch(`${base}/sessions/${approvalSession.id}/history`)).json()) as any;
+      const msgs: any[] = hist.messages ?? hist.history ?? hist;
+      const at = msgs.findIndex((m) => m.role === "user" && String(m.content).startsWith("[Approvals] Approved"));
+      resumed = at >= 0 && msgs.slice(at + 1).some((m) => m.role === "assistant");
+      if (!resumed) await new Promise((r) => setTimeout(r, 100));
+    }
+    assert(resumed, "approving resumes the waiting session with a follow-up turn");
+
     console.log("\n-- 7. Live events over SSE actually stream real activity --");
     const sseSessionRes = await fetch(`${base}/sessions`, {
       method: "POST",

@@ -120,7 +120,10 @@ export function installPermissionPolicy(policy: PermissionPolicy): void {
     // same way agent-loop.ts's dispatchTool() does for subagent.js/
     // memory.js — approvals.ts has no need to import permissions.ts, but
     // keeping this edge lazy means adding one never risks a cycle.
-    const { requestApproval } = await import("./approvals.js");
+    const { requestApproval, consumeApproval } = await import("./approvals.js");
+    // Already approved by the operator (the Approvals tab) — let exactly
+    // that call through once instead of asking again.
+    if (await consumeApproval({ agentId: ctx.agentId, toolName, args })) return;
     const label = findMatchingRule(policy, toolName, args)?.label;
     const request = await requestApproval({
       agentId: ctx.agentId,
@@ -133,8 +136,8 @@ export function installPermissionPolicy(policy: PermissionPolicy): void {
       block: true,
       reason:
         `waiting for approval: "${toolName}" needs the operator's OK (request ${request.id}). ` +
-        `Approve or reject it in the Workbench's Approvals tab — replying "approved" in chat doesn't resolve it — ` +
-        `then ask again.`,
+        `Approve or reject it in the Workbench's Approvals tab (replying "approved" in chat doesn't resolve it); ` +
+        `the conversation picks up again on its own once you decide.`,
     };
   });
 }
