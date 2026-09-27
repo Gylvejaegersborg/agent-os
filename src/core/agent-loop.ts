@@ -813,6 +813,57 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   return { sessionId, finalContent, toolCalled, cancelled: cancelled || undefined, usage };
 }
 
+/** Runs a tool call the operator approved in the Approvals tab, in the
+ *  session that asked for it, and records it exactly like a call the model
+ *  made inside a turn (tool.call.start/end events + a tool message). The
+ *  approval IS the permission, so this skips the `tool.before` hooks —
+ *  but everything else still applies: the Worker is the sandboxed one and
+ *  file tools go through the same sandbox checks.
+ *
+ *  Why not just tell the model "approved, run it again"? Smaller models
+ *  often don't re-issue the identical call, so the approval went nowhere. */
+export async function executeApprovedCall(opts: {
+  sessionId: string;
+  agentId: string;
+  toolCall: { name: string; args: Record<string, unknown> };
+  model: ModelAdapter;
+  worker: Worker;
+  skills?: SkillRegistry;
+  enableSubagents?: boolean;
+  enableMemoryNominations?: boolean;
+  enableArtifacts?: boolean;
+  sandboxPolicy?: SandboxPolicy;
+}): Promise<ToolDispatchResult> {
+  const { sessionId, agentId, toolCall } = opts;
+  await appendEvent(sessionStream(sessionId), "tool.call.start", { ...toolCall, approved: true });
+  await publishEvent("tool.call.start", { sessionId, agentId, ...toolCall });
+  const toolDef = getToolDefinition(toolCall.name);
+  const result = await withTimeout(
+    dispatchTool(toolCall, {
+      worker: opts.worker,
+      skills: opts.skills,
+      agentId,
+      sessionId,
+      model: opts.model,
+      enableSubagents: opts.enableSubagents,
+      enableMemoryNominations: opts.enableMemoryNominations,
+      enableArtifacts: opts.enableArtifacts,
+      sandboxPolicy: opts.sandboxPolicy,
+    }),
+    toolDef?.timeoutMs,
+    () => ({ ok: false, output: "", error: `tool "${toolCall.name}" timed out after ${toolDef?.timeoutMs}ms` }),
+  );
+  await appendEvent(sessionStream(sessionId), "tool.call.end", { ...toolCall, result, approved: true });
+  await publishEvent("tool.call.end", { sessionId, agentId, ...toolCall, result });
+  await fireHook("tool.after", { agentId, sessionId, payload: { ...toolCall, result } });
+  await appendEvent(sessionStream(sessionId), "session.message", {
+    role: "tool",
+    content: result.ok ? result.output : `error: ${result.error}`,
+    call: `${toolCall.name} ${JSON.stringify(toolCall.args ?? {})}`.slice(0, 300),
+  });
+  return result;
+}
+
 export function newSessionId(): string {
   return generateId();
 }

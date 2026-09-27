@@ -90,6 +90,8 @@ import {
   addAllowRule,
   removeAllowRule,
   EXACT_ONLY_TOOLS,
+  executeApprovedCall,
+  consumeApproval,
 } from "../core/index.js";
 import { checkPathSandbox } from "../core/permissions.js";
 import type { SessionStatus, ApprovalStatus, ApprovalRequest, TaskStatus, NominationStatus } from "../core/types.js";
@@ -241,11 +243,31 @@ async function resumeAfterDecision(deps: GatewayDeps, approval: ApprovalRequest)
     const session = await getSession(approval.sessionId);
     if (!session || session.status === "cancelled") return;
     const call = `${approval.toolName} ${JSON.stringify(approval.args)}`.slice(0, 400);
-    const userMessage =
-      approval.status === "approved"
-        ? `[Approvals] Approved ${approval.id}: ${call}. Go ahead and run exactly that call now, then carry on with what you were doing.`
-        : `[Approvals] Rejected ${approval.id}: ${call}. Don't run it. Say what you'd do instead, or ask what the operator wants.`;
     const model = (await createModelForAgent(session.agentId)) ?? deps.model;
+    let userMessage: string;
+    if (approval.status === "approved") {
+      // Run the approved call ourselves, then let the agent continue from its
+      // result — relying on the model to re-issue the identical call was
+      // unreliable. Marked used so it can't also be replayed by the model.
+      await consumeApproval({ agentId: approval.agentId, toolName: approval.toolName, args: approval.args });
+      const result = await executeApprovedCall({
+        sessionId: session.id,
+        agentId: session.agentId,
+        toolCall: { name: approval.toolName, args: approval.args },
+        model,
+        worker: deps.worker,
+        skills: deps.skills,
+        enableSubagents: deps.enableSubagents,
+        enableMemoryNominations: deps.enableMemoryNominations,
+        enableArtifacts: deps.enableArtifacts,
+        sandboxPolicy: deps.sandboxPolicy,
+      });
+      userMessage =
+        `[Approvals] Approved ${approval.id}: ${call}. Go ahead and carry on — it has already been run for you ` +
+        `(${result.ok ? "it succeeded" : "it failed"}; the result is the tool message just above). Don't run it again.`;
+    } else {
+      userMessage = `[Approvals] Rejected ${approval.id}: ${call}. Don't run it. Say what you'd do instead, or ask what the operator wants.`;
+    }
     await runTurn({
       sessionId: session.id,
       agentId: session.agentId,
