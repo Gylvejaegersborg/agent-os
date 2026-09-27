@@ -13,6 +13,7 @@
 //      conjures a provider that isn't already available via env vars.
 // Run with: node dist/test-identity-wiring.js
 
+import "./test-helpers/isolate.js";
 import {
   registerAgentIdentity,
   getAgentIdentity,
@@ -90,9 +91,12 @@ async function main(): Promise<void> {
   });
   const anonMessages = anonRecordingModel.lastMessages();
   const anonSystemMessage = anonMessages?.find((m) => m.role === "system");
+  // The file-tools guidance (agent-loop.ts) is part of every system
+  // message now, so "no system message at all" no longer holds; what
+  // matters is that nothing identity-related is injected.
   assert(
-    anonSystemMessage === undefined,
-    "an agent with no registered identity (and nothing else to inject) gets no system message at all — same as pre-wiring behavior",
+    anonSystemMessage === undefined || (!anonSystemMessage.content.includes("# Agent Identity") && !anonSystemMessage.content.includes("You are")),
+    "an agent with no registered identity gets no identity block or persona text in its system message",
   );
   assert(anonTurnResult.finalContent.length > 0, "a turn for an unregistered agent still completes normally (construction never breaks)");
 

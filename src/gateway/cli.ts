@@ -210,7 +210,7 @@ async function main(): Promise<void> {
   // claims some of these (e.g. "subagent-delegation"), so leaving them
   // off made that claim false in practice.
   const handle = await startGateway(
-    { model, worker, skills, skillsDir, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true, enableBaseSpace: true, sandboxPolicy, configuredHooks },
+    { model, worker, skills, skillsDir, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true, enableBaseSpace: true, maxToolHops: 8, sandboxPolicy, configuredHooks },
     port,
   );
   console.log(`[gateway] listening on http://127.0.0.1:${handle.port}`);
