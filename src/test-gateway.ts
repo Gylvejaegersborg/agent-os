@@ -189,6 +189,13 @@ async function main(): Promise<void> {
       if (!resumed) await new Promise((r) => setTimeout(r, 100));
     }
     assert(resumed, "approving resumes the waiting session with a follow-up turn");
+    const histAfter = (await (await fetch(`${base}/sessions/${approvalSession.id}/history`)).json()) as any;
+    const after: any[] = histAfter.messages ?? histAfter.history ?? histAfter;
+    const ranAt = after.findIndex((m) => m.role === "tool" && String(m.call ?? "").startsWith("shell "));
+    const toldAt = after.findIndex((m) => m.role === "user" && String(m.content).startsWith("[Approvals] Approved"));
+    assert(ranAt >= 0 && ranAt < toldAt, "the gateway ran the approved call itself, before telling the agent it was approved");
+    const used = (await (await fetch(`${base}/approvals/${approvalId}`)).json()) as any;
+    assert(!!used.usedAt, "the approval is marked as used by that run");
 
     console.log("\n-- 7. Live events over SSE actually stream real activity --");
     const sseSessionRes = await fetch(`${base}/sessions`, {
