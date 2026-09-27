@@ -205,7 +205,12 @@ async function getCompactionState(sessionId: string): Promise<CompactionState> {
  *  compacted — so every existing caller/test that never triggers
  *  compaction at all sees zero behavior change. */
 export async function getModelFacingHistory(sessionId: string): Promise<ModelMessage[]> {
-  const [full, compaction] = await Promise.all([getSessionHistory(sessionId), getCompactionState(sessionId)]);
+  const [raw, compaction] = await Promise.all([getSessionHistory(sessionId), getCompactionState(sessionId)]);
+  // Tool results carry the call that produced them — show it to the model.
+  const full = raw.map((m) => {
+    const call = (m as ModelMessage & { call?: string }).call;
+    return m.role === "tool" && call ? { role: m.role, content: `[${call}]\n${m.content}` } : m;
+  });
   if (compaction.throughIndex === 0) return full;
   const remaining = full.slice(compaction.throughIndex);
   return [{ role: "system", content: `[Summary of earlier conversation, compacted to stay within context limits]\n${compaction.summary}` }, ...remaining];
@@ -701,6 +706,12 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
         break;
       }
 
+      // Text the model wrote alongside the tool call ("Let me check your
+      // todos…") is part of its answer — keep it, or it streams in live
+      // and then vanishes when the client re-reads the history.
+      if (response.content?.trim()) {
+        await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: response.content });
+      }
       await appendEvent(sessionStream(sessionId), "tool.call.start", response.toolCall);
       await publishEvent("tool.call.start", { sessionId, agentId, ...response.toolCall });
       // A registered ToolDefinition's timeoutMs (tool-registry.ts) is
@@ -734,9 +745,14 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       await publishEvent("tool.call.end", { sessionId, agentId, ...response.toolCall, result });
       await fireHook("tool.after", { agentId, sessionId, payload: { ...response.toolCall, result } });
 
+      // Record which call produced the result: the history keeps no other
+      // record of the model's own tool call, and a model reading back a
+      // bare result can't tell what it asked for (see getModelFacingHistory).
+      const callLabel = `${response.toolCall.name} ${JSON.stringify(response.toolCall.args ?? {})}`.slice(0, 300);
       await appendEvent(sessionStream(sessionId), "session.message", {
         role: "tool",
         content: result.ok ? result.output : `error: ${result.error}`,
+        call: callLabel,
       });
       hops++;
       // Re-checked immediately after the tool actually ran (not just at
@@ -763,6 +779,16 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled, error: message, usage } });
     await publishEvent("agent.turn.end", { sessionId, agentId, finalContent, toolCalled, cancelled, error: message, usage });
     throw err;
+  }
+
+  // Used up every tool step without a final answer — say so instead of
+  // ending the turn with nothing (which reads as the reply vanishing).
+  if (!cancelled && !finalContent && hops >= maxHops) {
+    finalContent =
+      `I used all ${maxHops} tool steps I get per message before finishing` +
+      (toolCalled ? ` (last one: ${toolCalled})` : "") +
+      `. Say "continue" and I'll pick up from here.`;
+    await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent, truncated: true });
   }
 
   if (cancelled) {

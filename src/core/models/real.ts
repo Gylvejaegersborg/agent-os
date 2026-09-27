@@ -67,12 +67,20 @@ function detectAnthropicAuthStyle(apiKey: string): "api-key" | "oauth-bearer" {
 
 function toAnthropicMessages(messages: ModelMessage[]): { system?: string; messages: unknown[] } {
   const system = messages.find((m) => m.role === "system")?.content;
-  const rest = messages
-    .filter((m) => m.role !== "system")
-    .map((m) => ({
-      role: m.role === "assistant" ? "assistant" : m.role === "tool" ? "user" : "user",
-      content: m.role === "tool" ? [{ type: "tool_result", content: m.content }] : m.content,
-    }));
+  // Tool results go back as plain user text: the session history doesn't
+  // keep the model's tool_use blocks, and a tool_result block without its
+  // matching tool_use id is rejected by the API (400). Consecutive
+  // same-role messages are merged so roles always alternate.
+  const rest: { role: "user" | "assistant"; content: string }[] = [];
+  for (const m of messages) {
+    if (m.role === "system") continue;
+    const role = m.role === "assistant" ? "assistant" : "user";
+    const content = m.role === "tool" ? `Tool result:\n${m.content}` : m.content;
+    const last = rest[rest.length - 1];
+    if (last && last.role === role) last.content += `\n\n${content}`;
+    else rest.push({ role, content });
+  }
+  if (rest[0]?.role === "assistant") rest.unshift({ role: "user", content: "(conversation continues)" });
   return { system, messages: rest };
 }
 
