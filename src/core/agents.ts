@@ -23,6 +23,7 @@ import { getAgentControlState, type AgentControlState } from "./controls.js";
 import { listSessions } from "./session.js";
 import { listTasks } from "./tasks.js";
 import { computeMetricsSnapshot, type MetricsSnapshot } from "./observability.js";
+import { appendEvent, project } from "./eventlog.js";
 
 export type AgentLiveStatus = "active" | "idle";
 
@@ -33,6 +34,8 @@ export interface AgentRecord {
   role?: string;
   capabilities: string[];
   defaultModel?: string;
+  /** Manager's agent id; absent = reports to the operator. */
+  reportsTo?: string;
   status: AgentLiveStatus;
   /** Board controls (controls.ts): pause state, budget and this period's
    *  token use. `control.blocked` says why a new turn would be refused. */
@@ -66,6 +69,7 @@ export interface RegisterAgentInput {
   role?: string;
   capabilities?: string[];
   defaultModel?: string;
+  reportsTo?: string;
 }
 
 /** Registers a new authoritative agent — identity (identity.ts) plus, if
@@ -82,6 +86,7 @@ export async function registerAgent(input: RegisterAgentInput): Promise<AgentRec
     persona: input.persona,
     role: input.role,
     capabilities: input.capabilities,
+    ...(input.reportsTo ? { reportsTo: input.reportsTo } : {}),
   });
   if (input.defaultModel) {
     const { setAgentDefaultModel } = await import("./models/real.js");
@@ -99,7 +104,7 @@ export async function registerAgent(input: RegisterAgentInput): Promise<AgentRec
  *  it patched. */
 export async function updateAgent(
   id: string,
-  patch: Partial<Pick<RegisterAgentInput, "name" | "persona" | "role" | "capabilities" | "defaultModel">>,
+  patch: Partial<Pick<RegisterAgentInput, "name" | "persona" | "role" | "capabilities" | "defaultModel">> & { reportsTo?: string | null },
 ): Promise<AgentRecord | undefined> {
   const { defaultModel, ...identityPatch } = patch;
   const updated = await updateAgentIdentity(id, identityPatch);
@@ -143,6 +148,7 @@ async function composeRecord(identity: AgentIdentity): Promise<AgentRecord> {
     role: identity.role,
     capabilities: identity.capabilities ?? [],
     defaultModel,
+    ...(identity.reportsTo ? { reportsTo: identity.reportsTo } : {}),
     ...live,
     control,
     metrics,
@@ -272,5 +278,24 @@ export async function seedDefaultAgents(): Promise<AgentRecord[]> {
     }
     results.push(existing ?? (await registerAgent(input)));
   }
+  await seedReportingLines();
   return results;
+}
+
+/** The team's default reporting lines, applied ONCE (a marker event records
+ *  it), so an org the operator later reshapes — including clearing a
+ *  manager — is never overwritten on the next start. Hemera leads the
+ *  artist team; Argus (oversight) and Claude (builder) report to the
+ *  operator directly. */
+const DEFAULT_REPORTS_TO: Record<string, string> = { nyx: "hemera", aether: "hemera", hermes: "hemera", theia: "hemera", mnemosyne: "hemera" };
+const ORG_SEED_STREAM = "org-seed";
+
+async function seedReportingLines(): Promise<void> {
+  const seeded = await project<boolean>(ORG_SEED_STREAM, false, (done, e) => done || e.type === "org.reporting.seeded");
+  if (seeded) return;
+  for (const [id, manager] of Object.entries(DEFAULT_REPORTS_TO)) {
+    const identity = await getAgentIdentity(id);
+    if (identity && !identity.reportsTo && (await getAgentIdentity(manager))) await updateAgentIdentity(id, { reportsTo: manager });
+  }
+  await appendEvent(ORG_SEED_STREAM, "org.reporting.seeded", {});
 }

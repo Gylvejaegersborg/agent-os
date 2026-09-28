@@ -361,19 +361,31 @@ Ordered so each step is safe before the next adds autonomy:
       Projects, "Serves" on projects/todos/threads.
 - [ ] Flows and BaseSpace team crons take a focus too (a standup focused
       on a goal). **[core]** **[gateway]**
-- [ ] **Reporting lines + delegation through tasks.** `reportsTo` on each
-      agent (Hemera → the others, Argus alongside), an agent inbox (tasks
-      assigned to it), and a `delegate` tool that creates a task for another
-      agent instead of chatting at it. Paperclip's acceptance rules: an
-      agent can't cancel work handed to it — it does it, marks it blocked,
-      or hands it back to its manager with a reason. Track request depth,
-      and bill a delegated task's tokens to whoever asked (billing codes).
-      Single assignee with atomic checkout (tasks.ts's revisioning already
-      gives the conflict check). **[core]** **[gateway]** **[UI]** an org
-      chart view over BaseSpace teams.
-- [ ] **Heartbeat work loop.** On each heartbeat an agent checks its inbox
-      and works the highest-priority task, instead of free-form prompts.
-      Only after budgets exist (done) and delegation exists. **[core]**
+- [x] **Reporting lines + delegation through tasks.** `reportsTo` on each
+      identity (seeded once: the artist team → Hemera; Hemera, Argus and
+      Claude → the operator; loops rejected). A work ledger
+      (`core/work.ts`) with Paperclip's rules: one assignee, atomic claim,
+      the assignee can't cancel — it finishes (`done`), says why not
+      (`blocked`), or hands it back to its manager; depth capped at 3;
+      delegating straight back to the requester refused; tokens recorded
+      per item and rolled up to the item that asked. Agents get `delegate`
+      and `work` tools plus a "your team" block each turn; items keep the
+      requesting thread's goal focus. A background runner
+      (`gateway/work-runner.ts`) works them one at a time, skips paused or
+      over-budget assignees, completes on a real answer, blocks on a turn
+      that stopped (refused tool, pending approval, out of steps), and posts
+      the outcome back into the requester's thread as a `[Work]` note (no
+      reply turn — no agent ping-pong). Verified live on the Claude CLI:
+      Hemera, focused on a goal, delegated captions to Nyx; Nyx wrote them to
+      a BaseSpace note linked to the goal and marked the item done; the
+      result appeared in Hemera's chat. **[core]** **[gateway]** `/work`
+      routes, MCP `assign_work`/`list_work`; **[UI]** Work in the Tasks
+      panel (assign, retry, reassign, cancel), Reports-to in the agent
+      editor, reporting lines in Teams.
+- [ ] **Heartbeat work loop.** On each heartbeat a lead (Hemera) reviews
+      open and blocked work for her reports and the goals they serve, and
+      re-plans or escalates — the runner already works items as they
+      arrive, so this is the management layer on top. **[core]**
 - [ ] **Governance gates.** Agent-proposed hires (a new agent) and a lead's
       plan for a goal go to the approval queue before anything runs.
       Agent config changes (persona, model, budget) are revisioned with

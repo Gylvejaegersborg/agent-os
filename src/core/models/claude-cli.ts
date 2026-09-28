@@ -100,7 +100,7 @@ export function renderTranscript(messages: ModelMessage[]): string {
 // made-up results. So all three are accepted, only the FIRST call is taken,
 // and anything written after it is dropped (that's where invented results
 // go) — the real result comes back on the next hop.
-const OPENERS = [TOOL_OPEN, "<function_calls>", "<function_call>", "<tool_use>", "<call>", "<invoke"];
+const OPENERS = [TOOL_OPEN, "<function_calls>", "<function_call>", "<tool_use>", "<call>", "<invoke", "[tool_call]"];
 const NAME_KEYS = ["name", "tool_name", "tool", "function"];
 const ARG_KEYS = ["args", "arguments", "parameters", "params", "input", "tool_input", "tool_args"];
 
@@ -152,11 +152,40 @@ function parseBlock(block: string): ParsedCall | undefined {
   const wrapper = block.match(/^<([a-z_]+)>/)?.[1];
   const inner = (wrapper ? block.slice(wrapper.length + 2).split(`</${wrapper}>`)[0]! : block).trim();
   try {
-    return callFromObject(JSON.parse(inner));
+    const call = callFromObject(JSON.parse(inner));
+    if (call) return call;
   } catch {
-    // not JSON — try XML
+    // not plain JSON — try XML, then any JSON object inside
   }
-  return callFromInvokeXml(inner);
+  return callFromInvokeXml(inner) ?? firstJsonCall(inner);
+}
+
+/** The first balanced {...} in `text` that parses as a tool call — for
+ *  hybrids like `<function_calls>[tool_call]{"name": …}</tool_call>` (seen
+ *  live). String-aware, so braces inside argument values don't confuse it. */
+function firstJsonCall(text: string): ParsedCall | undefined {
+  for (let start = text.indexOf("{"); start !== -1; start = text.indexOf("{", start + 1)) {
+    let depth = 0;
+    let inString = false;
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+      if (inString) {
+        if (ch === "\\") i++;
+        else if (ch === '"') inString = false;
+      } else if (ch === '"') inString = true;
+      else if (ch === "{") depth++;
+      else if (ch === "}" && --depth === 0) {
+        try {
+          const call = callFromObject(JSON.parse(text.slice(start, i + 1)));
+          if (call) return call;
+        } catch {
+          // not JSON — try the next "{"
+        }
+        break;
+      }
+    }
+  }
+  return undefined;
 }
 
 function firstOpener(text: string): number {

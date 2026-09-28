@@ -27,6 +27,7 @@ import {
 } from "../core/index.js";
 import { startGateway } from "./server.js";
 import { startBaseSpaceCronRunner } from "./basespace-crons.js";
+import { startWorkRunner } from "./work-runner.js";
 
 // The one agent allowed to touch a real shell at all. Deliberately a
 // single, well-known id rather than a config knob: this whole feature
@@ -220,6 +221,12 @@ async function main(): Promise<void> {
 
   // Team meetings scheduled in BaseSpace (see basespace-crons.ts).
   const baseSpaceCrons = startBaseSpaceCronRunner({ model, worker, skills });
+  // Work handed between agents (core/work.ts), run one at a time.
+  const workRunner =
+    process.env.AGENT_OS_WORK_RUNNER === "off"
+      ? undefined
+      : startWorkRunner({ model, worker, skills, sandboxPolicy, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true, enableBaseSpace: true, maxToolHops: 8 });
+  console.log(`[gateway] work runner ${workRunner ? "on" : "off (AGENT_OS_WORK_RUNNER=off)"}`);
   console.log(
     `[gateway] BaseSpace team crons ${process.env.AGENT_OS_BASESPACE_CRONS === "off" ? "disabled" : "enabled"}; ` +
       `Hindsight memory ${process.env.HINDSIGHT_URL ? `on (${process.env.HINDSIGHT_URL})` : "off (set HINDSIGHT_URL to enable)"}`,
@@ -228,6 +235,7 @@ async function main(): Promise<void> {
   const shutdown = async (): Promise<void> => {
     console.log("\n[gateway] shutting down...");
     baseSpaceCrons.stop();
+    workRunner?.stop();
     await handle.stop();
     process.exit(0);
   };

@@ -105,6 +105,29 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
   {
+    name: "delegate",
+    description:
+      "Hand a piece of work to a teammate as a tracked work item (not a chat message): they run it in the background and the result is posted back " +
+      "in this conversation. It keeps this conversation's goal/project. Hand-offs are capped at a few levels deep.",
+    inputSchema: {
+      to: { type: "string", required: true, description: "The teammate's agent id (see 'Your team' in your instructions)." },
+      title: { type: "string", required: true, description: "What to do, as a short imperative (e.g. 'Draft three caption options for the Switch teaser')." },
+      detail: { type: "string", description: "Context they need: constraints, what done looks like, where to look." },
+    },
+  },
+  {
+    name: "work",
+    description:
+      "Your work items: action = list | done | blocked | hand-back | note | cancel. done {id?, text: the result}; blocked {id?, text: why}; " +
+      "hand-back {id?, text: why} gives it to your manager; note {id, text}; cancel {id, text} only for work YOU asked for. " +
+      "id defaults to the item you're working in this conversation. You can't cancel work handed to you.",
+    inputSchema: {
+      action: { type: "string", required: true, description: "list, done, blocked, hand-back, note or cancel." },
+      id: { type: "string", description: "Work item id (defaults to the one this conversation is working)." },
+      text: { type: "string", description: "The result, reason or note." },
+    },
+  },
+  {
     name: "basespace",
     description:
       "Reads the operator's BaseSpace dashboard (a snapshot it syncs here): section = summary | goals | notes | projects | todos | events | crons | teams. " +

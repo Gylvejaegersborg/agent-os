@@ -416,6 +416,41 @@ focused project. Subagents inherit the focus (session and Task). Over MCP,
 
 `npm run test-goals` covers it.
 
+## Work — handing tasks between agents
+
+Agents hand each other work as tracked **work items** (`src/core/work.ts`),
+not chat messages — Paperclip's model:
+
+- **Reporting lines**: each identity can have `reportsTo` (set in BaseSpace's
+  agent editor, or `PUT /agents/:id {reportsTo}`; `null` = the operator).
+  Seeded once: Nyx, Aether, Hermes, Theia, Mnemosyne → Hemera; Hemera, Argus
+  and Claude → the operator. Loops are rejected. Each turn gets a "Your team"
+  block: who you report to, who reports to you, what's assigned to you.
+- **Tools**: `delegate {to, title, detail?}` creates an item for a teammate
+  (it keeps the thread's goal/project focus); `work {action: list | done |
+  blocked | hand-back | note | cancel, id?, text?}`.
+- **Rules**: one assignee, claimed atomically; the assignee can't cancel —
+  it finishes, marks it blocked with a reason, or hands it back to its
+  manager (no manager → blocked for the operator); only the requester or
+  the operator cancels; at most 3 hand-offs deep; handing work straight
+  back to whoever asked is refused. Tokens spent working an item are
+  recorded on it, and `totalTokens` includes everything it was split into.
+- **Runner** (`src/gateway/work-runner.ts`, `AGENT_OS_WORK_RUNNER=off` to
+  disable): works open items one at a time (`AGENT_OS_WORK_CONCURRENCY`), in
+  a fresh session for the assignee with the item's focus; skips paused or
+  over-budget assignees until that lifts. A turn that ends with a real
+  answer completes the item with it (if the agent didn't call `work`
+  itself); one that stopped — a refused tool, a pending approval, out of
+  tool steps (`AgentTurnResult.stopReason`) — leaves it blocked with why. The
+  outcome is posted into the requester's thread as a `[Work]` note; no turn
+  runs on the requester's side, so agents can't ping-pong.
+- **HTTP**: `GET /work?assignee=&requestedBy=&involving=&status=`, `GET
+  /work/:id`, `POST /work {assignee, title, detail?, focus?}` (as the
+  operator), `POST /work/:id/cancel|reopen|reassign|note`. **MCP**:
+  `assign_work`, `list_work`.
+
+`npm run test-work` covers it; it was also run live on the Claude CLI.
+
 ## Board controls — pause, resume, budgets
 
 The operator's live levers over each agent (`src/core/controls.ts`, from

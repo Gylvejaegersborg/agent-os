@@ -49,6 +49,7 @@
     "test-mcp": "tsc -b && node dist/test-mcp.js",
     "test-controls": "tsc -b && node dist/test-controls.js",
     "test-goals": "tsc -b && node dist/test-goals.js",
+    "test-work": "tsc -b && node dist/test-work.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {

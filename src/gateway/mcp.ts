@@ -21,6 +21,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { addOverlayItem, readSnapshotSection, type OverlayKind } from "../core/basespace.js";
 import { listAgentRecords } from "../core/agents.js";
 import { listApprovals } from "../core/approvals.js";
+import { OPERATOR, createWork, listWork, type WorkStatus } from "../core/work.js";
 import type { SessionFocus } from "../core/types.js";
 
 /** The one thing the MCP layer needs from the gateway that isn't a plain
@@ -111,7 +112,7 @@ const TOOLS: McpTool[] = [
     async run() {
       const agents = await listAgentRecords();
       return agents
-        .map((a) => `- ${a.id} — ${a.name}${a.role ? ` (${a.role})` : ""}; ${a.status}; model ${a.defaultModel ?? "gateway default"}${a.capabilities.length ? `; ${a.capabilities.join(", ")}` : ""}`)
+        .map((a) => `- ${a.id} — ${a.name}${a.role ? ` (${a.role})` : ""}; reports to ${a.reportsTo ?? "the operator"}; ${a.status}; model ${a.defaultModel ?? "gateway default"}${a.capabilities.length ? `; ${a.capabilities.join(", ")}` : ""}`)
         .join("\n") || "No agents registered.";
     },
   },
@@ -140,6 +141,59 @@ const TOOLS: McpTool[] = [
         : undefined;
       const r = await deps.askAgent(agentId, message, typeof args.sessionId === "string" ? args.sessionId : undefined, focus);
       return `${r.reply || "(no reply)"}\n\n[sessionId: ${r.sessionId}${r.toolCalled ? `; used tool: ${r.toolCalled}` : ""}]`;
+    },
+  },
+  {
+    name: "assign_work",
+    description:
+      "Hand an agent a piece of work as a tracked work item (on the operator's behalf). It runs in the background — one at a time — and its " +
+      "result, blockers or hand-backs show in list_work and in BaseSpace. Pass goalId/projectId so the agent gets the why.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agentId: { type: "string", description: "Who does it (see list_agents)." },
+        title: { type: "string", description: "What to do, as a short imperative." },
+        detail: { type: "string", description: "Context: constraints, what done looks like." },
+        goalId: { type: "string" },
+        projectId: { type: "string" },
+      },
+      required: ["agentId", "title"],
+    },
+    async run(args) {
+      const focus = typeof args.goalId === "string" && args.goalId ? { kind: "goal" as const, id: args.goalId }
+        : typeof args.projectId === "string" && args.projectId ? { kind: "project" as const, id: args.projectId }
+        : undefined;
+      const item = await createWork({
+        title: String(args.title ?? ""),
+        detail: typeof args.detail === "string" ? args.detail : undefined,
+        assignee: String(args.agentId ?? ""),
+        requestedBy: OPERATOR,
+        ...(focus ? { focus } : {}),
+      });
+      return `Assigned "${item.title}" to ${item.assignee} (work item ${item.id}). Check on it with list_work.`;
+    },
+  },
+  {
+    name: "list_work",
+    description: "Work handed between agents: who has what, status (open, in_progress, blocked, done, cancelled), results, blockers and tokens spent.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        status: { type: "string", enum: ["open", "in_progress", "blocked", "done", "cancelled"] },
+        agentId: { type: "string", description: "Only work this agent has or asked for." },
+      },
+    },
+    async run(args) {
+      const list = await listWork({
+        ...(typeof args.status === "string" ? { status: args.status as WorkStatus } : {}),
+        ...(typeof args.agentId === "string" ? { involving: args.agentId } : {}),
+      });
+      if (!list.length) return "No work items.";
+      return list
+        .slice(0, 30)
+        .map((w) => `- ${w.id}: "${w.title}" — ${w.assignee}, ${w.status} (from ${w.requestedBy}${w.depth ? `, depth ${w.depth}` : ""}${w.totalTokens ? `, ${w.totalTokens} tokens` : ""})` +
+          `${w.result ? `\n    result: ${w.result.slice(0, 240)}` : ""}${w.blockedReason ? `\n    blocked: ${w.blockedReason}` : ""}`)
+        .join("\n");
     },
   },
   {

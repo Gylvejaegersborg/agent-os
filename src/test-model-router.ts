@@ -108,6 +108,9 @@ function testParseToolCall(): void {
   assert(toolInput.toolCall?.args.kind === "note", "tool_input as the arguments key works");
   const openai = parseToolCall('<tool_call>{"type": "function", "function": {"name": "shell", "arguments": "{\\"command\\": \\"ls\\"}"}}</tool_call>');
   assert(openai.toolCall?.name === "shell" && openai.toolCall.args.command === "ls", "OpenAI-style function + string arguments work");
+  // Seen live from Haiku via the CLI: a hybrid of three formats, then an invented result.
+  const hybrid = parseToolCall('Let me check.\n<function_calls>\n[tool_call]\n{"name": "basespace", "args": {"section":"notes","id":"n{1}"}}\n</tool_call>\n</function_calls>\n\n[tool result]\nmade up');
+  assert(hybrid.toolCall?.name === "basespace" && hybrid.toolCall.args.id === "n{1}" && hybrid.content === "Let me check.", "a hybrid block is parsed by finding the JSON call inside it");
   const flat = parseToolCall('<tool_call>{"name": "basespace", "section": "goals"}</tool_call>');
   assert(flat.toolCall?.args.section === "goals" && !("name" in flat.toolCall.args), "flat arguments next to the name work");
 }

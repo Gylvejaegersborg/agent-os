@@ -48,6 +48,16 @@ import {
   runTurn,
   createModelForAgent,
   listProviders,
+  OPERATOR,
+  WorkError,
+  cancelWork,
+  createWork,
+  getWork,
+  listWork,
+  noteWork,
+  reassignWork,
+  reopenWork,
+  type WorkStatus,
   AgentBlockedError,
   getAgentControlState,
   pauseAgent,
@@ -361,6 +371,50 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
     return;
   }
 
+  // ---- Work handed between agents (core/work.ts). The operator assigns,
+  // cancels, reopens and reassigns; agents do the rest through their tools. ----
+  if (segments[0] === "work") {
+    const send = async (fn: () => Promise<unknown>, ok = 200) => {
+      try {
+        sendJson(res, ok, await fn());
+      } catch (err) {
+        sendJson(res, err instanceof WorkError ? 409 : 500, { error: err instanceof Error ? err.message : String(err) });
+      }
+    };
+    if (method === "GET" && segments.length === 1) {
+      const q = (k: string) => url.searchParams.get(k) ?? undefined;
+      await send(async () => ({ work: await listWork({ assignee: q("assignee"), requestedBy: q("requestedBy"), involving: q("involving"), status: q("status") as WorkStatus | undefined }) }));
+      return;
+    }
+    if (method === "GET" && segments.length === 2) {
+      const item = await getWork(segments[1]!);
+      if (item) sendJson(res, 200, item);
+      else sendJson(res, 404, { error: `no work item ${segments[1]}` });
+      return;
+    }
+    const body = method === "POST" ? await readRequestBody(req) : {};
+    const text = (k: string) => (typeof body[k] === "string" ? (body[k] as string) : "");
+    if (method === "POST" && segments.length === 1) {
+      const focus = parseFocus(body.focus);
+      if (focus === "invalid") {
+        sendJson(res, 400, { error: 'focus must be {kind: "goal" | "project", id}' });
+        return;
+      }
+      await send(() => createWork({ title: text("title"), detail: text("detail") || undefined, assignee: text("assignee"), requestedBy: OPERATOR, ...(focus ? { focus } : {}) }), 201);
+      return;
+    }
+    if (method === "POST" && segments.length === 3) {
+      const id = segments[1]!;
+      const action = segments[2];
+      if (action === "cancel") await send(() => cancelWork(id, OPERATOR, text("reason")));
+      else if (action === "reopen") await send(() => reopenWork(id, OPERATOR, text("reason") || "reopened by the operator"));
+      else if (action === "reassign") await send(() => reassignWork(id, OPERATOR, text("to"), text("reason") || "reassigned by the operator"));
+      else if (action === "note") await send(() => noteWork(id, OPERATOR, text("text")));
+      else sendJson(res, 404, { error: `unknown work action ${action}` });
+      return;
+    }
+  }
+
   // ---- MCP (mcp.ts) — the OS as tools for Claude Code (the Terminal
   // panel wires it in) or any other MCP client. ----
   if (segments.length === 1 && segments[0] === "mcp") {
@@ -541,6 +595,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         role: typeof body.role === "string" ? body.role : undefined,
         capabilities: Array.isArray(body.capabilities) ? body.capabilities.filter((c: unknown) => typeof c === "string") : undefined,
         defaultModel: typeof body.defaultModel === "string" ? body.defaultModel : undefined,
+        reportsTo: typeof body.reportsTo === "string" && body.reportsTo ? body.reportsTo : undefined,
       });
       sendJson(res, 201, agent);
       return;
@@ -553,7 +608,13 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         role: typeof body.role === "string" ? body.role : undefined,
         capabilities: Array.isArray(body.capabilities) ? body.capabilities.filter((c: unknown) => typeof c === "string") : undefined,
         defaultModel: typeof body.defaultModel === "string" ? body.defaultModel : undefined,
-      });
+        // "" or null: reports to the operator directly.
+        reportsTo: body.reportsTo === null || body.reportsTo === "" ? null : typeof body.reportsTo === "string" ? body.reportsTo : undefined,
+      }).catch((err: unknown) => err as Error);
+      if (updated instanceof Error) {
+        sendJson(res, 400, { error: updated.message });
+        return;
+      }
       if (!updated) {
         sendJson(res, 404, { error: `no such agent: ${segments[1]}` });
         return;

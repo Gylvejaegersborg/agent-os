@@ -4,7 +4,8 @@
 // Every turn is written to the session's event stream, so resume/replay/
 // observability for free (see eventlog.ts).
 
-import { AgentBlockedError, assertAgentMayRun, recordAgentUsage } from "./controls.js";
+import { blockWork, cancelWork, completeWork, createWork, handBackWork, listWork, noteWork, orgContext, recordWorkUsage, workForSession, type WorkView } from "./work.js";
+import { AgentBlockedError, assertAgentMayRun, getAgentControlState, recordAgentUsage } from "./controls.js";
 import { hindsightConfigured, hindsightRecall, hindsightReflect, hindsightRetain } from "./hindsight.js";
 import { addOverlayItem, focusContext, readSnapshotSection, type OverlayKind } from "./basespace.js";
 import * as fs from "node:fs/promises";
@@ -38,6 +39,11 @@ export interface AgentTurnResult {
    *  reported usage at all (the stub model, or a provider response that
    *  didn't carry it), never a fabricated {0,0}. */
   usage?: { inputTokens: number; outputTokens: number };
+  /** How the turn ended: a real answer, a tool call the harness refused
+   *  (plan mode, policy, an approval still pending), out of tool steps, or
+   *  cancelled. Lets callers like the work runner tell "finished" from
+   *  "stopped". */
+  stopReason: "answered" | "tool-blocked" | "max-hops" | "cancelled";
 }
 
 export interface RunTurnOptions {
@@ -130,6 +136,16 @@ const PLAN_MODE_BLOCKED_TOOLS = new Set(["shell", "edit_file", "write_file", "su
 
 function sessionStream(sessionId: string): string {
   return `session:${sessionId}`;
+}
+
+/** Posts a note from the harness into a session without running a turn —
+ *  e.g. "Nyx finished the work you handed over". Stored as a user-role
+ *  message with a `[Tag] ` prefix (like approval decisions), so the agent
+ *  sees it next turn and BaseSpace shows it as a system note. Publishes
+ *  `session.note` so an open chat refreshes. */
+export async function appendSessionNote(sessionId: string, tag: string, text: string): Promise<void> {
+  await appendEvent(sessionStream(sessionId), "session.message", { role: "user", content: `[${tag}] ${text}` });
+  await publishEvent("session.note", { sessionId, tag });
 }
 
 export async function getSessionHistory(sessionId: string): Promise<ModelMessage[]> {
@@ -524,6 +540,52 @@ async function dispatchTool(
     const lines = await hindsightRecall(ctx.agentId, query);
     return { ok: true, output: lines.length ? lines.map((l) => `- ${l}`).join("\n") : "Nothing relevant remembered." };
   }
+  if (toolCall.name === "delegate") {
+    const str = (k: string) => (typeof toolCall.args[k] === "string" ? (toolCall.args[k] as string).trim() : "");
+    try {
+      const current = await workForSession(ctx.sessionId);
+      const item = await createWork({
+        title: str("title"),
+        detail: str("detail") || undefined,
+        assignee: str("to"),
+        requestedBy: ctx.agentId,
+        requestedFromSessionId: ctx.sessionId,
+        parentId: current?.id,
+        focus: (await getSession(ctx.sessionId))?.focus,
+      });
+      const control = await getAgentControlState(item.assignee);
+      const waiting = control.blocked ? ` Note: ${item.assignee} is ${control.blocked === "paused" ? "paused" : "over budget"}, so it waits until that lifts.` : "";
+      return { ok: true, output: `Handed "${item.title}" to ${item.assignee} as work item ${item.id}. It runs in the background; the result will be posted back in this conversation.${waiting}` };
+    } catch (err) {
+      return { ok: false, output: "", error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+  if (toolCall.name === "work") {
+    const action = String(toolCall.args.action ?? "list");
+    const text = typeof toolCall.args.text === "string" ? toolCall.args.text : "";
+    try {
+      if (action === "list") {
+        const active = (w: { status: string }) => w.status === "open" || w.status === "in_progress" || w.status === "blocked";
+        const mine = (await listWork({ assignee: ctx.agentId })).filter(active);
+        const asked = (await listWork({ requestedBy: ctx.agentId })).filter((w) => active(w) || w.status === "done").slice(0, 10);
+        const line = (w: WorkView) => `- ${w.id}: "${w.title}" — ${w.status}${w.assignee !== ctx.agentId ? ` (${w.assignee})` : ` (from ${w.requestedBy})`}${w.result ? ` → ${w.result.slice(0, 160)}` : ""}${w.blockedReason ? ` — ${w.blockedReason}` : ""}`;
+        return { ok: true, output: `Assigned to you:\n${mine.map(line).join("\n") || "- nothing"}\n\nYou asked for:\n${asked.map(line).join("\n") || "- nothing"}` };
+      }
+      const id = typeof toolCall.args.id === "string" && toolCall.args.id ? toolCall.args.id : (await workForSession(ctx.sessionId))?.id;
+      if (!id) return { ok: false, output: "", error: "which work item? pass id (see action list)" };
+      const item =
+        action === "done" ? await completeWork(id, ctx.agentId, text)
+        : action === "blocked" ? await blockWork(id, ctx.agentId, text)
+        : action === "hand-back" ? await handBackWork(id, ctx.agentId, text)
+        : action === "note" ? await noteWork(id, ctx.agentId, text)
+        : action === "cancel" ? await cancelWork(id, ctx.agentId, text)
+        : undefined;
+      if (!item) return { ok: false, output: "", error: `unknown action "${action}" — use list, done, blocked, hand-back, note or cancel` };
+      return { ok: true, output: `Work ${item.id} is now ${item.status}${item.assignee !== ctx.agentId ? ` (with ${item.assignee})` : ""}.` };
+    } catch (err) {
+      return { ok: false, output: "", error: err instanceof Error ? err.message : String(err) };
+    }
+  }
   if (toolCall.name === "basespace") {
     const section = String(toolCall.args.section ?? "summary");
     const query = typeof toolCall.args.query === "string" ? toolCall.args.query : undefined;
@@ -584,6 +646,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // comment) — stays {0,0} and is omitted from agent.turn.end entirely
   // when nothing ever reported usage (the stub model, or a provider that
   // doesn't report it), rather than claiming a fabricated zero.
+  let stopReason: AgentTurnResult["stopReason"] = "answered";
   let usageInputTokens = 0;
   let usageOutputTokens = 0;
   let sawUsage = false;
@@ -600,6 +663,9 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // session is focused on one): the chain up to the top goal, linked notes
   // and open todos. Once per turn — it's the same for every hop.
   const focusText = await focusContext((await getSession(sessionId))?.focus);
+  // Reporting lines and open work (work.ts) — only for agents on the
+  // operator's team (the same flag that turns on BaseSpace).
+  const orgText = enableBaseSpace ? await orgContext(agentId) : "";
 
   // Checked once per turn, BEFORE the hop loop builds its first set of
   // messages — so if this turn is the one that pushes history over
@@ -668,7 +734,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     // personaText first — "who you are" precedes "what you remember/can do"
     // in the assembled system message, matching how a human-written system
     // prompt would order identity before capability context.
-    const systemParts = [personaText, focusText, memoryText, catalogText, subagentText, nominationText, artifactText, baseSpaceText, fileToolsText, planModeText].filter(
+    const systemParts = [personaText, focusText, orgText, memoryText, catalogText, subagentText, nominationText, artifactText, baseSpaceText, fileToolsText, planModeText].filter(
       Boolean,
     );
     const messages: ModelMessage[] = systemParts.length
@@ -709,6 +775,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       // subagent can itself mutate files, so plan mode has to cover it
       // too to mean anything.
       if (planMode && PLAN_MODE_BLOCKED_TOOLS.has(response.toolCall.name)) {
+        stopReason = "tool-blocked";
         finalContent = `Tool call blocked: plan mode is active — "${response.toolCall.name}" would change something, and plan mode only allows read-only inspection. Describe what you'd do instead; the operator can turn plan mode off to actually execute it.`;
         await appendEvent(sessionStream(sessionId), "session.message", {
           role: "assistant",
@@ -723,6 +790,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
         payload: response.toolCall,
       });
       if (blockDecision.block) {
+        stopReason = "tool-blocked";
         finalContent = `Tool call blocked: ${blockDecision.reason ?? "no reason given"}`;
         await appendEvent(sessionStream(sessionId), "session.message", {
           role: "assistant",
@@ -810,6 +878,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // Used up every tool step without a final answer — say so instead of
   // ending the turn with nothing (which reads as the reply vanishing).
   if (!cancelled && !finalContent && hops >= maxHops) {
+    stopReason = "max-hops";
     finalContent =
       `I used all ${maxHops} tool steps I get per message before finishing` +
       (toolCalled ? ` (last one: ${toolCalled})` : "") +
@@ -829,7 +898,13 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   const usage = sawUsage ? { inputTokens: usageInputTokens, outputTokens: usageOutputTokens } : undefined;
   // Counts toward the agent's budget (controls.ts) — including a cancelled
   // turn's tokens, since those were spent too.
-  if (usage) await recordAgentUsage(agentId, usage, sessionId);
+  if (usage) {
+    await recordAgentUsage(agentId, usage, sessionId);
+    // Tokens spent in a work session count on that work item (and roll up
+    // to whoever asked for it — work.ts's totalTokens).
+    const working = await workForSession(sessionId, { anyStatus: true });
+    if (working) await recordWorkUsage(working.id, usage.inputTokens + usage.outputTokens);
+  }
   if (!cancelled && finalContent) {
     // Every completed exchange goes to Hindsight (when configured) so it can
     // extract facts/experiences from it; no-op otherwise.
@@ -839,7 +914,8 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled, usage } });
   await publishEvent("agent.turn.end", { sessionId, agentId, finalContent, toolCalled, cancelled, usage });
 
-  return { sessionId, finalContent, toolCalled, cancelled: cancelled || undefined, usage };
+  if (cancelled) stopReason = "cancelled";
+  return { sessionId, finalContent, toolCalled, cancelled: cancelled || undefined, usage, stopReason };
 }
 
 /** Runs a tool call the operator approved in the Approvals tab, in the
