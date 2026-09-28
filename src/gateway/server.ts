@@ -40,6 +40,7 @@ import type { Worker } from "../core/worker.js";
 import type { SkillRegistry } from "../core/skills.js";
 import {
   createSession,
+  setSessionFocus,
   getSession,
   listSessions,
   cancelSession,
@@ -104,6 +105,7 @@ import type { SessionStatus, ApprovalStatus, ApprovalRequest, TaskStatus, Nomina
 import type { SandboxPolicy } from "../core/permissions.js";
 import type { ConfiguredHook } from "../core/configured-hooks.js";
 import { handleMcp, type McpDeps } from "./mcp.js";
+import type { SessionFocus } from "../core/types.js";
 import { closeAllTerminals, closeTerminal, setTerminalGatewayUrl, createTerminal, listTerminals, ptyBackend, resizeTerminal, streamTerminal, terminalsEnabled, writeTerminal } from "./terminal.js";
 import type { ArtifactType } from "../core/artifacts.js";
 import type { FlowStepDefinition } from "../core/flow-engine.js";
@@ -251,18 +253,26 @@ export function startGateway(deps: GatewayDeps, port = 0): Promise<GatewayHandle
   });
 }
 
+/** A request body's `focus`: undefined when absent, "invalid" when malformed. */
+function parseFocus(raw: unknown): SessionFocus | undefined | "invalid" {
+  if (raw === undefined || raw === null) return undefined;
+  const f = raw as { kind?: unknown; id?: unknown };
+  if ((f.kind === "goal" || f.kind === "project") && typeof f.id === "string" && f.id) return { kind: f.kind, id: f.id };
+  return "invalid";
+}
+
 /** What mcp.ts needs from the gateway: an agent turn run exactly the way
  *  POST /sessions/:id/turns runs one (same model routing, tools, sandbox
  *  and approvals), in a new session unless one is given. */
 function mcpDeps(deps: GatewayDeps): McpDeps {
   return {
-    async askAgent(agentId, message, sessionId) {
+    async askAgent(agentId, message, sessionId, focus) {
       let session = sessionId ? await getSession(sessionId) : undefined;
       if (sessionId && (!session || session.agentId !== agentId)) {
         throw new Error(`no session ${sessionId} for agent ${agentId}`);
       }
       if (!(await getAgentRecord(agentId))) throw new Error(`no agent "${agentId}" — see list_agents`);
-      session ??= await createSession({ agentId, title: "From Claude Code" });
+      session ??= await createSession({ agentId, title: "From Claude Code", ...(focus ? { focus } : {}) });
       const model = (await createModelForAgent(agentId)) ?? deps.model;
       const result = await runTurn({
         sessionId: session.id,
@@ -767,10 +777,16 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         sendJson(res, 400, { error: "agentId (string) is required" });
         return;
       }
+      const focus = parseFocus(body.focus);
+      if (focus === "invalid") {
+        sendJson(res, 400, { error: 'focus must be {kind: "goal" | "project", id}' });
+        return;
+      }
       const session = await createSession({
         agentId: body.agentId,
         title: typeof body.title === "string" ? body.title : undefined,
         parentSessionId: typeof body.parentSessionId === "string" ? body.parentSessionId : undefined,
+        ...(focus ? { focus } : {}),
       });
       sendJson(res, 201, session);
       return;
@@ -819,6 +835,23 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         sendJson(res, 200, session);
       } catch (err) {
         sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+    // What this conversation's work serves — a BaseSpace goal or project;
+    // `{focus: null}` clears it. Each turn then gets the goal chain, linked
+    // notes and open todos (basespace.ts's focusContext).
+    if (method === "PUT" && segments.length === 3 && segments[2] === "focus") {
+      const body = await readRequestBody(req);
+      const focus = body.focus === null ? null : parseFocus(body.focus);
+      if (focus === "invalid" || focus === undefined) {
+        sendJson(res, 400, { error: 'body must be {focus: {kind: "goal" | "project", id}} or {focus: null}' });
+        return;
+      }
+      try {
+        sendJson(res, 200, await setSessionFocus(segments[1]!, focus));
+      } catch (err) {
+        sendJson(res, 404, { error: err instanceof Error ? err.message : String(err) });
       }
       return;
     }

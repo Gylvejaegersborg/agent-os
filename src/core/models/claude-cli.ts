@@ -76,7 +76,7 @@ export function renderToolProtocol(tools: ToolSpec[]): string {
     "# Tools",
     "You run inside Agent-OS, which executes tools for you; your own built-in tools are disabled.",
     `To use a tool, end your reply with exactly one block: ${TOOL_OPEN}{"name": "<tool>", "args": {...}}${TOOL_CLOSE}`,
-    "You may write a short sentence before it, nothing after it. One tool call per reply.",
+    "Use exactly that format (not <function_calls> or XML). You may write a short sentence before it, nothing after it — never guess a tool's result. One tool call per reply.",
     "Agent-OS runs it (some calls wait for the operator's approval) and sends the output back as a [tool result] message.",
     "If no tool is needed, just answer normally.",
     "",
@@ -92,32 +92,96 @@ export function renderTranscript(messages: ModelMessage[]): string {
   return `${parts.join("\n\n")}\n\nReply as the assistant to the last message above.`;
 }
 
-/** Splits a reply into its visible text and an optional tool call. A block
- *  whose JSON doesn't parse is left in the text rather than guessed at. */
-export function parseToolCall(text: string): { content: string; toolCall?: { name: string; args: Record<string, unknown> } } {
-  const start = text.indexOf(TOOL_OPEN);
-  if (start === -1) return { content: text.trim() };
-  const end = text.indexOf(TOOL_CLOSE, start);
-  const raw = text.slice(start + TOOL_OPEN.length, end === -1 ? undefined : end).trim();
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed.name === "string") {
-      const args = parsed.args && typeof parsed.args === "object" ? parsed.args : parsed.arguments && typeof parsed.arguments === "object" ? parsed.arguments : {};
-      return { content: text.slice(0, start).trim(), toolCall: { name: parsed.name, args } };
+// Claude doesn't always use the requested <tool_call> format: with its own
+// tools switched off it sometimes falls back to the shapes it was trained
+// on — `<function_calls>` holding JSON (`[{"tool_name": …, "args": …}]`) or
+// XML (`<invoke name="…"><parameter name="…">…</parameter></invoke>`). Seen
+// live: the raw block leaked into the reply and the model went on to write
+// made-up results. So all three are accepted, only the FIRST call is taken,
+// and anything written after it is dropped (that's where invented results
+// go) — the real result comes back on the next hop.
+const OPENERS = [TOOL_OPEN, "<function_calls>", "<function_call>", "<tool_use>", "<call>", "<invoke"];
+const NAME_KEYS = ["name", "tool_name", "tool", "function"];
+const ARG_KEYS = ["args", "arguments", "parameters", "params", "input", "tool_input", "tool_args"];
+
+type ParsedCall = { name: string; args: Record<string, unknown> };
+
+function asArgs(v: unknown): Record<string, unknown> | undefined {
+  if (typeof v === "string") {
+    try {
+      v = JSON.parse(v); // OpenAI-style: arguments as a JSON string
+    } catch {
+      return undefined;
     }
-  } catch {
-    // fall through
   }
-  return { content: text.trim() };
+  return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
+}
+
+function callFromObject(o: unknown): ParsedCall | undefined {
+  const item = Array.isArray(o) ? o[0] : o;
+  if (!item || typeof item !== "object") return undefined;
+  const r = item as Record<string, unknown>;
+  // {"function": {"name", "arguments"}} (OpenAI tool_calls shape)
+  if (r.function && typeof r.function === "object") return callFromObject(r.function);
+  const nameKey = NAME_KEYS.find((k) => typeof r[k] === "string");
+  if (!nameKey) return undefined;
+  const argKey = ARG_KEYS.find((k) => asArgs(r[k]));
+  // No wrapper key: the arguments sit flat next to the name.
+  const args = argKey ? asArgs(r[argKey])! : Object.fromEntries(Object.entries(r).filter(([k]) => k !== nameKey && k !== "type" && k !== "id"));
+  return { name: r[nameKey] as string, args };
+}
+
+function callFromInvokeXml(xml: string): ParsedCall | undefined {
+  const invoke = xml.match(/<invoke\s+name="([^"]+)"\s*>([\s\S]*?)(?:<\/invoke>|$)/);
+  if (!invoke) return undefined;
+  const args: Record<string, unknown> = {};
+  for (const m of invoke[2]!.matchAll(/<parameter\s+name="([^"]+)"\s*>([\s\S]*?)<\/parameter>/g)) {
+    const raw = m[2]!.trim();
+    try {
+      args[m[1]!] = JSON.parse(raw);
+    } catch {
+      args[m[1]!] = raw;
+    }
+  }
+  return { name: invoke[1]!, args };
+}
+
+function parseBlock(block: string): ParsedCall | undefined {
+  // Strip the wrapper tag (<tool_call>, <function_calls>, <call>, …) and
+  // everything after its closing tag; a bare <invoke> is parsed as XML.
+  const wrapper = block.match(/^<([a-z_]+)>/)?.[1];
+  const inner = (wrapper ? block.slice(wrapper.length + 2).split(`</${wrapper}>`)[0]! : block).trim();
+  try {
+    return callFromObject(JSON.parse(inner));
+  } catch {
+    // not JSON — try XML
+  }
+  return callFromInvokeXml(inner);
+}
+
+function firstOpener(text: string): number {
+  const hits = OPENERS.map((o) => text.indexOf(o)).filter((i) => i !== -1);
+  return hits.length ? Math.min(...hits) : -1;
+}
+
+/** Splits a reply into its visible text and an optional tool call (the
+ *  first one, in any accepted format). A block that doesn't parse is left
+ *  in the text rather than guessed at. */
+export function parseToolCall(text: string): { content: string; toolCall?: ParsedCall } {
+  const start = firstOpener(text);
+  if (start === -1) return { content: text.trim() };
+  const call = parseBlock(text.slice(start));
+  return call ? { content: text.slice(0, start).trim(), toolCall: call } : { content: text.trim() };
 }
 
 /** How much of `text` is safe to show live: everything before a tool-call
  *  block, minus any trailing characters that could be the start of one. */
 function visiblePrefixLength(text: string): number {
-  const start = text.indexOf(TOOL_OPEN);
+  const start = firstOpener(text);
   if (start !== -1) return start;
-  for (let n = Math.min(TOOL_OPEN.length - 1, text.length); n > 0; n--) {
-    if (TOOL_OPEN.startsWith(text.slice(-n))) return text.length - n;
+  for (let n = Math.min(Math.max(...OPENERS.map((o) => o.length)) - 1, text.length); n > 0; n--) {
+    const tail = text.slice(-n);
+    if (OPENERS.some((o) => o.startsWith(tail))) return text.length - n;
   }
   return text.length;
 }

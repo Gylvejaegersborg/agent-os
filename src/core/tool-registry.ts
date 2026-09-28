@@ -107,10 +107,11 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: "basespace",
     description:
-      "Reads the operator's BaseSpace dashboard (a snapshot it syncs here): section = summary | notes | projects | todos | events | crons | teams. " +
-      "Use query to filter by text; use id to get one item in full (notes are listed without their text until you ask for one by id).",
+      "Reads the operator's BaseSpace dashboard (a snapshot it syncs here): section = summary | goals | notes | projects | todos | events | crons | teams. " +
+      "Goals are what the work is for; projects serve goals; todos and notes link to them. Use query to filter by text; use id to get one item in full " +
+      "(a goal or project by id comes with its goal chain, linked notes and open todos; notes are listed without their text until you ask for one by id).",
     inputSchema: {
-      section: { type: "string", required: true, description: "summary, notes, projects, todos, events, crons or teams." },
+      section: { type: "string", required: true, description: "summary, goals, notes, projects, todos, events, crons or teams." },
       query: { type: "string", description: "Only items containing this text." },
       id: { type: "string", description: "Return this one item in full (for a note: its whole text)." },
     },
@@ -119,7 +120,8 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
     name: "basespace-add",
     description:
       "Adds something to the operator's BaseSpace: kind = note {title, body, folder?} | todo {title, due? YYYY-MM-DD, time? HH:MM, priority? high|med|low, notes?} | " +
-      "project-update {projectId, text}. Internal to their own dashboard — use approvals for anything that goes outside it.",
+      "project-update {projectId, text}. Todos can name the projectId or goalId they serve. When this conversation is focused on a goal or project, " +
+      "what you add links to it automatically. Internal to their own dashboard — use approvals for anything that goes outside it.",
     inputSchema: {
       kind: { type: "string", required: true, description: "note, todo or project-update." },
       title: { type: "string", description: "Note or todo title." },
@@ -129,7 +131,8 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
       time: { type: "string", description: "Todo time, HH:MM (the operator gets a notification then)." },
       priority: { type: "string", description: "Todo priority: high, med or low." },
       notes: { type: "string", description: "Todo details." },
-      projectId: { type: "string", description: "Project id (from the basespace tool) for a project-update." },
+      projectId: { type: "string", description: "Project id (from the basespace tool): required for a project-update; for a todo, the project it serves." },
+      goalId: { type: "string", description: "For a todo: the goal it serves (from the basespace tool, section goals)." },
       text: { type: "string", description: "The project update." },
     },
   },

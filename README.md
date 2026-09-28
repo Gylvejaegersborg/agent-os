@@ -319,7 +319,12 @@ a preference, e.g. `AGENT_OS_DEFAULT_MODEL=claude-cli:sonnet`.
 
 **How `claude-cli` works** (`src/core/models/claude-cli.ts`): each model call
 is one `claude -p --output-format stream-json` run, fed the conversation on
-stdin, with Claude Code's own tools switched off (`--tools ""`). Agent-OS's
+stdin, with Claude Code's own tools switched off (`--tools ""`). The model asks
+for a tool with a `<tool_call>` block; because Claude sometimes falls back to
+the shapes it was trained on (`<function_calls>` JSON or `<invoke>` XML,
+`<call>`, OpenAI-style `function`/`arguments`), all of those are accepted,
+only the first call is taken, and anything written after it is dropped —
+that's where a model invents results. Agent-OS's
 tools are described in the system prompt and the model asks for one with a
 `<tool_call>{"name": …, "args": …}</tool_call>` block, which the adapter
 turns back into a normal tool call — so plan mode, permissions, hooks,
@@ -387,6 +392,29 @@ claude mcp add --transport http agent-os http://127.0.0.1:8787/mcp
 Same trust as the rest of the gateway: no auth, so keep it private.
 `npm run test-mcp` covers it; it was also verified with the real Claude
 Code CLI.
+
+## Goals and focus — the "why" behind the work
+
+BaseSpace goals (what the work is for) link projects, sub-goals, notes and
+todos; the snapshot carries those links, and agents read them with the
+`basespace` tool (`section: goals`; a goal or project read by id comes with
+its chain, linked notes and open todos).
+
+A session can be **focused** on a goal or project — `POST /sessions` with
+`{focus: {kind: "goal" | "project", id}}`, or `PUT /sessions/:id/focus`
+(`{focus: null}` clears it). Each turn in a focused session then gets a
+"What this work serves" block (`focusContext()` in `src/core/basespace.ts`):
+the project's status and next moves, the goal chain up to the top goal with
+each goal's *why* and target, linked notes (with ids to read them), and the
+open todos serving it. Once per turn, from the snapshot — no model call.
+
+Continuity back into BaseSpace: a note an agent adds from a focused session
+gets a `Serves: [[Name]]` link (so it shows under that goal/project), a todo
+gets its `projectId`/`goalId`, and a `project-update` defaults to the
+focused project. Subagents inherit the focus (session and Task). Over MCP,
+`ask_agent` and `basespace_add` take `goalId`/`projectId`.
+
+`npm run test-goals` covers it.
 
 ## Board controls — pause, resume, budgets
 

@@ -21,12 +21,13 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { addOverlayItem, readSnapshotSection, type OverlayKind } from "../core/basespace.js";
 import { listAgentRecords } from "../core/agents.js";
 import { listApprovals } from "../core/approvals.js";
+import type { SessionFocus } from "../core/types.js";
 
 /** The one thing the MCP layer needs from the gateway that isn't a plain
  *  core call: running an agent turn exactly like POST /sessions/:id/turns
  *  does (same model routing, tools, sandbox, approvals). */
 export interface McpDeps {
-  askAgent(agentId: string, message: string, sessionId?: string): Promise<{ sessionId: string; reply: string; toolCalled?: string }>;
+  askAgent(agentId: string, message: string, sessionId?: string, focus?: SessionFocus): Promise<{ sessionId: string; reply: string; toolCalled?: string }>;
 }
 
 interface JsonRpcRequest {
@@ -50,12 +51,12 @@ const TOOLS: McpTool[] = [
   {
     name: "basespace_read",
     description:
-      "Read the operator's BaseSpace dashboard (the snapshot BaseSpace syncs to Agent-OS). section = summary | notes | projects | todos | events | crons | teams. " +
+      "Read the operator's BaseSpace dashboard (the snapshot BaseSpace syncs to Agent-OS). section = summary | goals | notes | projects | todos | events | crons | teams. Goals are what the work is for; a goal or project read by id comes with its goal chain, linked notes and open todos. " +
       "Use query to filter by text; use id to get one item in full (notes are listed without their text until asked for by id).",
     inputSchema: {
       type: "object",
       properties: {
-        section: { type: "string", enum: ["summary", "notes", "projects", "todos", "events", "crons", "teams"] },
+        section: { type: "string", enum: ["summary", "goals", "notes", "projects", "todos", "events", "crons", "teams"] },
         query: { type: "string", description: "Only items containing this text." },
         id: { type: "string", description: "Return this one item in full." },
       },
@@ -86,13 +87,19 @@ const TOOLS: McpTool[] = [
         time: { type: "string", description: "Todo time, HH:MM." },
         priority: { type: "string", enum: ["high", "med", "low"] },
         notes: { type: "string", description: "Todo details." },
-        projectId: { type: "string", description: "Project id (see basespace_read section=projects)." },
+        projectId: { type: "string", description: "Project id (see basespace_read section=projects): required for project-update; for a note or todo, links it to that project." },
+        goalId: { type: "string", description: "Links a note or todo to this goal (see basespace_read section=goals)." },
         text: { type: "string", description: "The project update." },
       },
       required: ["kind"],
     },
     async run(args) {
-      const r = await addOverlayItem(String(args.kind) as OverlayKind, args, MCP_AUTHOR);
+      // No session here, so an explicit goalId/projectId plays the part of
+      // a focus: the note or todo links back to it.
+      const focus = typeof args.goalId === "string" && args.goalId ? { kind: "goal" as const, id: args.goalId }
+        : typeof args.projectId === "string" && args.projectId && args.kind !== "project-update" ? { kind: "project" as const, id: args.projectId }
+        : undefined;
+      const r = await addOverlayItem(String(args.kind) as OverlayKind, args, MCP_AUTHOR, focus);
       if (!r.ok) throw new Error(r.error ?? "could not add to BaseSpace");
       return r.output;
     },
@@ -119,6 +126,8 @@ const TOOLS: McpTool[] = [
         agentId: { type: "string", description: "Agent id, from list_agents." },
         message: { type: "string" },
         sessionId: { type: "string", description: "Continue this conversation instead of starting a new one." },
+        goalId: { type: "string", description: "For a new conversation: the goal it serves — the agent gets the goal chain, linked notes and open todos." },
+        projectId: { type: "string", description: "For a new conversation: the project it serves (same as goalId, for a project)." },
       },
       required: ["agentId", "message"],
     },
@@ -126,7 +135,10 @@ const TOOLS: McpTool[] = [
       const agentId = String(args.agentId ?? "");
       const message = String(args.message ?? "");
       if (!agentId || !message) throw new Error("agentId and message are required");
-      const r = await deps.askAgent(agentId, message, typeof args.sessionId === "string" ? args.sessionId : undefined);
+      const focus = typeof args.goalId === "string" && args.goalId ? { kind: "goal" as const, id: args.goalId }
+        : typeof args.projectId === "string" && args.projectId ? { kind: "project" as const, id: args.projectId }
+        : undefined;
+      const r = await deps.askAgent(agentId, message, typeof args.sessionId === "string" ? args.sessionId : undefined, focus);
       return `${r.reply || "(no reply)"}\n\n[sessionId: ${r.sessionId}${r.toolCalled ? `; used tool: ${r.toolCalled}` : ""}]`;
     },
   },

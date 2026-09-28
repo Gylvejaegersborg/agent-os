@@ -342,12 +342,25 @@ Ordered so each step is safe before the next adds autonomy:
       `POST /agents/:id/pause|resume`, `PUT /agents/:id/budget`, `control`
       on every agent record; **[UI]** Controls in the agent editor, a
       "Paused"/"Over budget" marker in the agent list.
-- [ ] **Goals and the "why" chain.** Goals (e.g. "Release Switch in
-      October") as first-class records; every task can point at a parent
-      task or a goal, and each turn gets the chain injected ("you're doing
-      X because Y because goal Z"). Paperclip's single most effective
-      alignment trick, and cheap: it's context, not a model. BaseSpace
-      projects are the natural goals. **[core]** **[UI]**
+- [x] **Goals and the "why" chain, woven into what's already there.**
+      Goals live in BaseSpace (they're the operator's intent) and join its
+      existing connective layer: a goal links projects and can sit under a
+      bigger goal; notes link a goal with `[[Goal title]]` like they link
+      projects; todos can serve a project or goal (a project's next moves
+      do automatically). The snapshot carries all of it. A Workbench thread
+      can be focused on a goal or project — every turn then gets "what this
+      work serves": the chain up to the top goal, next moves, linked notes
+      and open todos — and notes/todos an agent adds from that thread link
+      back to it, so the work stays one continuous thread instead of
+      starting from zero. Subagents inherit the focus; MCP's `ask_agent` and
+      `basespace_add` take `goalId`/`projectId`. Verified live: Hemera on
+      the Claude CLI, focused on a goal, answered from its chain and added a
+      todo that came back linked to the goal. **[core]** `basespace.ts`
+      (`focusContext`), `session.ts` (focus); **[gateway]** `PUT
+      /sessions/:id/focus`, `focus` on `POST /sessions`; **[UI]** goals on
+      Projects, "Serves" on projects/todos/threads.
+- [ ] Flows and BaseSpace team crons take a focus too (a standup focused
+      on a goal). **[core]** **[gateway]**
 - [ ] **Reporting lines + delegation through tasks.** `reportsTo` on each
       agent (Hemera → the others, Argus alongside), an agent inbox (tasks
       assigned to it), and a `delegate` tool that creates a task for another

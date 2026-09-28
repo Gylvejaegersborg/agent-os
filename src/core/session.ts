@@ -17,7 +17,7 @@
 import { project, appendEvent } from "./eventlog.js";
 import { publishEvent } from "./eventbus.js";
 import { generateId } from "./id.js";
-import type { Session, SessionStatus } from "./types.js";
+import type { Session, SessionFocus, SessionStatus } from "./types.js";
 
 const SESSIONS_STREAM = "sessions";
 
@@ -28,6 +28,8 @@ export interface CreateSessionInput {
   title?: string;
   parentSessionId?: string;
   metadata?: Record<string, unknown>;
+  /** What this session's work serves (a BaseSpace goal or project). */
+  focus?: SessionFocus;
   /** Explicit id, e.g. for a caller that already generated one via
    *  newSessionId() (agent-loop.ts) and needs the registry entry and the
    *  message stream to share the same id. Omit to have this call generate
@@ -43,6 +45,7 @@ export async function createSession(input: CreateSessionInput): Promise<Session>
     title: input.title,
     parentSessionId: input.parentSessionId,
     metadata: input.metadata ?? {},
+    ...(input.focus ? { focus: input.focus } : {}),
   });
   const session = await getSession(id);
   if (!session) throw new Error("session.created event did not project to a session");
@@ -83,6 +86,7 @@ async function projectSessions(): Promise<SessionProjectionState> {
         updatedAt: event.timestamp,
         title: p.title,
         parentSessionId: p.parentSessionId,
+        ...(p.focus ? { focus: p.focus } : {}),
         metadata: p.metadata ?? {},
       });
     } else if (event.type === "session.activity") {
@@ -94,6 +98,12 @@ async function projectSessions(): Promise<SessionProjectionState> {
       const existing = state.sessions.get(p.sessionId);
       if (!existing) return state;
       state.sessions.set(p.sessionId, { ...existing, status: p.status, updatedAt: event.timestamp });
+    } else if (event.type === "session.focus.set") {
+      const p = event.payload as any;
+      const existing = state.sessions.get(p.sessionId);
+      if (!existing) return state;
+      const { focus: _old, ...rest } = existing;
+      state.sessions.set(p.sessionId, { ...rest, ...(p.focus ? { focus: p.focus } : {}), updatedAt: event.timestamp });
     } else if (event.type === "session.renamed") {
       const p = event.payload as any;
       const existing = state.sessions.get(p.sessionId);
@@ -198,6 +208,17 @@ export async function isSessionCancelled(id: string): Promise<boolean> {
  *  terminal ones (a completed/cancelled thread can still be relabeled for
  *  the human reading the list later). Empty string clears back to the
  *  caller's own fallback label (e.g. a formatted createdAt). */
+/** Sets (or, with null, clears) what a session's work serves. */
+export async function setSessionFocus(id: string, focus: SessionFocus | null): Promise<Session> {
+  const existing = await getSession(id);
+  if (!existing) throw new Error(`no such session: ${id}`);
+  if (focus && (!["goal", "project"].includes(focus.kind) || typeof focus.id !== "string" || !focus.id)) {
+    throw new Error('focus must be {kind: "goal" | "project", id} or null');
+  }
+  await appendEvent(SESSIONS_STREAM, "session.focus.set", { sessionId: id, focus: focus ? { kind: focus.kind, id: focus.id } : null });
+  return (await getSession(id))!;
+}
+
 export async function renameSession(id: string, title: string): Promise<Session> {
   const existing = await getSession(id);
   if (!existing) throw new Error(`no such session: ${id}`);

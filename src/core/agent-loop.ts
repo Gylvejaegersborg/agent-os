@@ -6,7 +6,7 @@
 
 import { AgentBlockedError, assertAgentMayRun, recordAgentUsage } from "./controls.js";
 import { hindsightConfigured, hindsightRecall, hindsightReflect, hindsightRetain } from "./hindsight.js";
-import { addOverlayItem, readSnapshotSection, type OverlayKind } from "./basespace.js";
+import { addOverlayItem, focusContext, readSnapshotSection, type OverlayKind } from "./basespace.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { appendEvent, project } from "./eventlog.js";
@@ -466,6 +466,7 @@ async function dispatchTool(
     const result = await spawnSubagentTask({
       agentId: ctx.agentId,
       goal,
+      focus: (await getSession(ctx.sessionId))?.focus,
       model: ctx.model,
       worker: ctx.worker,
       skills: ctx.skills,
@@ -531,7 +532,8 @@ async function dispatchTool(
   }
   if (toolCall.name === "basespace-add") {
     const kind = String(toolCall.args.kind ?? "") as OverlayKind;
-    return addOverlayItem(kind, toolCall.args, ctx.agentId);
+    // Linked back to whatever this session's work serves (its focus).
+    return addOverlayItem(kind, toolCall.args, ctx.agentId, (await getSession(ctx.sessionId))?.focus);
   }
   return { ok: false, output: "", error: `unknown tool: ${toolCall.name}` };
 }
@@ -594,6 +596,10 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // which doesn't change between hops. Recalling inside the hop loop used
   // to repeat the same HTTP call (up to 4s each) on every tool step.
   const recalled = injectMemory ? await hindsightRecall(agentId, userMessage) : [];
+  // What this session's work serves (a BaseSpace goal or project, if the
+  // session is focused on one): the chain up to the top goal, linked notes
+  // and open todos. Once per turn — it's the same for every hop.
+  const focusText = await focusContext((await getSession(sessionId))?.focus);
 
   // Checked once per turn, BEFORE the hop loop builds its first set of
   // messages — so if this turn is the one that pushes history over
@@ -662,7 +668,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     // personaText first — "who you are" precedes "what you remember/can do"
     // in the assembled system message, matching how a human-written system
     // prompt would order identity before capability context.
-    const systemParts = [personaText, memoryText, catalogText, subagentText, nominationText, artifactText, baseSpaceText, fileToolsText, planModeText].filter(
+    const systemParts = [personaText, focusText, memoryText, catalogText, subagentText, nominationText, artifactText, baseSpaceText, fileToolsText, planModeText].filter(
       Boolean,
     );
     const messages: ModelMessage[] = systemParts.length

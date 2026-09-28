@@ -95,6 +95,21 @@ function testParseToolCall(): void {
   const bad = parseToolCall("<tool_call>{not json</tool_call>");
   assert(!bad.toolCall && bad.content.includes("not json"), "an unparseable block is left as text, not guessed at");
   assert(!parseToolCall("plain answer").toolCall, "plain text has no tool call");
+  // Formats Claude falls back to (seen live), each with invented text after.
+  const fc = parseToolCall('Checking.\n<function_calls>\n[{"tool_name": "basespace", "args": {"section": "summary"}}]\n</function_calls>\nIt shows 3 todos.');
+  assert(fc.toolCall?.name === "basespace" && fc.toolCall.args.section === "summary" && fc.content === "Checking.", "a JSON <function_calls> block is parsed and what follows it dropped");
+  const xml = parseToolCall('<function_calls><invoke name="read_file"><parameter name="path">a.md</parameter><parameter name="limit">5</parameter></invoke></function_calls> made-up output');
+  assert(xml.toolCall?.name === "read_file" && xml.toolCall.args.path === "a.md" && xml.toolCall.args.limit === 5 && xml.content === "", "an XML <invoke> call is parsed, parameters JSON-decoded when possible");
+  const two = parseToolCall('<tool_call>{"name": "a", "args": {}}</tool_call><tool_call>{"name": "b", "args": {}}</tool_call>');
+  assert(two.toolCall?.name === "a", "only the first of several calls is taken");
+  const call = parseToolCall('<call>{"name": "basespace-add", "args": {"kind": "todo", "title": "x"}}</call>');
+  assert(call.toolCall?.name === "basespace-add" && call.toolCall.args.kind === "todo", "a <call> wrapper works");
+  const toolInput = parseToolCall('<tool_call>{"tool_name": "basespace-add", "tool_input": {"kind": "note", "title": "y"}}</tool_call>');
+  assert(toolInput.toolCall?.args.kind === "note", "tool_input as the arguments key works");
+  const openai = parseToolCall('<tool_call>{"type": "function", "function": {"name": "shell", "arguments": "{\\"command\\": \\"ls\\"}"}}</tool_call>');
+  assert(openai.toolCall?.name === "shell" && openai.toolCall.args.command === "ls", "OpenAI-style function + string arguments work");
+  const flat = parseToolCall('<tool_call>{"name": "basespace", "section": "goals"}</tool_call>');
+  assert(flat.toolCall?.args.section === "goals" && !("name" in flat.toolCall.args), "flat arguments next to the name work");
 }
 
 async function testAdapterText(): Promise<void> {
