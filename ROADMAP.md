@@ -207,6 +207,14 @@ agent-os plus the Workbench. The idea is what's worth taking.
       provider groups the gateway can't use. **[UI]**
       `AgentEditorModal.tsx`. The CLI is installed on Codespace creation;
       log in once with `claude` → `/login`. **[Codespace]** `setup.sh`.
+- [x] Terminals inside the OS: the Workbench's Terminal panel runs the real
+      Claude Code CLI (or a shell) through the gateway, so you can use
+      Claude Code — and do its one-time `/login` — without leaving the OS.
+      Opt-in (`AGENT_OS_TERMINAL=1`), on in the Codespace. **[gateway]**
+      `terminal.ts`; **[UI]** `TerminalTab.tsx`.
+- [ ] Give the terminal's Claude Code the OS as context: an MCP server over
+      the gateway (BaseSpace snapshot, agents, approvals) so it can see and
+      act in BaseSpace like the in-OS agents do. **[gateway]**
 - [ ] Flows still run every step on the gateway default model
       (`server.ts`'s flow routes pass `deps.model`); route per step agent
       like chat turns do. **[gateway]**

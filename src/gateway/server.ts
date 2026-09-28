@@ -98,6 +98,7 @@ import { checkPathSandbox } from "../core/permissions.js";
 import type { SessionStatus, ApprovalStatus, ApprovalRequest, TaskStatus, NominationStatus } from "../core/types.js";
 import type { SandboxPolicy } from "../core/permissions.js";
 import type { ConfiguredHook } from "../core/configured-hooks.js";
+import { closeAllTerminals, closeTerminal, createTerminal, listTerminals, ptyBackend, resizeTerminal, streamTerminal, terminalsEnabled, writeTerminal } from "./terminal.js";
 import type { ArtifactType } from "../core/artifacts.js";
 import type { FlowStepDefinition } from "../core/flow-engine.js";
 
@@ -229,7 +230,10 @@ export function startGateway(deps: GatewayDeps, port = 0): Promise<GatewayHandle
       resolve({
         server,
         port: actualPort,
-        stop: () => new Promise<void>((res, rej) => server.close((err) => (err ? rej(err) : res()))),
+        stop: () => {
+          closeAllTerminals();
+          return new Promise<void>((res, rej) => server.close((err) => (err ? rej(err) : res())));
+        },
       });
     });
   });
@@ -301,6 +305,51 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
   if (method === "GET" && segments.length === 1 && segments[0] === "events") {
     handleEventStream(req, res, url);
     return;
+  }
+
+  // ---- Terminals (terminal.ts) — interactive Claude Code / shell sessions
+  // BaseSpace shows in its Workbench. Off unless AGENT_OS_TERMINAL=1. ----
+  if (segments[0] === "terminals") {
+    if (method === "GET" && segments.length === 1) {
+      sendJson(res, 200, { enabled: terminalsEnabled(), backend: await ptyBackend(), terminals: terminalsEnabled() ? listTerminals() : [] });
+      return;
+    }
+    if (!terminalsEnabled()) {
+      sendJson(res, 403, { error: "terminals are off — start the gateway with AGENT_OS_TERMINAL=1 to enable them" });
+      return;
+    }
+    const id = segments[1];
+    if (method === "POST" && segments.length === 1) {
+      const body = await readRequestBody(req);
+      try {
+        sendJson(res, 201, await createTerminal(body));
+      } catch (err) {
+        sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+    if (method === "GET" && segments.length === 3 && segments[2] === "stream") {
+      if (!streamTerminal(id, req, res)) sendJson(res, 404, { error: `no terminal ${id}` });
+      return;
+    }
+    if (method === "POST" && segments.length === 3 && segments[2] === "input") {
+      const body = await readRequestBody(req, 64 * 1024);
+      const data = typeof body.data === "string" ? body.data : "";
+      if (writeTerminal(id, data)) sendJson(res, 200, { ok: true });
+      else sendJson(res, 404, { error: `no running terminal ${id}` });
+      return;
+    }
+    if (method === "POST" && segments.length === 3 && segments[2] === "resize") {
+      const body = await readRequestBody(req);
+      if (resizeTerminal(id, body.cols, body.rows)) sendJson(res, 200, { ok: true });
+      else sendJson(res, 404, { error: `no running terminal ${id}` });
+      return;
+    }
+    if (method === "DELETE" && segments.length === 2) {
+      if (closeTerminal(id)) sendJson(res, 200, { ok: true });
+      else sendJson(res, 404, { error: `no terminal ${id}` });
+      return;
+    }
   }
 
   // Which model providers this gateway can use, for BaseSpace's agent

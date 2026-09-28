@@ -45,10 +45,14 @@
     "test-context-compaction": "tsc -b && node dist/test-context-compaction.js",
     "test-file-revisions": "tsc -b && node dist/test-file-revisions.js",
     "test-model-router": "tsc -b && node dist/test-model-router.js",
+    "test-terminal": "tsc -b && node dist/test-terminal.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
     "typescript": "^5.7.2"
+  },
+  "optionalDependencies": {
+    "node-pty": "^1.1.0"
   }
 }

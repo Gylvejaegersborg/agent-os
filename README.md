@@ -331,6 +331,36 @@ overrides where the CLI is; `AGENT_OS_CLAUDE_CLI_TIMEOUT_MS` (default
 180000) caps one call. `npm run test-model-router` covers it with a fake
 CLI; it was also run live against a logged-in CLI.
 
+## Terminals inside the OS — Claude Code in BaseSpace
+
+With `AGENT_OS_TERMINAL=1`, the gateway runs interactive terminal sessions
+that BaseSpace shows in the Workbench's **Terminal** panel: **Claude Code**
+(the real, full `claude` CLI, logged in with your own subscription) or a
+**shell**. Both start in BaseOStest's checkout (`BASEOS_REPO_DIR`), so Claude
+Code works on the OS itself. The first time, pick a theme and run `/login`;
+that same login is what the `claude-cli:` model provider uses.
+
+- The gateway owns the processes (`src/gateway/terminal.ts`): closing the
+  panel or reloading the page leaves them running, and reopening re-attaches
+  with recent scrollback. They end when the gateway restarts.
+- Plain HTTP, no WebSocket: output streams over SSE
+  (`GET /terminals/:id/stream`), keystrokes are `POST /terminals/:id/input`,
+  plus `POST /terminals` (`{profile: "claude" | "shell", cols, rows}`),
+  `POST /terminals/:id/resize`, `DELETE /terminals/:id` and `GET /terminals`.
+- PTY: `node-pty`, an **optional** dependency (it compiles a native module;
+  if that fails, `npm install` still succeeds). Without it, util-linux's
+  `script` provides the PTY and everything works except live resizing.
+  `AGENT_OS_TERMINAL_BACKEND=script` forces the fallback.
+- **Off by default, and it's a full shell as the gateway's user.** The
+  gateway has no auth, so only enable it where the gateway is reachable by
+  you alone. BaseOStest's Codespace turns it on because forwarded ports are
+  private to your GitHub login by default; never make them public while it's
+  on. (Anyone who can reach the gateway could already approve the `claude`
+  agent's shell commands, so this widens less than it sounds, but it skips
+  approvals entirely.)
+
+`npm run test-terminal` covers both PTY backends through the real routes.
+
 ## Skills — the open agentskills.io format
 
 Skills live under `./skills/<skill-name>/SKILL.md`, following the open
