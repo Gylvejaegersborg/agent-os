@@ -34,4 +34,5 @@ export * from "./cli-agent-worker.js";
 export * from "./model.js";
 export * from "./models/real.js";
 export * from "./agent-loop.js";
+export * from "./controls.js";
 export * from "./observability.js";

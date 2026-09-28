@@ -361,6 +361,57 @@ that same login is what the `claude-cli:` model provider uses.
 
 `npm run test-terminal` covers both PTY backends through the real routes.
 
+## The OS over MCP — for Claude Code and other MCP clients
+
+`POST /mcp` makes the gateway an MCP server (Model Context Protocol,
+Streamable HTTP in its simplest form: one JSON-RPC request per POST, a JSON
+reply; no dependency). Tools (`src/gateway/mcp.ts`):
+
+| Tool | Does |
+|---|---|
+| `basespace_read` | Reads the BaseSpace snapshot (summary, notes, projects, todos, events, crons, teams) |
+| `basespace_add` | Adds a note, todo or project update to BaseSpace (internal to the operator's own dashboard) |
+| `list_agents` | The agent team: role, model, status, capabilities |
+| `ask_agent` | Runs a turn with an agent, exactly like chatting in the Workbench; `sessionId` continues it |
+| `list_approvals` | The approval queue, read-only |
+
+There is deliberately no tool that approves or rejects: that stays with the
+operator. Every Claude Code session started from the Terminal panel gets
+this server automatically (`--mcp-config`) plus a line of context saying it
+runs inside the OS. Any other MCP client can use it too:
+
+```bash
+claude mcp add --transport http agent-os http://127.0.0.1:8787/mcp
+```
+
+Same trust as the rest of the gateway: no auth, so keep it private.
+`npm run test-mcp` covers it; it was also verified with the real Claude
+Code CLI.
+
+## Board controls — pause, resume, budgets
+
+The operator's live levers over each agent (`src/core/controls.ts`, from
+Paperclip's "board powers"):
+
+- **Pause/resume:** `POST /agents/:id/pause` (`{reason?}`) and
+  `POST /agents/:id/resume`. A paused agent takes no new turns.
+- **Budgets:** `PUT /agents/:id/budget` with `{period: "day" | "week" |
+  "month", limitTokens, warnAt?}` (`limitTokens: null` removes it). An
+  `agent.budget.warning` event fires once at `warnAt` (default 80%) and
+  `agent.budget.exceeded` once at the limit; from then on new turns are
+  refused until the period rolls over (UTC) or the limit is raised — the
+  block is derived from usage, never stuck.
+- Enforced in `runTurn()`, so it covers chat, flows, crons, heartbeats,
+  subagents and MCP. A refused turn is written to the session with the
+  reason and answered with HTTP 409 `{blocked}`. Crons, heartbeats and
+  automations skip a blocked agent instead of recording failures. A turn
+  already running finishes.
+- Tokens, not dollars: what each provider reports (the Claude CLI includes
+  cached input). Every agent record carries `control` (pause, budget, this
+  period's usage, `blocked`). No agent tool can change any of this.
+
+`npm run test-controls` covers it.
+
 ## Skills — the open agentskills.io format
 
 Skills live under `./skills/<skill-name>/SKILL.md`, following the open

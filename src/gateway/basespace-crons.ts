@@ -25,6 +25,7 @@ import {
   runTurn,
   newSessionId,
   createModelForAgent,
+  agentIsBlocked,
   publishEvent,
   type ModelAdapter,
   type Worker,
@@ -144,6 +145,12 @@ export function startBaseSpaceCronRunner(deps: BaseSpaceCronDeps): { stop: () =>
 }
 
 async function runStandup(deps: BaseSpaceCronDeps, cron: SnapshotCron, team: SnapshotTeam, lead: string, slot: Date): Promise<void> {
+  // A paused or over-budget chair (controls.ts) skips the meeting instead of
+  // recording a failed task every slot.
+  if (await agentIsBlocked(lead)) {
+    console.log(`[basespace-crons] skipped "${cron.name}" for ${team.name}: ${lead} is paused or over budget`);
+    return;
+  }
   const goal = standupPrompt(cron, team, slot);
   const task = await createTask({ type: "cron", agentId: lead, input: { source: "basespace", cronId: cron.id, team: team.id, goal } });
   await transitionTask(task.id, "running");

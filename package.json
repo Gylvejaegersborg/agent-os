@@ -46,6 +46,8 @@
     "test-file-revisions": "tsc -b && node dist/test-file-revisions.js",
     "test-model-router": "tsc -b && node dist/test-model-router.js",
     "test-terminal": "tsc -b && node dist/test-terminal.js",
+    "test-mcp": "tsc -b && node dist/test-mcp.js",
+    "test-controls": "tsc -b && node dist/test-controls.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {

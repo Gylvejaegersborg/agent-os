@@ -212,9 +212,12 @@ agent-os plus the Workbench. The idea is what's worth taking.
       Claude Code — and do its one-time `/login` — without leaving the OS.
       Opt-in (`AGENT_OS_TERMINAL=1`), on in the Codespace. **[gateway]**
       `terminal.ts`; **[UI]** `TerminalTab.tsx`.
-- [ ] Give the terminal's Claude Code the OS as context: an MCP server over
-      the gateway (BaseSpace snapshot, agents, approvals) so it can see and
-      act in BaseSpace like the in-OS agents do. **[gateway]**
+- [x] The terminal's Claude Code gets the OS as context: the gateway is an
+      MCP server (`/mcp`: `basespace_read`, `basespace_add`, `list_agents`,
+      `ask_agent`, `list_approvals`), wired into every Claude Code terminal
+      session. Approvals stay operator-only — no MCP tool decides one.
+      Verified with the real CLI (it read the team and a project and added a
+      todo). **[gateway]** `mcp.ts`.
 - [ ] Flows still run every step on the gateway default model
       (`server.ts`'s flow routes pass `deps.model`); route per step agent
       like chat turns do. **[gateway]**
@@ -311,3 +314,72 @@ screenshot-driven computer use.
 - [ ] The event log is already a dataset of approved turns and tool calls:
       the realistic first step toward an own model is a LoRA fine-tune of a
       small open model on it, not training from scratch.
+
+## 7. Running the team like an organization (from Paperclip)
+
+[paperclipai/paperclip](https://github.com/paperclipai/paperclip) (MIT)
+treats agents as a company: goals every task traces back to, an org chart
+with reporting lines, delegation through tasks, budgets that stop
+spending, and a human "board" with live controls and approval gates. We're
+not adopting the app (it's a whole control plane beside ours); these are
+the ideas, mapped onto what agent-os and BaseSpace already have. Read from
+`doc/SPEC.md`, `doc/PRODUCT.md`, `doc/TASK-WATCHDOG.md` and the companies
+spec at their 2026-09-28 state.
+
+**Already here in some form:** agent roles and capabilities (agents.ts);
+teams with a lead (BaseSpace `teams.ts`); a task ledger with parent tasks
+(tasks.ts); heartbeats and crons; approvals; per-session token counts.
+
+Ordered so each step is safe before the next adds autonomy:
+
+- [x] **Board controls.** Pause/resume any agent, and a token budget per
+      day/week/month with a warning at 80% and a hard stop at the limit.
+      Enforced once in `runTurn()`, so chat, flows, crons, heartbeats,
+      subagents and MCP's `ask_agent` all respect it; scheduled work skips a
+      blocked agent instead of failing every cycle. A budget block lifts on
+      its own when the period rolls over. Operator-only: no agent tool.
+      Tokens, not dollars. **[core]** `controls.ts`; **[gateway]**
+      `POST /agents/:id/pause|resume`, `PUT /agents/:id/budget`, `control`
+      on every agent record; **[UI]** Controls in the agent editor, a
+      "Paused"/"Over budget" marker in the agent list.
+- [ ] **Goals and the "why" chain.** Goals (e.g. "Release Switch in
+      October") as first-class records; every task can point at a parent
+      task or a goal, and each turn gets the chain injected ("you're doing
+      X because Y because goal Z"). Paperclip's single most effective
+      alignment trick, and cheap: it's context, not a model. BaseSpace
+      projects are the natural goals. **[core]** **[UI]**
+- [ ] **Reporting lines + delegation through tasks.** `reportsTo` on each
+      agent (Hemera → the others, Argus alongside), an agent inbox (tasks
+      assigned to it), and a `delegate` tool that creates a task for another
+      agent instead of chatting at it. Paperclip's acceptance rules: an
+      agent can't cancel work handed to it — it does it, marks it blocked,
+      or hands it back to its manager with a reason. Track request depth,
+      and bill a delegated task's tokens to whoever asked (billing codes).
+      Single assignee with atomic checkout (tasks.ts's revisioning already
+      gives the conflict check). **[core]** **[gateway]** **[UI]** an org
+      chart view over BaseSpace teams.
+- [ ] **Heartbeat work loop.** On each heartbeat an agent checks its inbox
+      and works the highest-priority task, instead of free-form prompts.
+      Only after budgets exist (done) and delegation exists. **[core]**
+- [ ] **Governance gates.** Agent-proposed hires (a new agent) and a lead's
+      plan for a goal go to the approval queue before anything runs.
+      Agent config changes (persona, model, budget) are revisioned with
+      rollback — the event log already keeps history; this needs a "restore
+      this version" action. **[core]** **[UI]**
+- [ ] **Task watchdog.** Opt-in per task tree: when every task in it has
+      stopped (done, blocked, failed), a named verifier agent (Argus) checks
+      the claims against the evidence and either accepts or re-opens with a
+      reason. Paperclip's rule: report problems, don't silently fix them.
+      **[core]**
+- [ ] **Stale-work visibility.** Surface tasks running with no recent
+      activity on a dashboard instead of auto-reassigning them (tasks.ts's
+      `reconcileLostTasks()` already detects some). **[UI]**
+- [ ] **Team templates.** Export/import a team (agents, personas, skills,
+      budgets, reporting lines) as markdown files, like Paperclip's
+      `COMPANY.md`/`TEAM.md`/`AGENTS.md` package, with secrets stripped.
+      Makes the ISΛRK team reproducible and shareable. **[core]** **[UI]**
+
+**Deliberately not copying:** multiple companies per instance and
+enterprise RBAC (one operator here); "not a chatbot" as a hard rule — the
+Workbench keeps chat, but work that comes out of a chat should become a
+task attached to a goal; dollar-cost tracking without a real price source.

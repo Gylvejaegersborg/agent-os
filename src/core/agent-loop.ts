@@ -4,6 +4,7 @@
 // Every turn is written to the session's event stream, so resume/replay/
 // observability for free (see eventlog.ts).
 
+import { AgentBlockedError, assertAgentMayRun, recordAgentUsage } from "./controls.js";
 import { hindsightConfigured, hindsightRecall, hindsightReflect, hindsightRetain } from "./hindsight.js";
 import { addOverlayItem, readSnapshotSection, type OverlayKind } from "./basespace.js";
 import * as fs from "node:fs/promises";
@@ -546,6 +547,19 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // a real, listable/cancellable registry entry for free.
   await ensureSession(sessionId, agentId);
 
+  // Board controls (controls.ts): a paused or over-budget agent takes no new
+  // turns, whichever path the turn came from. Recorded in the session so the
+  // conversation shows why instead of the message vanishing.
+  try {
+    await assertAgentMayRun(agentId);
+  } catch (err) {
+    if (err instanceof AgentBlockedError) {
+      await appendEvent(sessionStream(sessionId), "session.message", { role: "user", content: userMessage });
+      await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: err.message, blocked: err.blocked });
+    }
+    throw err;
+  }
+
   await appendEvent(sessionStream(sessionId), "agent.turn.start", { agentId, userMessage });
   await fireHook("agent.turn.start", { agentId, sessionId, payload: { userMessage } });
   // Published on the real event bus (eventbus.ts), NOT a second/parallel
@@ -779,6 +793,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     const message = err instanceof Error ? err.message : String(err);
     finalContent = `⚠ ${message}`;
     const usage = sawUsage ? { inputTokens: usageInputTokens, outputTokens: usageOutputTokens } : undefined;
+    if (usage) await recordAgentUsage(agentId, usage, sessionId);
     await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent, error: true });
     await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled, error: message, usage });
     await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled, error: message, usage } });
@@ -806,6 +821,9 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   }
 
   const usage = sawUsage ? { inputTokens: usageInputTokens, outputTokens: usageOutputTokens } : undefined;
+  // Counts toward the agent's budget (controls.ts) — including a cancelled
+  // turn's tokens, since those were spent too.
+  if (usage) await recordAgentUsage(agentId, usage, sessionId);
   if (!cancelled && finalContent) {
     // Every completed exchange goes to Hindsight (when configured) so it can
     // extract facts/experiences from it; no-op otherwise.

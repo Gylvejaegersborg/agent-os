@@ -142,6 +142,31 @@ async function spawnPty(file: string, args: string[], cols: number, rows: number
   };
 }
 
+// ---- Claude Code wired into the OS ----
+
+let gatewayUrl: string | undefined;
+/** Set by startGateway() once it's listening, so Claude Code sessions can
+ *  reach this gateway's /mcp (mcp.ts). */
+export function setTerminalGatewayUrl(url: string): void {
+  gatewayUrl = url;
+}
+
+/** Claude Code started from the OS gets the OS as MCP tools (BaseSpace,
+ *  the agent team, the approval queue) and a line of context saying where
+ *  it is. Its own tools, permissions and login are untouched: this is your
+ *  normal Claude Code, plus the OS. */
+function claudeArgs(): string[] {
+  if (!gatewayUrl) return [];
+  const mcpConfig = { mcpServers: { "agent-os": { type: "http", url: `${gatewayUrl}/mcp` } } };
+  return [
+    "--mcp-config", JSON.stringify(mcpConfig),
+    "--append-system-prompt",
+    "You're running inside ISΛRK's personal OS (BaseSpace + Agent-OS). The agent-os MCP tools read and add to BaseSpace " +
+      "(notes, projects, todos, calendar), list the agent team and approval queue, and hand work to an agent (ask_agent). " +
+      "Anything outward-facing (posts, uploads, emails) goes through Agent-OS approvals, which only the operator decides.",
+  ];
+}
+
 // ---- Sessions ----
 
 function clampSize(n: unknown, fallback: number, min: number, max: number): number {
@@ -170,7 +195,7 @@ export async function createTerminal(input: { profile?: unknown; cols?: unknown;
 
   const [file, args, title] =
     profile === "claude"
-      ? [claudeCliCommand(), [] as string[], "Claude Code"]
+      ? [claudeCliCommand(), claudeArgs(), "Claude Code"]
       : [process.env.SHELL || "bash", [] as string[], "Shell"];
 
   const info: TerminalInfo = { id: generateId(), profile, title, cwd, createdAt: new Date().toISOString(), cols, rows };

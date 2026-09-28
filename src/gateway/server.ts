@@ -47,6 +47,11 @@ import {
   runTurn,
   createModelForAgent,
   listProviders,
+  AgentBlockedError,
+  getAgentControlState,
+  pauseAgent,
+  resumeAgent,
+  setAgentBudget,
   getSessionHistory,
   getSessionUsage,
   newSessionId,
@@ -98,7 +103,8 @@ import { checkPathSandbox } from "../core/permissions.js";
 import type { SessionStatus, ApprovalStatus, ApprovalRequest, TaskStatus, NominationStatus } from "../core/types.js";
 import type { SandboxPolicy } from "../core/permissions.js";
 import type { ConfiguredHook } from "../core/configured-hooks.js";
-import { closeAllTerminals, closeTerminal, createTerminal, listTerminals, ptyBackend, resizeTerminal, streamTerminal, terminalsEnabled, writeTerminal } from "./terminal.js";
+import { handleMcp, type McpDeps } from "./mcp.js";
+import { closeAllTerminals, closeTerminal, setTerminalGatewayUrl, createTerminal, listTerminals, ptyBackend, resizeTerminal, streamTerminal, terminalsEnabled, writeTerminal } from "./terminal.js";
 import type { ArtifactType } from "../core/artifacts.js";
 import type { FlowStepDefinition } from "../core/flow-engine.js";
 
@@ -220,6 +226,11 @@ export function startGateway(deps: GatewayDeps, port = 0): Promise<GatewayHandle
       try {
         await route(req, res, deps);
       } catch (err) {
+        // A paused or over-budget agent (controls.ts) is a refusal, not a crash.
+        if (err instanceof AgentBlockedError) {
+          sendJson(res, 409, { error: err.message, blocked: err.blocked, agentId: err.agentId });
+          return;
+        }
         sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
       }
     });
@@ -227,6 +238,7 @@ export function startGateway(deps: GatewayDeps, port = 0): Promise<GatewayHandle
     server.listen(port, "127.0.0.1", () => {
       const address = server.address();
       const actualPort = typeof address === "object" && address ? address.port : port;
+      setTerminalGatewayUrl(`http://127.0.0.1:${actualPort}`);
       resolve({
         server,
         port: actualPort,
@@ -237,6 +249,38 @@ export function startGateway(deps: GatewayDeps, port = 0): Promise<GatewayHandle
       });
     });
   });
+}
+
+/** What mcp.ts needs from the gateway: an agent turn run exactly the way
+ *  POST /sessions/:id/turns runs one (same model routing, tools, sandbox
+ *  and approvals), in a new session unless one is given. */
+function mcpDeps(deps: GatewayDeps): McpDeps {
+  return {
+    async askAgent(agentId, message, sessionId) {
+      let session = sessionId ? await getSession(sessionId) : undefined;
+      if (sessionId && (!session || session.agentId !== agentId)) {
+        throw new Error(`no session ${sessionId} for agent ${agentId}`);
+      }
+      if (!(await getAgentRecord(agentId))) throw new Error(`no agent "${agentId}" — see list_agents`);
+      session ??= await createSession({ agentId, title: "From Claude Code" });
+      const model = (await createModelForAgent(agentId)) ?? deps.model;
+      const result = await runTurn({
+        sessionId: session.id,
+        agentId,
+        userMessage: message,
+        model,
+        worker: deps.worker,
+        skills: deps.skills,
+        enableSubagents: deps.enableSubagents,
+        enableMemoryNominations: deps.enableMemoryNominations,
+        enableArtifacts: deps.enableArtifacts,
+        enableBaseSpace: deps.enableBaseSpace,
+        sandboxPolicy: deps.sandboxPolicy,
+        maxToolHops: deps.maxToolHops,
+      });
+      return { sessionId: session.id, reply: result.finalContent, toolCalled: result.toolCalled };
+    },
+  };
 }
 
 /** Runs one follow-up turn in the session whose tool call was waiting on
@@ -304,6 +348,14 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
 
   if (method === "GET" && segments.length === 1 && segments[0] === "events") {
     handleEventStream(req, res, url);
+    return;
+  }
+
+  // ---- MCP (mcp.ts) — the OS as tools for Claude Code (the Terminal
+  // panel wires it in) or any other MCP client. ----
+  if (segments.length === 1 && segments[0] === "mcp") {
+    const body = method === "POST" ? await readRequestBody(req) : undefined;
+    await handleMcp(req, res, body, mcpDeps(deps));
     return;
   }
 
@@ -428,6 +480,26 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
   // worker/metrics from Agent-OS instead of maintaining its own mock
   // roster (see Phase 4 of the architecture plan). ----
   if (segments[0] === "agents") {
+    // ---- Board controls (controls.ts): pause/resume and token budgets.
+    // Operator-only by design — agents get no tool for these. ----
+    if (segments.length === 3 && ["pause", "resume", "budget"].includes(segments[2]!) && (method === "POST" || method === "PUT")) {
+      const agentId = segments[1]!;
+      if (!(await getAgentRecord(agentId))) {
+        sendJson(res, 404, { error: `no such agent: ${agentId}` });
+        return;
+      }
+      const body = await readRequestBody(req);
+      try {
+        if (segments[2] === "pause") await pauseAgent(agentId, { reason: typeof body.reason === "string" ? body.reason : undefined, by: "operator" });
+        else if (segments[2] === "resume") await resumeAgent(agentId, { by: "operator" });
+        else await setAgentBudget(agentId, body);
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+        return;
+      }
+      sendJson(res, 200, await getAgentControlState(agentId));
+      return;
+    }
     if (method === "GET" && segments.length === 1) {
       sendJson(res, 200, { agents: await listAgentRecords() });
       return;

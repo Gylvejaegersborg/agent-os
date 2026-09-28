@@ -19,6 +19,7 @@
 
 import { getAgentIdentity, listAgentIdentities, registerAgentIdentity, updateAgentIdentity, type AgentIdentity } from "./identity.js";
 import { getAgentDefaultModel } from "./models/real.js";
+import { getAgentControlState, type AgentControlState } from "./controls.js";
 import { listSessions } from "./session.js";
 import { listTasks } from "./tasks.js";
 import { computeMetricsSnapshot, type MetricsSnapshot } from "./observability.js";
@@ -33,6 +34,9 @@ export interface AgentRecord {
   capabilities: string[];
   defaultModel?: string;
   status: AgentLiveStatus;
+  /** Board controls (controls.ts): pause state, budget and this period's
+   *  token use. `control.blocked` says why a new turn would be refused. */
+  control: AgentControlState;
   /** The most recently active Session for this agent, if any exist at
    *  all — "most recently active" meaning the highest updatedAt, active
    *  status preferred over any other. Undefined only when this agent has
@@ -126,10 +130,11 @@ async function deriveLiveState(
 }
 
 async function composeRecord(identity: AgentIdentity): Promise<AgentRecord> {
-  const [defaultModel, live, metrics] = await Promise.all([
+  const [defaultModel, live, metrics, control] = await Promise.all([
     getAgentDefaultModel(identity.id),
     deriveLiveState(identity.id),
     computeMetricsSnapshot(identity.id),
+    getAgentControlState(identity.id),
   ]);
   return {
     id: identity.id,
@@ -139,6 +144,7 @@ async function composeRecord(identity: AgentIdentity): Promise<AgentRecord> {
     capabilities: identity.capabilities ?? [],
     defaultModel,
     ...live,
+    control,
     metrics,
     createdAt: identity.createdAt,
     updatedAt: identity.updatedAt,
