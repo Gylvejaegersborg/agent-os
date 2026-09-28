@@ -8,7 +8,7 @@
 
 import * as path from "node:path";
 import {
-  createModelFromEnvOrOllama,
+  createDefaultModel,
   createStubModel,
   createLocalShellWorker,
   createSandboxedWorker,
@@ -135,10 +135,13 @@ async function main(): Promise<void> {
   const configuredHooks = await loadConfiguredHooks(hooksFile);
   console.log(`[gateway] configured hooks: ${configuredHooks.length} loaded from ${hooksFile}`);
 
-  const model = (await createModelFromEnvOrOllama()) ?? createStubModel();
+  // AGENT_OS_DEFAULT_MODEL (e.g. "claude-cli:sonnet") picks the default
+  // provider/model; unset, it's Anthropic → OpenAI → Ollama as before.
+  // Agents can still name their own (models/real.ts's provider router).
+  const model = (await createDefaultModel()) ?? createStubModel();
   if (model.id === "stub-model") {
     console.log(
-      "[gateway] no ANTHROPIC_TOKEN/ANTHROPIC_API_KEY/OPENAI_API_KEY set and Ollama not reachable — " +
+      "[gateway] no ANTHROPIC_API_KEY/OPENAI_API_KEY set, AGENT_OS_DEFAULT_MODEL unset or unusable, and Ollama not reachable — " +
         "running with the deterministic stub model. Set a provider env var for real model calls.",
     );
   } else {

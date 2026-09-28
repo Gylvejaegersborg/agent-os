@@ -46,6 +46,7 @@ import {
   renameSession,
   runTurn,
   createModelForAgent,
+  listProviders,
   getSessionHistory,
   getSessionUsage,
   newSessionId,
@@ -299,6 +300,14 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
 
   if (method === "GET" && segments.length === 1 && segments[0] === "events") {
     handleEventStream(req, res, url);
+    return;
+  }
+
+  // Which model providers this gateway can use, for BaseSpace's agent
+  // editor. An agent's defaultModel can name any of them ("claude-cli:sonnet",
+  // "ollama:llama3.2:3b", ...); see models/real.ts's provider router.
+  if (method === "GET" && segments.length === 1 && segments[0] === "providers") {
+    sendJson(res, 200, { providers: await listProviders(), defaultModel: deps.model.id });
     return;
   }
 

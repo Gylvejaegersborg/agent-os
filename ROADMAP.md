@@ -153,3 +153,153 @@ gaps above:
 - Memory's dreaming-pass gate: the model can never write curated memory
   directly, only nominate — a human always approves before anything
   durable changes.
+
+---
+
+# External integrations plan
+
+From a review of seven outside repos on 2026-09-28, each read from its
+source at that date rather than its README. The goal: make every agent
+more efficient through the harness (the hardware can't run a big model),
+run on Claude and local models side by side, and grow toward voice, a
+knowledge graph and computer use. Numbered in the order they're being
+done. Tags as above, plus **[Codespace]** for BaseOStest's
+`.devcontainer/` scripts.
+
+## 1. Provider router + Claude through the official CLI — done
+
+Why: the gateway picked ONE provider for every agent (first credential
+found: Anthropic → OpenAI → Ollama). And the only way to use a Claude
+subscription was to send its OAuth token straight to the API from this
+harness (`ANTHROPIC_TOKEN` in `models/real.ts`), the pattern Anthropic
+has been restricting for third-party tools.
+
+What [stablyai/orca](https://github.com/stablyai/orca) and
+[paperclipai/paperclip](https://github.com/paperclipai/paperclip) do
+instead: start the official `claude` CLI and let it use its own login.
+Paperclip's `claude-local` adapter runs
+`claude --print --output-format stream-json`. Neither app itself is worth
+adopting here. Orca is a desktop IDE for a human running coding agents in
+worktrees, and Paperclip is a whole control plane that overlaps ~70% with
+agent-os plus the Workbench. The idea is what's worth taking.
+
+- [x] Provider router: an agent's model preference can name its provider
+      (`claude-cli:sonnet`, `ollama:llama3.2:3b`, `anthropic:<id>`,
+      `openai:<id>`), so agents on one gateway can use different
+      providers. A preference still can't grant access the gateway process
+      doesn't already have; an unusable provider falls back to the default
+      with a one-time warning. `AGENT_OS_DEFAULT_MODEL` sets the gateway
+      default. **[core]** `models/real.ts` (`parseModelRef`,
+      `createModelFromRef`, `createDefaultModel`, `listProviders`);
+      **[gateway]** `GET /providers`.
+- [x] `claude-cli` provider: each model call is one `claude -p` run with
+      Claude Code's built-in tools switched off. Agent-OS's tools are
+      offered through a small `<tool_call>{…}</tool_call>` text protocol and
+      parsed back into a normal tool call, so plan mode, policy, hooks,
+      approvals and the sandbox still apply. Streams text live and hides
+      the tool block from the stream. Verified live against a logged-in
+      CLI (a real turn called `shell` and answered from its output).
+      **[core]** `models/claude-cli.ts`; `npm run test-model-router`.
+- [x] `OPENAI_BASE_URL` points the OpenAI adapter at any OpenAI-compatible
+      server (LM Studio, vLLM, llama.cpp, OpenRouter): the slot for future
+      providers and subscriptions. **[core]**
+- [x] Agent editor offers "Claude — your subscription" and labels
+      provider groups the gateway can't use. **[UI]**
+      `AgentEditorModal.tsx`. The CLI is installed on Codespace creation;
+      log in once with `claude` → `/login`. **[Codespace]** `setup.sh`.
+- [ ] Flows still run every step on the gateway default model
+      (`server.ts`'s flow routes pass `deps.model`); route per step agent
+      like chat turns do. **[gateway]**
+- [ ] Per-agent token budgets that pause an agent at its limit
+      (Paperclip's best idea). Token counts already exist
+      (`getSessionUsage()`). **[core]** **[UI]**
+- [ ] Retire the `ANTHROPIC_TOKEN` direct-OAuth path once `claude-cli` has
+      proven itself; keep `ANTHROPIC_API_KEY` (pay-per-token) as is. **[core]**
+
+## 2. Hindsight: fix, then turn on — in progress
+
+[vectorize-io/hindsight](https://github.com/vectorize-io/hindsight) (MIT).
+The client in `hindsight.ts` was checked against Hindsight 0.10.1's server
+code and a real server: the retain, recall and reflect bodies are
+accepted as sent (no `X-Ignored-Params`), `async` is a valid alias, and
+per-item `tags` and `budget: "low"` are real fields.
+
+- [x] Recall ran on every tool step of a turn (`renderMemoryContext` sat
+      inside the hop loop), up to 3 identical 4s calls per message. Now
+      once per turn. **[core]** `agent-loop.ts`; asserted in
+      `test-basespace`.
+- [x] It was never actually on: nothing started Hindsight or set
+      `HINDSIGHT_URL`. Codespaces have no Docker, so the README's
+      `docker run` couldn't work there. Opt-in with the Codespace secret
+      `HINDSIGHT_ENABLED=1`: runs the server through `uvx`, uses the
+      Codespace's Ollama for fact extraction, and sets `HINDSIGHT_URL` for
+      the gateway. **[Codespace]** `hindsight.sh`, `start.sh`.
+- [ ] Pick the extraction LLM deliberately. Hindsight's default for Ollama
+      is `gemma3:12b` (too big here); the Codespace uses the agents' own
+      3B model, which extracts poorly. `HINDSIGHT_LLM_PROVIDER=claude-code`
+      (Hindsight's own Claude CLI provider) is worth trying once the CLI is
+      logged in.
+- [ ] Use what's unused: mental models (`/mental-models`, living documents
+      Hindsight keeps current), tag-filtered recall, document ingestion
+      (`/files/retain`) for Notes. **[core]**
+- Note: episodic writes are mirrored into Hindsight too, but the only live
+  caller is an approved memory nomination, so that's a small, deliberate
+  duplicate of a human-confirmed fact, not double extraction of every turn.
+
+## 3. Knowledge graph (not built yet)
+
+[Tencent/WeKnora](https://github.com/Tencent/WeKnora) (MIT, Go) is document
+RAG, not agent memory: its own agent, chat, sandboxes and chat-app
+channels, Postgres + Redis + a parser service, and its graph needs Neo4j.
+Too heavy for this hardware and it duplicates much of the stack. Revisit
+only for large PDF/Office collections.
+
+- [ ] Build the graph from Hindsight's entities (`/entities/graph`) plus
+      the `[[wikilinks]]` in BaseSpace's Notes vault, and render it with the
+      existing `features/constellation` 3D view. **[core]** **[UI]**
+
+Memory layers: built-in curated memory stays the small, human-approved
+"who I am / how I work" layer; Hindsight is the experience and entity
+layer; Notes are the documents.
+
+## 4. Skills + CLI-Anything for computer use
+
+[HKUDS/CLI-Anything](https://github.com/HKUDS/CLI-Anything) (Apache-2.0)
+wraps apps' own backends as JSON-emitting CLIs, each with a `SKILL.md` in
+the same format as `skills/`. That suits small models far better than
+screenshot-driven computer use.
+
+- [ ] `parseSkillFile` reads YAML block scalars (`description: >-`) as the
+      literal text `">-"`, so every CLI-Anything skill imports with an empty
+      description. Tested against `cli-anything-audacity`. **[core]**
+      `skills.ts`.
+- [ ] Try Audacity, Rekordbox, MuseScore, Kdenlive/Shotcut, OBS, n8n and
+      Obsidian. They change files, so only the `claude` agent (the one with
+      shell) gets them, through approvals.
+- For real screen-and-mouse control, Orca's `orca computer …` commands
+  exist, but they need a vision model the local hardware can't run well.
+
+## 5. Voice for HUD mode and live chat
+
+- [ ] [debpalash/VoiceStudio](https://github.com/debpalash/VoiceStudio):
+      local speech-to-text over an OpenAI-compatible endpoint
+      (`:3900/v1/audio/transcriptions`) plus a streaming WebSocket, TTS and
+      MCP. First use: the Workbench mic button (`ConversationPane.tsx`)
+      records a `.webm` that no agent can hear, so transcribe it before
+      sending. AGPL-3.0, so keep it an unmodified separate service called
+      over HTTP.
+- [ ] [Tencent-Hunyuan/AuK](https://github.com/Tencent-Hunyuan/AuK) (MIT):
+      1.5B speech generation/editing, ~17–25 GiB GPU memory even with CPU
+      offload. Not for this hardware; maybe later for vocal edits via its
+      GGUF port (audio.cpp).
+- Live voice chat is limited by LLM response speed, not the voice layer.
+
+## 6. Harness efficiency for small models, then an own model
+
+- [ ] Adapters take one tool call per model response (`real.ts` header).
+- [ ] Tool results go back as plain user text on OpenAI-style providers;
+      small models follow real `tool` messages better.
+- [ ] Agents get 3 tool steps per message (`maxToolHops`).
+- [ ] The event log is already a dataset of approved turns and tool calls:
+      the realistic first step toward an own model is a LoRA fine-tune of a
+      small open model on it, not training from scratch.

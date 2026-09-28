@@ -14,6 +14,7 @@
 // Run with: node dist/test-identity-wiring.js
 
 import "./test-helpers/isolate.js";
+import { resetClaudeCliAvailability } from "./core/models/claude-cli.js";
 import {
   registerAgentIdentity,
   getAgentIdentity,
@@ -145,6 +146,11 @@ async function main(): Promise<void> {
   // we can't assume that in CI — so explicitly probe createModelFromEnv()
   // with no args first to establish ground truth for this run).
   const envHasProvider = createModelFromEnv() !== undefined;
+  // An installed Claude CLI is also a provider this environment grants (a
+  // bare "claude-…" preference uses it — see models/real.ts's router), so
+  // pin it to "not installed" here the same way Ollama is pinned below.
+  process.env.CLAUDE_CLI_PATH = "/nonexistent/claude";
+  resetClaudeCliAvailability();
   const resolvedForPreffedAgent = await createModelForAgent(modelPrefAgentId, {
     // point Ollama probing at a deliberately unreachable port so this
     // test is not flaky depending on whether the machine happens to

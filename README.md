@@ -33,7 +33,7 @@ independently — see `docs/architecture.md §0`.
 |---|---|---|
 | Event log (append-only, JSONL, projections) | ✅ working | `src/core/eventlog.ts` |
 | Agent loop (turn = LLM call + tool calls, event-sourced) | ✅ working | `src/core/agent-loop.ts` |
-| Model abstraction (swappable adapter interface) | ✅ working — stub + real Anthropic/OpenAI/Ollama adapters | `src/core/model.ts`, `src/core/models/real.ts` |
+| Model abstraction (swappable adapter interface) | ✅ working — stub + real Anthropic/OpenAI/Ollama/Claude-CLI adapters, per-agent provider routing | `src/core/model.ts`, `src/core/models/real.ts`, `src/core/models/claude-cli.ts` |
 | Worker abstraction (execution environment, separate from Agent identity) | ✅ working (local-shell + stub) | `src/core/worker.ts` |
 | Task / Flow (OpenClaw's ledger + orchestration split, with optimistic-concurrency revisioning) — **timeout + 'lost' enforcement, real notifyPolicy wiring, and Flow.kind:'mirrored' now implemented** | ✅ working | `src/core/tasks.ts` |
 | Subagent delegation (in-process, isolated context, same harness) | ✅ working — PRIMARY/default multiagent mechanism | `src/core/subagent.ts` |
@@ -296,6 +296,40 @@ npm run test-live-model
 
 If none of the above are available, the command exits with a clear error
 instead of silently falling back to the stub.
+
+## Model providers — one gateway, several providers
+
+Each agent's model preference (`defaultModel`, set in BaseSpace's agent
+editor or via `POST/PUT /agents`) can name its provider, so agents on the
+same gateway can run on different ones:
+
+| Preference | Provider | Needs on the gateway machine |
+|---|---|---|
+| `claude-cli:sonnet` (or `:opus`, `:haiku`, a full id) | Your Claude subscription through the official Claude Code CLI | `claude` installed and logged in once (`claude` → `/login`) |
+| `anthropic:<model id>` | Anthropic API, pay per token | `ANTHROPIC_API_KEY` |
+| `openai:<model id>` | OpenAI, or any OpenAI-compatible server | `OPENAI_API_KEY`, and/or `OPENAI_BASE_URL` (e.g. LM Studio `http://localhost:1234/v1`) |
+| `ollama:<model>` (e.g. `ollama:llama3.2:3b`) | Local Ollama | `ollama serve` reachable |
+| a bare name (`llama3.2:3b`, `claude-sonnet-5`, …) | As before: Anthropic → OpenAI → Ollama; a bare `claude-…` name uses the CLI when there's no Anthropic key | — |
+
+A preference can only pick a provider the gateway already has access to;
+anything else falls back to the default with a one-time warning.
+`AGENT_OS_DEFAULT_MODEL` (same syntax) sets the default for agents without
+a preference, e.g. `AGENT_OS_DEFAULT_MODEL=claude-cli:sonnet`.
+`GET /providers` lists what this gateway can use.
+
+**How `claude-cli` works** (`src/core/models/claude-cli.ts`): each model call
+is one `claude -p --output-format stream-json` run, fed the conversation on
+stdin, with Claude Code's own tools switched off (`--tools ""`). Agent-OS's
+tools are described in the system prompt and the model asks for one with a
+`<tool_call>{"name": …, "args": …}</tool_call>` block, which the adapter
+turns back into a normal tool call — so plan mode, permissions, hooks,
+approvals and the sandbox all still apply. This is the same way Orca and
+Paperclip use a Claude subscription: through Anthropic's own CLI rather
+than by sending the subscription's token to the API from a third-party app
+(which is what the older `ANTHROPIC_TOKEN` path does). `CLAUDE_CLI_PATH`
+overrides where the CLI is; `AGENT_OS_CLAUDE_CLI_TIMEOUT_MS` (default
+180000) caps one call. `npm run test-model-router` covers it with a fake
+CLI; it was also run live against a logged-in CLI.
 
 ## Skills — the open agentskills.io format
 
@@ -1001,7 +1035,7 @@ When it's on:
 - every completed exchange and every episodic memory write is retained into the
   agent's own bank (`<HINDSIGHT_BANK_PREFIX or "agent-os">-<agentId>`);
 - each turn's system message gets a "Recalled from long-term memory" block for the
-  user's message;
+  user's message (recalled once per turn, not on every tool step);
 - agents get a `recall-memory` tool ({query, deep?}; `deep` uses reflect).
 
 Run it (one container with its own embedded Postgres; it needs an LLM key for fact
@@ -1015,6 +1049,18 @@ docker run -d --name hindsight --restart unless-stopped -p 8888:8888 -p 9999:999
 
 HINDSIGHT_URL=http://127.0.0.1:8888 npm run gateway
 ```
+
+Without Docker (a Codespace has none), run the same server through `uv`, here with
+a local Ollama doing the fact extraction:
+
+```bash
+HINDSIGHT_API_LLM_PROVIDER=ollama HINDSIGHT_API_LLM_MODEL=llama3.2:3b \
+HINDSIGHT_API_LLM_BASE_URL=http://localhost:11434/v1 \
+  uvx --from hindsight-api==0.10.1 hindsight-api --port 8888 --idle-timeout 0
+```
+
+It refuses to run as root (its embedded Postgres won't). In a BaseOStest Codespace, set
+the secret `HINDSIGHT_ENABLED=1` and `.devcontainer/hindsight.sh` does this for you.
 
 Optional: `HINDSIGHT_API_KEY` (Bearer token), `HINDSIGHT_BANK_PREFIX`,
 `HINDSIGHT_RECALL_TOKENS` (default 600). The Hindsight UI is on port 9999.
@@ -1044,7 +1090,8 @@ src/
     worker.ts                          # execution-environment interface (local-shell, stub, sandboxed wrapper)
     cli-agent-worker.ts                  # OPTIONAL cross-harness Worker: shells out to claude/codex/opencode CLI
     model.ts             # swappable LLM adapter interface (stub adapter shipped)
-    models/real.ts        # real Anthropic / OpenAI / Ollama adapters + per-agent defaultModel preference wiring
+    models/real.ts        # real Anthropic / OpenAI / Ollama adapters, provider router + per-agent defaultModel wiring
+    models/claude-cli.ts  # Claude through the official Claude Code CLI (your subscription), Agent-OS keeps the tools
     agent-loop.ts          # the turn loop binding all of the above together (persona + memory + skills + tools)
   cli.ts                    # runnable end-to-end demo of every primitive above
   test-live-model.ts         # calls a real model adapter (not the stub) — see below

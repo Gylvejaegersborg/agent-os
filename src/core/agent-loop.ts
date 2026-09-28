@@ -293,7 +293,7 @@ export async function getSessionUsage(sessionId: string): Promise<SessionUsage> 
  *  documents produce empty sections rather than empty-but-labeled ones,
  *  so a fresh agent with no promoted memories yet doesn't inject a
  *  confusing "MEMORY.md: (nothing here)" block into every turn. */
-async function renderMemoryContext(agentId: string, queryText: string): Promise<string> {
+async function renderMemoryContext(agentId: string, queryText: string, recalled: string[]): Promise<string> {
   const retrieved = await retrieveMemoryContext(agentId, queryText);
   const parts: string[] = [];
   if (retrieved.memoryLines.length > 0) {
@@ -309,8 +309,9 @@ async function renderMemoryContext(agentId: string, queryText: string): Promise<
     parts.push(`# USER.md (user profile/preferences learned over time)${note}\n${retrieved.userProfileLines.join("\n")}`);
   }
   // Optional Hindsight layer (hindsight.ts) — empty unless HINDSIGHT_URL is
-  // set and reachable.
-  const recalled = await hindsightRecall(agentId, queryText);
+  // set and reachable. Fetched once per turn by runTurn(), not here: this
+  // function runs on every tool hop, and the query (the user's message)
+  // doesn't change between hops.
   if (recalled.length > 0) {
     parts.push(`# Recalled from long-term memory (Hindsight)\n${recalled.map((l) => `- ${l}`).join("\n")}`);
   }
@@ -575,6 +576,10 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // own doc comment for why (unlike memory/skills, identity isn't expected
   // to change mid-turn).
   const personaText = await renderIdentityContext(agentId);
+  // Hindsight recall, also once per turn: the query is the user's message,
+  // which doesn't change between hops. Recalling inside the hop loop used
+  // to repeat the same HTTP call (up to 4s each) on every tool step.
+  const recalled = injectMemory ? await hindsightRecall(agentId, userMessage) : [];
 
   // Checked once per turn, BEFORE the hop loop builds its first set of
   // messages — so if this turn is the one that pushes history over
@@ -639,7 +644,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     // comment for why. Only ever populated by the dreaming pass
     // (memory.ts), never by this turn's own conversation, so a chatty
     // session cannot inject its own unvetted "memory" into itself.
-    const memoryText = injectMemory ? await renderMemoryContext(agentId, userMessage) : "";
+    const memoryText = injectMemory ? await renderMemoryContext(agentId, userMessage, recalled) : "";
     // personaText first — "who you are" precedes "what you remember/can do"
     // in the assembled system message, matching how a human-written system
     // prompt would order identity before capability context.

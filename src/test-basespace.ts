@@ -202,6 +202,13 @@ async function testHindsight(): Promise<void> {
   await new Promise((r) => setTimeout(r, 50));
   assert(seen.some((s) => s.url.endsWith("/memories") && String(s.body.items[0].content).startsWith("User: write a caption")), "the finished exchange is retained");
 
+  // A turn with a tool hop still recalls only once (the query doesn't
+  // change between hops).
+  const recallsBefore = seen.filter((s) => s.url.endsWith("/memories/recall")).length;
+  const hopTurn = await runTurn({ sessionId: newSessionId(), agentId: "nyx", userMessage: "run shell: echo hi", model, worker: createStubWorker() });
+  const recallsDuring = seen.filter((s) => s.url.endsWith("/memories/recall")).length - recallsBefore;
+  assert(hopTurn.toolCalled === "shell" && recallsDuring === 1, `a turn with a tool hop recalls once (got ${recallsDuring})`);
+
   process.env.HINDSIGHT_URL = "http://127.0.0.1:1"; // nothing listening
   assert((await hindsightRecall("nyx", "x")).length === 0, "an unreachable Hindsight degrades to no recall instead of failing the turn");
   delete process.env.HINDSIGHT_URL;
