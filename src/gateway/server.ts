@@ -58,6 +58,7 @@ import {
   reassignWork,
   reopenWork,
   listLeads,
+  setFlowFocus,
   exportTeam,
   bundleTeam,
   unbundleTeam,
@@ -1128,10 +1129,17 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         sendJson(res, 400, { error: "steps (array of {id, agentId, goal, dependsOn?, retries?}) is required" });
         return;
       }
+      const focus = parseFocus(body.focus);
+      if (focus === "invalid") {
+        sendJson(res, 400, { error: 'focus must be {kind: "goal" | "project", id}' });
+        return;
+      }
       const flow = await createFlow(
         "managed",
         steps.map((s) => ({ id: s.id, dependsOn: s.dependsOn ?? [] })),
       );
+      // What the flow serves: every step's session is focused on it.
+      if (focus) await setFlowFocus(flow.id, focus);
       // Fire-and-forget: a Flow can run many real model turns across many
       // steps, potentially minutes — the HTTP response returns the
       // CREATED Flow immediately (201) rather than blocking on the whole
@@ -1147,6 +1155,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         enableSubagents: deps.enableSubagents,
         enableMemoryNominations: deps.enableMemoryNominations,
         enableArtifacts: deps.enableArtifacts,
+        enableBaseSpace: deps.enableBaseSpace,
         sandboxPolicy: deps.sandboxPolicy,
       }).catch((err) => {
         console.error(`[gateway] flow ${flow.id} driving failed:`, err instanceof Error ? err.message : err);
@@ -1174,6 +1183,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         enableSubagents: deps.enableSubagents,
         enableMemoryNominations: deps.enableMemoryNominations,
         enableArtifacts: deps.enableArtifacts,
+        enableBaseSpace: deps.enableBaseSpace,
         sandboxPolicy: deps.sandboxPolicy,
       }).catch((err) => {
         console.error(`[gateway] flow ${flow.id} resume failed:`, err instanceof Error ? err.message : err);

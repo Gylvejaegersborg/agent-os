@@ -442,6 +442,16 @@ focused project. Subagents inherit the focus (session and Task). Over MCP,
 
 `npm run test-goals` covers it.
 
+**Flows and team crons take a focus too.**
+- `POST /flows {steps, focus}` runs every step in a session focused on that
+  goal or project. The flow remembers it for a resume, and steps get the
+  BaseSpace tools.
+- A BaseSpace team cron with a focus runs its standup the same way, and its
+  prompt says what the meeting serves.
+- Both sessions are linked to their task, so "Needs a look" sees their
+  activity.
+- `npm run test-focus-runs`.
+
 ## Work — handing tasks between agents
 
 Agents hand each other work as tracked **work items** (`src/core/work.ts`),

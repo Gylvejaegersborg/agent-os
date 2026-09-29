@@ -371,8 +371,10 @@ Ordered so each step is safe before the next adds autonomy:
       (`focusContext`), `session.ts` (focus); **[gateway]** `PUT
       /sessions/:id/focus`, `focus` on `POST /sessions`; **[UI]** goals on
       Projects, "Serves" on projects/todos/threads.
-- [ ] Flows and BaseSpace team crons take a focus too (a standup focused
-      on a goal). **[core]** **[gateway]**
+- [x] Flows and BaseSpace team crons take a focus too (a standup focused
+      on a goal): each flow step and each standup runs in a session focused
+      on it, linked to its task; flows remember their focus for a resume;
+      flow steps now get the BaseSpace tools. **[core]** **[gateway]** **[UI]**
 - [x] **Reporting lines + delegation through tasks.** `reportsTo` on each
       identity (seeded once: the artist team → Hemera; Hemera, Argus and
       Claude → the operator; loops rejected). A work ledger

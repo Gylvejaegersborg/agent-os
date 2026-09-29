@@ -55,6 +55,7 @@
     "test-watchdog": "tsc -b && node dist/test-watchdog.js",
     "test-stale": "tsc -b && node dist/test-stale.js",
     "test-team-template": "tsc -b && node dist/test-team-template.js",
+    "test-focus-runs": "tsc -b && node dist/test-focus-runs.js",
     "team": "tsc -b && node dist/team-cli.js",
     "typecheck": "tsc -b --noEmit"
   },

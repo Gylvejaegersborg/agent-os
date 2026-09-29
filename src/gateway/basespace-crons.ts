@@ -23,7 +23,9 @@ import {
   createTask,
   transitionTask,
   runTurn,
-  newSessionId,
+  createSession,
+  linkSessionWork,
+  type SessionFocus,
   createModelForAgent,
   agentIsBlocked,
   publishEvent,
@@ -45,6 +47,8 @@ interface SnapshotCron {
   owner: string;
   team?: string;
   schedule: Schedule;
+  /** What the meeting serves (a BaseSpace goal or project). */
+  focus?: SessionFocus;
 }
 
 interface SnapshotTeam {
@@ -91,6 +95,7 @@ export function standupPrompt(cron: SnapshotCron, team: SnapshotTeam, slot: Date
   return [
     `It's time for "${cron.name}" — you chair it for the team "${team.name}"${team.description ? ` (${team.description})` : ""}.`,
     `Members: ${team.members.join(", ")}.`,
+    ...(cron.focus ? ["This meeting serves the goal or project described above (what this conversation serves): keep today's priorities tied to it, and say plainly if the team's work isn't moving it."] : []),
     "",
     "1. Read the operator's BaseSpace with the `basespace` tool: start with section summary, then todos, projects or notes as needed.",
     `2. Decide today's priorities for the team and what each member should focus on${others.length ? ` (${others.join(", ")})` : ""}, given their roles.`,
@@ -158,8 +163,13 @@ async function runStandup(deps: BaseSpaceCronDeps, cron: SnapshotCron, team: Sna
   console.log(`[basespace-crons] running "${cron.name}" for ${team.name} (chair: ${lead})`);
   try {
     const model = (await createModelForAgent(lead)) ?? deps.model;
+    // Focused on what the meeting serves (if set): the chair gets the goal
+    // chain, linked notes and open todos, and the minutes link back.
+    const focus = cron.focus && (cron.focus.kind === "goal" || cron.focus.kind === "project") && typeof cron.focus.id === "string" ? cron.focus : undefined;
+    const session = await createSession({ agentId: lead, title: `${cron.name} — ${slot.toISOString().slice(0, 10)}`, ...(focus ? { focus } : {}) });
+    await linkSessionWork(session.id, { taskId: task.id });
     const result = await runTurn({
-      sessionId: newSessionId(),
+      sessionId: session.id,
       agentId: lead,
       userMessage: goal,
       model,
