@@ -23,6 +23,10 @@ process.env.CLAUDE_CLI_PATH = "/nonexistent/claude"; // no real providers in thi
 import {
   MAX_ROUNDS,
   OPERATOR,
+  addOverlayItem,
+  loadOverlay,
+  readSnapshotSection,
+  saveSnapshot,
   cancelWork,
   checkWatches,
   createSession,
@@ -68,6 +72,8 @@ async function throwsWith(p: Promise<unknown>, re: RegExp): Promise<boolean> {
 const attempts = new Map<string, number>();
 const verifyBriefs: string[] = [];
 const verifierTools: string[][] = [];
+const workPrompts: string[] = [];
+let lazyVerifier = false;
 
 const scripted: ModelAdapter = {
   id: "scripted",
@@ -82,6 +88,8 @@ const scripted: ModelAdapter = {
       if (!toolMsgs.length) verifyBriefs.push(first);
       // Send back every item whose claim has nothing behind it, then report.
       const unbacked = [...first.matchAll(/### (\S+) "[^"]+" — \w+, done\n(?:.*\n)*?  what actually ran:\n  \(no tool calls/g)].map((m) => m[1]!);
+      // A verifier that sends things back, then wanders off without a verdict.
+      if (lazyVerifier && toolMsgs.length) return call("basespace", { section: "notes", query: "anything" });
       const next = unbacked[toolMsgs.length];
       if (next) return call("work", { action: "reopen", id: next, text: "No evidence this happened — nothing was added or sent." });
       return call("work", { action: "done", text: unbacked.length ? `Reopened ${unbacked.length}: claims without evidence. Rest accepted.` : "All accepted: claims match what ran." });
@@ -91,6 +99,7 @@ const scripted: ModelAdapter = {
       return { content: "ok" };
     }
     const title = /: (.*)$/m.exec(first.split("\n")[0]!)?.[1] ?? "";
+    if (!toolMsgs.length) workPrompts.push(first);
     if (toolMsgs.length) return call("work", { action: "done", text: `Done: ${title} — in Notes.` });
     const n = (attempts.get(title) ?? 0) + 1;
     if (!toolMsgs.length) attempts.set(title, n);
@@ -135,8 +144,36 @@ async function testVerifyAndReopen(): Promise<void> {
   const notes = (await getSessionHistory(hemera.id)).filter((m) => m.content.startsWith("[Work] ")).map((m) => m.content);
   assert(notes.some((n) => /Argus finished "Verify: Switch teaser week": Reopened 1/.test(n)) && notes.some((n) => /All accepted/.test(n)), "each verdict is posted back to the thread that asked");
 
+  assert(workPrompts.some((p) => p.includes("Press list for Switch") && /sent back to you by argus: No evidence this happened/.test(p)), "the re-run is told why it was sent back");
   const other = await createWork({ title: "Unrelated", assignee: "theia", requestedBy: OPERATOR });
   assert(await throwsWith(reopenWork(other.id, "argus", "x"), /manager or the operator/), "the verifier can't reopen work it isn't verifying");
+}
+
+async function testOverlayAndDedupe(): Promise<void> {
+  const first = await addOverlayItem("note", { title: "Moodboard", body: "v1" }, "nyx");
+  const id = /id (agent-[\w-]+)/.exec(first.output)![1]!;
+  const read = await readSnapshotSection("notes", { id });
+  assert(read.ok && read.output.includes('"v1"'), "an agent can read a note a teammate just added, before BaseSpace syncs");
+  const again = await addOverlayItem("note", { title: "Moodboard", body: "v2" }, "nyx");
+  const notes = (await loadOverlay()).notes.filter((n) => n.title === "Moodboard");
+  assert(notes.length === 1 && notes[0]!.body === "v2" && /replaced, not duplicated/.test(again.output), "adding the same note again updates it instead of duplicating");
+}
+
+async function testLazyVerifier(): Promise<void> {
+  lazyVerifier = true;
+  attempts.delete("Press list for Switch");
+  const press = await createWork({ title: "Press list for Switch", assignee: "hermes", requestedBy: OPERATOR });
+  const watch = await watchWork({ rootIds: [press.id], label: "press again", createdBy: OPERATOR });
+  // Run until the first verification has settled, then let round 2 be done properly.
+  for (let i = 0; i < 12 && (await getWatch(watch.id))!.rounds < 1; i++) {
+    await runner.idle();
+    await checkWatches();
+  }
+  lazyVerifier = false;
+  await settle();
+  const w = (await getWatch(watch.id))!;
+  const verdicts = w.verificationIds.length;
+  assert(verdicts === 2 && w.status === "verified", "a verifier that sent an item back but ran out of steps still counts: the item re-ran and round 2 verified it");
 }
 
 async function testGivesUp(): Promise<void> {
@@ -185,12 +222,15 @@ async function testRoutes(): Promise<void> {
 
 async function main(): Promise<void> {
   await seedDefaultAgents();
+  await saveSnapshot({ schema: 1, notes: [] });
   runner = startWorkRunner({ model: scripted, worker: createStubWorker(), enableBaseSpace: true, maxToolHops: 4 }, { intervalMs: 60_000 });
   const unsub = subscribeToAllEvents((type) => {
     if (type.startsWith("work.") || type === "watch.created") void checkWatches();
   });
   try {
     await testVerifyAndReopen();
+    await testOverlayAndDedupe();
+    await testLazyVerifier();
     await testGivesUp();
     await testNotBeforeStopped();
     await testRoutes();

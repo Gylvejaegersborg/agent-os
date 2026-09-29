@@ -92,7 +92,20 @@ export async function readSnapshotSection(section: string, opts: { query?: strin
     return { ok: false, output: "", error: "BaseSpace hasn't sent a snapshot yet — it syncs automatically while BaseSpace is open and connected." };
   }
   const header = `BaseSpace snapshot from ${snap.exportedAt ?? snap.receivedAt}.`;
-  const list = (key: string): any[] => (Array.isArray(snap[key]) ? snap[key] : []);
+  // What agents added (the overlay) shows up in the snapshot only after
+  // BaseSpace syncs again — until then, read it straight from the overlay,
+  // or an agent can't see what a teammate just added (a verifier would
+  // call finished work missing).
+  const overlay = await loadOverlay();
+  const pending = (key: string, have: any[]): any[] => {
+    const src = key === "notes" ? overlay.notes : key === "todos" ? overlay.tasks : [];
+    const ids = new Set(have.map((i) => i.id));
+    return src.filter((i) => !ids.has(i.id));
+  };
+  const list = (key: string): any[] => {
+    const have = Array.isArray(snap[key]) ? snap[key] : [];
+    return [...have, ...pending(key, have)];
+  };
 
   if (section === "summary") {
     const today = new Date().toISOString().slice(0, 10);
@@ -275,8 +288,18 @@ export async function addOverlayItem(kind: OverlayKind, args: Record<string, unk
     if (!title) return { ok: false, output: "", error: "a note needs a title" };
     const folder = str("folder") || `Agents/${cap1(agentId)}`;
     let body = str("body");
+    // The same agent adding a note with the same title again (a retry, a
+    // re-run after being sent back) updates it instead of piling up copies.
+    const recent = o.notes.find(
+      (n) => n.title === title && Array.isArray(n.tags) && (n.tags as string[]).includes(agentId) && Date.now() - Date.parse(String(n.created ?? "")) < 24 * 3_600_000,
+    );
     if (links.wikiName && !body.toLowerCase().includes(`[[${links.wikiName.toLowerCase()}`)) {
       body = `${body}${body ? "\n\n" : ""}Serves: [[${links.wikiName}]]`;
+    }
+    if (recent) {
+      Object.assign(recent, { body, folder, updated: now });
+      await saveOverlay(o);
+      return { ok: true, output: `Updated your note "${title}" (${folder}), id ${recent.id} — same title as one you added earlier, so it was replaced, not duplicated.` };
     }
     o.notes.push({ id, title, folder, tags: [agentId], updated: now, created: now, body });
     await saveOverlay(o);

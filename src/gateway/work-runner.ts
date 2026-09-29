@@ -61,9 +61,13 @@ export interface WorkRunnerHandle {
 function workPrompt(item: WorkView, requesterName: string): string {
   // A verification's detail is the whole brief (watchdog.ts builds it).
   if (item.kind === "verification") return `[Work] ${requesterName} asked you to verify (work item ${item.id}): ${item.title}\n\n${item.detail ?? ""}`;
+  // Sent back (by a verifier, a lead or the operator): say why, first thing.
+  const back = [...item.notes].reverse().find((n) => n.text.startsWith("reopened:"));
   return [
     `[Work] ${requesterName} handed you this (work item ${item.id}): ${item.title}`,
     item.detail ? `\n${item.detail}` : "",
+    back ? `\n\nThis was sent back to you by ${back.by}: ${back.text.slice("reopened: ".length)} Fix exactly that — don't start over.` : "",
+    "\n\nThe brief above is everything you're given; look up at most two things in BaseSpace if you truly need them, then produce it.",
     "\nDo it now. Put what you make where the operator will see it: in BaseSpace with `basespace-add` (a note, todo or project update), " +
       "or in your result itself — not in files (only the builder agent has file tools). When it's finished, call the `work` tool with " +
       "action \"done\" and a short result (what you did, where it is). If you can't: action \"blocked\" with the reason, or \"hand-back\" " +
@@ -118,7 +122,7 @@ export function startWorkRunner(deps: WorkRunnerDeps, opts: { intervalMs?: numbe
           enableBaseSpace: deps.enableBaseSpace,
           // A verifier reads and reports — it can't do the work it checks.
           ...(item.kind === "verification"
-            ? { onlyTools: ["work", "basespace"], maxToolHops: Math.min(12, (item.verifies?.length ?? 1) + 3) }
+            ? { onlyTools: ["work", "basespace"], maxToolHops: Math.min(14, (item.verifies?.length ?? 1) * 2 + 3) }
             : { maxToolHops: deps.maxToolHops }),
         });
         const after = await getWork(item.id);

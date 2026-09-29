@@ -169,7 +169,8 @@ async function evidencePack(watch: Watch, items: WorkView[]): Promise<string> {
     "- Claim matches the evidence: accept it (say so in your result).\n" +
     "- Claim isn't backed (nothing was added, the text doesn't do what was asked, a made-up number or fact): `work` reopen {id, text: what's missing}.\n" +
     "- Needs a decision only the operator can make: `work` escalate {id, text}.\n" +
-    "Report problems — don't fix them yourself. Finish with `work` done {text: one line per item: accepted / reopened / escalated, and why}.\n\n" +
+    "Report problems — don't fix them yourself. Finish with `work` done {text: one line per item: accepted / reopened / escalated, and why}.\n" +
+    "The evidence below is complete. Only if a claim names something not shown, look it up once with `basespace` (it includes what agents just added).\n\n" +
     text
   );
 }
@@ -231,11 +232,21 @@ async function checkWatchesNow(): Promise<void> {
       const reopened = (v.verifies ?? []).filter((id) =>
         (byId.get(id)?.notes ?? []).some((n) => n.by === watch.verifier && n.text.startsWith("reopened:") && n.at >= since),
       );
+      // A verifier that sent items back but ran out of steps before writing
+      // its verdict still sent them back — its reasons are the verdict.
+      const reasons = reopened.map((id) => {
+        const n = [...(byId.get(id)?.notes ?? [])].reverse().find((x) => x.by === watch.verifier && x.text.startsWith("reopened:"));
+        return `${byId.get(id)?.title ?? id}: ${n?.text.slice("reopened: ".length) ?? ""}`;
+      });
       const status: WatchStatus =
-        v.status !== "done" ? "needs-operator"
-        : reopened.length ? "reopened"
-        : "verified";
-      const verdict = v.status === "done" ? (v.result ?? "") : v.status === "blocked" ? `the verifier couldn't finish: ${v.blockedReason ?? ""}` : "the verification was cancelled";
+        reopened.length ? "reopened"
+        : v.status === "done" ? "verified"
+        : "needs-operator";
+      const verdict =
+        v.status === "done" ? (v.result ?? "")
+        : reopened.length ? `sent back: ${reasons.join("; ")}`
+        : v.status === "blocked" ? `the verifier couldn't finish: ${v.blockedReason ?? ""}`
+        : "the verification was cancelled";
       await appendEvent(STREAM, "watch.settled", { id: watch.id, status, verdict, reopened });
       await publishEvent("watch.settled", { id: watch.id, status });
     }
