@@ -21,19 +21,27 @@
 // fed the whole model-facing conversation on stdin; the Agent-OS session
 // log stays the only source of truth for history.
 //
+// Extended thinking is off by default (MAX_THINKING_TOKENS=0 in the child's
+// env): measured live, a three-caption hand-off spent most of its output
+// tokens thinking — 159 output tokens for a reply that needed 23. Opt back
+// in per agent with a "+think" suffix on the model: `claude-cli:sonnet+think`.
+//
 // Env:
 //   CLAUDE_CLI_PATH              path to the CLI (default: "claude" on PATH)
 //   AGENT_OS_CLAUDE_CLI_TIMEOUT_MS  per-call timeout (default 180000)
 
 import { spawn, spawnSync } from "node:child_process";
 import os from "node:os";
-import type { ModelAdapter, ModelMessage, ModelResponse } from "../model.js";
+import type { ModelAdapter, ModelCallOptions, ModelMessage, ModelResponse } from "../model.js";
 import { registryToolSpecs, type ToolSpec } from "./real.js";
 
 export interface ClaudeCliOptions {
   /** Passed as `--model` (an alias like "sonnet"/"opus"/"haiku" or a full
    *  model id). Omitted → the CLI's own default. */
   model?: string;
+  /** Let the model think before answering (costs output tokens on every
+   *  call). Also turned on by a "+think" suffix on `model`. Default off. */
+  thinking?: boolean;
   command?: string;
   tools?: ToolSpec[];
   timeoutMs?: number;
@@ -67,19 +75,34 @@ export function resetClaudeCliAvailability(): void {
 const TOOL_OPEN = "<tool_call>";
 const TOOL_CLOSE = "</tool_call>";
 
+/** One line per argument: `name*` when required, then what it's for. */
+function renderArgs(parameters: Record<string, unknown>): string {
+  const props = (parameters.properties ?? {}) as Record<string, { type?: string; description?: string }>;
+  const required = new Set((parameters.required ?? []) as string[]);
+  return Object.entries(props)
+    .map(([k, v]) => `    ${k}${required.has(k) ? "*" : ""}${v.type && v.type !== "string" ? ` (${v.type})` : ""}${v.description ? `: ${v.description}` : ""}`)
+    .join("\n");
+}
+
+/** The tool list in plain text — a compact line per argument instead of a
+ *  JSON Schema per tool: this goes out in the system prompt of every call
+ *  (the CLI gives no prompt caching here), so every character is paid for
+ *  again on each tool step. */
 export function renderToolProtocol(tools: ToolSpec[]): string {
   if (!tools.length) return "";
   const list = tools
-    .map((t) => `- ${t.name}: ${t.description}\n  args schema: ${JSON.stringify(t.parameters)}`)
+    .map((t) => {
+      const args = renderArgs(t.parameters);
+      return `- ${t.name}: ${t.description}${args ? `\n${args}` : ""}`;
+    })
     .join("\n");
   return [
     "# Tools",
-    "You run inside Agent-OS, which executes tools for you; your own built-in tools are disabled.",
-    `To use a tool, end your reply with exactly one block: ${TOOL_OPEN}{"name": "<tool>", "args": {...}}${TOOL_CLOSE}`,
-    "Use exactly that format (not <function_calls> or XML). You may write a short sentence before it, nothing after it — never guess a tool's result. One tool call per reply.",
-    "Agent-OS runs it (some calls wait for the operator's approval) and sends the output back as a [tool result] message.",
-    "If no tool is needed, just answer normally.",
-    "",
+    "Agent-OS runs tools for you (your built-in tools are off). To use one, end your reply with exactly one block:",
+    `${TOOL_OPEN}{"name": "<tool>", "args": {...}}${TOOL_CLOSE}`,
+    "That format only (not <function_calls> or XML), one call per reply, nothing after it — never guess a result. " +
+      "The output comes back as a [tool result] message (some calls wait for the operator's approval). No tool needed → just answer.",
+    "Tools (* = required argument):",
     list,
   ].join("\n");
 }
@@ -217,11 +240,14 @@ function visiblePrefixLength(text: string): number {
 
 export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter {
   const command = opts.command ?? claudeCliCommand();
+  const thinkSuffix = /\+think$/.test(opts.model ?? "");
+  const model = thinkSuffix ? opts.model!.replace(/\+think$/, "") || undefined : opts.model;
+  const thinking = opts.thinking ?? thinkSuffix;
   const timeoutMs = opts.timeoutMs ?? Number(process.env.AGENT_OS_CLAUDE_CLI_TIMEOUT_MS ?? 180_000);
 
-  async function run(messages: ModelMessage[], onDelta?: (delta: string) => void): Promise<ModelResponse> {
+  async function run(messages: ModelMessage[], onDelta?: (delta: string) => void, callOpts?: ModelCallOptions): Promise<ModelResponse> {
     const system = messages.find((m) => m.role === "system")?.content ?? "";
-    const toolText = renderToolProtocol(opts.tools ?? registryToolSpecs());
+    const toolText = renderToolProtocol(callOpts?.tools ?? opts.tools ?? registryToolSpecs());
     const systemPrompt = [system, toolText].filter(Boolean).join("\n\n") || "You are a helpful assistant.";
     const args = [
       "-p",
@@ -232,13 +258,14 @@ export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter 
       "--no-session-persistence",
       "--setting-sources", "",
       "--system-prompt", systemPrompt,
-      ...(opts.model ? ["--model", opts.model] : []),
+      ...(model ? ["--model", model] : []),
     ];
     // The CLI authenticates with its own login. ANTHROPIC_TOKEN is Agent-OS's
     // own variable for the direct-API path, not something the CLI reads —
     // dropped so it can't leak into the child's environment.
     const env = { ...process.env };
     delete env.ANTHROPIC_TOKEN;
+    if (!thinking) env.MAX_THINKING_TOKENS = "0";
 
     return new Promise<ModelResponse>((resolve, reject) => {
       const child = spawn(command, args, { cwd: opts.cwd ?? os.tmpdir(), env, stdio: ["pipe", "pipe", "pipe"] });
@@ -318,8 +345,8 @@ export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter 
   }
 
   return {
-    id: `claude-cli:${opts.model ?? "default"}`,
-    complete: (messages) => run(messages),
-    completeStream: (messages, onDelta) => run(messages, onDelta),
+    id: `claude-cli:${model ?? "default"}${thinking ? "+think" : ""}`,
+    complete: (messages, callOpts) => run(messages, undefined, callOpts),
+    completeStream: (messages, onDelta, callOpts) => run(messages, onDelta, callOpts),
   };
 }

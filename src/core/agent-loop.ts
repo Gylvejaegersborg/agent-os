@@ -12,7 +12,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { appendEvent, project } from "./eventlog.js";
 import { publishEvent } from "./eventbus.js";
-import type { ModelAdapter, ModelMessage } from "./model.js";
+import type { ModelAdapter, ModelMessage, ToolSpec } from "./model.js";
 import type { Worker } from "./worker.js";
 import { fireHook } from "./hooks.js";
 import { generateId } from "./id.js";
@@ -20,7 +20,7 @@ import { SkillRegistry, renderSkillCatalog } from "./skills.js";
 import { retrieveMemoryContext } from "./memory.js";
 import { getAgentIdentity } from "./identity.js";
 import { ensureSession, isSessionCancelled, getSession } from "./session.js";
-import { getToolDefinition, withTimeout } from "./tool-registry.js";
+import { getToolDefinition, listToolDefinitions, toToolSpec, toolVisibleTo, withTimeout } from "./tool-registry.js";
 import type { ArtifactType } from "./artifacts.js";
 import type { EpisodicKind } from "./types.js";
 import { checkPathSandbox, type SandboxPolicy } from "./permissions.js";
@@ -266,7 +266,7 @@ async function maybeCompactSession(sessionId: string, model: ModelAdapter): Prom
           "Summarize the following conversation concisely but completely — preserve concrete facts, decisions, file paths, and anything a continuation would genuinely need. Prose is fine; do not editorialize or add commentary about the summarization itself.",
       },
       { role: "user", content: `${priorSummaryPart}Conversation to summarize:\n\n${transcript}` },
-    ]);
+    ], { tools: [] });
     await appendEvent(sessionStream(sessionId), "session.compacted", { summary: result.content, throughIndex: newThroughIndex });
   } catch (err) {
     console.error(`[agent-loop] context compaction failed for session ${sessionId} (continuing uncompacted):`, err instanceof Error ? err.message : err);
@@ -600,6 +600,39 @@ async function dispatchTool(
   return { ok: false, output: "", error: `unknown tool: ${toolCall.name}` };
 }
 
+const FILE_TOOLS = new Set(["read_file", "edit_file", "write_file"]);
+/** `work` actions that settle the item: once one succeeds the agent has
+ *  nothing left to say, so the turn ends there instead of spending another
+ *  full model call on "Done!". */
+const SETTLING_WORK_ACTIONS = new Set(["done", "blocked", "hand-back"]);
+
+/** The tools this agent can actually use this turn: the ones the turn has
+ *  switched on, minus the ones the gateway hides from this agent
+ *  (tool-registry.ts's setToolVisibility). Everything offered is described
+ *  in every model call, so offering a tool that can only fail is paid for
+ *  on each hop. Hiding isn't the enforcement — dispatch and the tool.before
+ *  hooks still refuse a hidden tool if it's called anyway. */
+function offeredTools(
+  agentId: string,
+  on: { skills?: SkillRegistry; enableSubagents?: boolean; enableMemoryNominations?: boolean; enableArtifacts?: boolean; enableBaseSpace?: boolean },
+): ToolSpec[] {
+  const enabled: Record<string, boolean | undefined> = {
+    skill: !!on.skills && on.skills.listMetadata().length > 0,
+    subagent: on.enableSubagents,
+    "nominate-memory": on.enableMemoryNominations,
+    "record-artifact": on.enableArtifacts,
+    "recall-memory": hindsightConfigured(),
+    basespace: on.enableBaseSpace,
+    "basespace-add": on.enableBaseSpace,
+    delegate: on.enableBaseSpace,
+    work: on.enableBaseSpace,
+  };
+  return listToolDefinitions()
+    .filter((d) => !(d.name in enabled) || !!enabled[d.name])
+    .filter((d) => toolVisibleTo(agentId, d.name))
+    .map(toToolSpec);
+}
+
 export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents, enableMemoryNominations, enableArtifacts, enableBaseSpace, sandboxPolicy, planMode } = opts;
   const injectMemory = opts.injectMemory ?? true;
@@ -666,6 +699,8 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // Reporting lines and open work (work.ts) — only for agents on the
   // operator's team (the same flag that turns on BaseSpace).
   const orgText = enableBaseSpace ? await orgContext(agentId) : "";
+  const tools = offeredTools(agentId, { skills, enableSubagents, enableMemoryNominations, enableArtifacts, enableBaseSpace });
+  const offered = new Set(tools.map((t) => t.name));
 
   // Checked once per turn, BEFORE the hop loop builds its first set of
   // messages — so if this turn is the one that pushes history over
@@ -719,8 +754,9 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       "(start with section \"summary\") before answering questions about their work, and use `basespace-add` to leave a note, a todo or a " +
       "project update there — that's how your work shows up for them. Only add things they'd want to see." +
       (hindsightConfigured() ? " Use `recall-memory` to look up what you've learned in earlier conversations." : "");
-    const fileToolsText =
-      "Prefer `read_file`/`edit_file`/`write_file` over shell redirection or `sed` for reading or changing a file's content — " +
+    const fileToolsText = ![...FILE_TOOLS].some((t) => offered.has(t))
+      ? ""
+      : "Prefer `read_file`/`edit_file`/`write_file` over shell redirection or `sed` for reading or changing a file's content — " +
       "`edit_file` takes {path, old_string, new_string} and fails with no write made if old_string isn't found or isn't unique in the file " +
       "(pass replace_all:true to replace every occurrence instead), rather than silently touching the wrong spot." +
       (sandboxPolicy
@@ -750,12 +786,16 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     // "session.message" event below remains the durable record, same as
     // always, so the event log doesn't balloon with one entry per token.
     const response = model.completeStream
-      ? await model.completeStream(messages, (delta) => {
-          publishEvent("agent.turn.delta", { sessionId, agentId, delta }).catch((err) => {
-            console.error("[agent-loop] failed to publish turn delta:", err instanceof Error ? err.message : err);
-          });
-        })
-      : await model.complete(messages);
+      ? await model.completeStream(
+          messages,
+          (delta) => {
+            publishEvent("agent.turn.delta", { sessionId, agentId, delta }).catch((err) => {
+              console.error("[agent-loop] failed to publish turn delta:", err instanceof Error ? err.message : err);
+            });
+          },
+          { tools },
+        )
+      : await model.complete(messages, { tools });
 
     if (response.usage) {
       sawUsage = true;
@@ -848,6 +888,15 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
         call: callLabel,
       });
       hops++;
+      // Settling a work item (done / blocked / hand-back) is the last thing
+      // the agent has to do — end here, with the result as the reply,
+      // rather than one more model call to say so.
+      if (response.toolCall.name === "work" && result.ok && SETTLING_WORK_ACTIONS.has(String(response.toolCall.args?.action ?? ""))) {
+        const text = typeof response.toolCall.args?.text === "string" ? response.toolCall.args.text.trim() : "";
+        finalContent = text || response.content?.trim() || result.output;
+        await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent });
+        break;
+      }
       // Re-checked immediately after the tool actually ran (not just at
       // the top of the next hop) so a cancellation that arrives WHILE a
       // tool call is in flight is honored before the next model call is

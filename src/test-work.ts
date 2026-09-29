@@ -65,6 +65,7 @@ async function throwsWith(p: Promise<unknown>, re: RegExp): Promise<boolean> {
 }
 
 const systems: string[] = [];
+let captionCalls = 0;
 /** Behaves by what it's asked: a [Work] prompt titled "…auto…" just
  *  answers, "…explode…" throws, anything else calls `work done`; a chat
  *  asking to "delegate captions" delegates to Nyx. 10+5 tokens per call. */
@@ -75,6 +76,7 @@ const scripted: ModelAdapter = {
     const usage = { inputTokens: 10, outputTokens: 5 };
     const last = messages[messages.length - 1]!;
     const firstUser = messages.find((m) => m.role === "user")?.content ?? "";
+    if (firstUser.startsWith("[Work]") && firstUser.includes("Draft three captions")) captionCalls++;
     // Never finishes: keeps calling a tool until the steps run out.
     if (firstUser.startsWith("[Work]") && firstUser.includes("endless")) return { content: "", toolCall: { name: "work", args: { action: "list" } }, usage };
     if (last.role === "tool") return { content: "Finished.", usage };
@@ -144,6 +146,7 @@ async function testToolsAndRunner(): Promise<void> {
     const done = (await getWork(item.id))!;
     assert(done.status === "done" && done.result === "Three captions drafted in Notes.", "the runner ran Nyx's turn and she marked it done");
     assert(done.tokens > 0, "tokens spent on it are recorded on the item");
+    assert(captionCalls === 1, `\`work done\` ends the turn — no extra model call to say so (${captionCalls} calls)`);
     await new Promise((r) => setTimeout(r, 100));
     const notes = (await getSessionHistory(session.id)).filter((m) => m.content.startsWith("[Work] "));
     assert(notes.some((m) => m.content.includes('Nyx finished "Draft three captions for the teaser": Three captions drafted in Notes.')), "the result is posted back into Hemera's conversation");

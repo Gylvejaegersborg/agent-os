@@ -10,17 +10,12 @@
 // carry multiple tool calls — that's a deliberate scaffold limitation, not
 // an oversight.
 
-import { listToolDefinitions } from "../tool-registry.js";
-import type { ModelAdapter, ModelMessage, ModelResponse } from "../model.js";
+import { listToolDefinitions, toToolSpec } from "../tool-registry.js";
+import type { ModelAdapter, ModelCallOptions, ModelMessage, ModelResponse, ToolSpec } from "../model.js";
 import { appendEvent, project } from "../eventlog.js";
 import { claudeCliAvailable, createClaudeCliModel } from "./claude-cli.js";
 
-export interface ToolSpec {
-  name: string;
-  description: string;
-  /** JSON Schema for the tool's arguments. */
-  parameters: Record<string, unknown>;
-}
+export type { ToolSpec } from "../model.js";
 
 /** Every tool in the registry (tool-registry.ts), as the JSON-Schema specs
  *  the provider APIs take. Used whenever an adapter isn't given an explicit
@@ -29,19 +24,7 @@ export interface ToolSpec {
  *  call path only ran against the stub model. Read at call time, so tools
  *  registered after the adapter was created are included. */
 export function registryToolSpecs(): ToolSpec[] {
-  return listToolDefinitions().map((d) => ({
-    name: d.name,
-    description: d.description,
-    parameters: {
-      type: "object",
-      properties: Object.fromEntries(
-        Object.entries(d.inputSchema).map(([k, v]) => [k, { type: v.type, ...(v.description ? { description: v.description } : {}) }]),
-      ),
-      required: Object.entries(d.inputSchema)
-        .filter(([, v]) => v.required)
-        .map(([k]) => k),
-    },
-  }));
+  return listToolDefinitions().map(toToolSpec);
 }
 
 interface AnthropicOptions {
@@ -92,7 +75,7 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
 
   return {
     id: `anthropic:${model}`,
-    async complete(messages: ModelMessage[]): Promise<ModelResponse> {
+    async complete(messages: ModelMessage[], callOpts?: ModelCallOptions): Promise<ModelResponse> {
       const { system, messages: anthropicMessages } = toAnthropicMessages(messages);
 
       const headers: Record<string, string> = {
@@ -114,7 +97,7 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
         messages: anthropicMessages,
         ...(system ? { system } : {}),
       };
-      const tools = opts.tools ?? registryToolSpecs();
+      const tools = callOpts?.tools ?? opts.tools ?? registryToolSpecs();
       if (tools.length) {
         body.tools = tools.map((t) => ({
           name: t.name,
@@ -153,7 +136,7 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
     // and parsed once complete — Anthropic streams a tool call's JSON
     // input incrementally too, but there's no meaningful "delta" to show
     // a user for that, so only text deltas go to onDelta).
-    async completeStream(messages: ModelMessage[], onDelta: (deltaText: string) => void): Promise<ModelResponse> {
+    async completeStream(messages: ModelMessage[], onDelta: (deltaText: string) => void, callOpts?: ModelCallOptions): Promise<ModelResponse> {
       const { system, messages: anthropicMessages } = toAnthropicMessages(messages);
 
       const headers: Record<string, string> = {
@@ -174,7 +157,7 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
         stream: true,
         ...(system ? { system } : {}),
       };
-      const tools = opts.tools ?? registryToolSpecs();
+      const tools = callOpts?.tools ?? opts.tools ?? registryToolSpecs();
       if (tools.length) {
         body.tools = tools.map((t) => ({
           name: t.name,
@@ -265,14 +248,14 @@ export function createOpenAiModel(opts: OpenAiOptions): ModelAdapter {
 
   return {
     id: `openai:${model}`,
-    async complete(messages: ModelMessage[]): Promise<ModelResponse> {
+    async complete(messages: ModelMessage[], callOpts?: ModelCallOptions): Promise<ModelResponse> {
       const openAiMessages = messages.map((m) => ({
         role: m.role === "tool" ? "user" : m.role, // scaffold-level simplification
         content: m.content,
       }));
 
       const body: Record<string, unknown> = { model, messages: openAiMessages };
-      const tools = opts.tools ?? registryToolSpecs();
+      const tools = callOpts?.tools ?? opts.tools ?? registryToolSpecs();
       if (tools.length) {
         body.tools = tools.map((t) => ({
           type: "function",
@@ -383,14 +366,14 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
 
   return {
     id: `ollama:${model}`,
-    async complete(messages: ModelMessage[]): Promise<ModelResponse> {
+    async complete(messages: ModelMessage[], callOpts?: ModelCallOptions): Promise<ModelResponse> {
       const ollamaMessages = messages.map((m) => ({
         role: m.role === "tool" ? "user" : m.role,
         content: m.content,
       }));
 
       const body: Record<string, unknown> = { model, messages: ollamaMessages, stream: false };
-      const tools = opts.tools ?? registryToolSpecs();
+      const tools = callOpts?.tools ?? opts.tools ?? registryToolSpecs();
       if (tools.length) {
         body.tools = tools.map((t) => ({
           type: "function",
@@ -432,14 +415,14 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
     // this scaffold only ever surfaces ONE tool call per turn (same
     // assumption the non-streaming path above makes via `tool_calls?.[0]`),
     // so only index 0 is tracked.
-    async completeStream(messages: ModelMessage[], onDelta: (deltaText: string) => void): Promise<ModelResponse> {
+    async completeStream(messages: ModelMessage[], onDelta: (deltaText: string) => void, callOpts?: ModelCallOptions): Promise<ModelResponse> {
       const ollamaMessages = messages.map((m) => ({
         role: m.role === "tool" ? "user" : m.role,
         content: m.content,
       }));
 
       const body: Record<string, unknown> = { model, messages: ollamaMessages, stream: true };
-      const tools = opts.tools ?? registryToolSpecs();
+      const tools = callOpts?.tools ?? opts.tools ?? registryToolSpecs();
       if (tools.length) {
         body.tools = tools.map((t) => ({
           type: "function",

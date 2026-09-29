@@ -115,7 +115,7 @@ export async function readSnapshotSection(section: string, opts: { query?: strin
         .filter((g) => g.status === "active")
         .map((g) => ({ id: g.id, title: g.title, why: g.why, target: g.target, progress: g.progress, projects: (g.projectIds ?? []).map((id: string) => nameOf(snap, "project", id)) })),
     };
-    return { ok: true, output: cap(`${header}\n${JSON.stringify(out, null, 1)}`) };
+    return { ok: true, output: cap(`${header}\n${JSON.stringify(out)}`) };
   }
 
   const key = section === "todo" ? "todos" : section === "goal" ? "goals" : section;
@@ -128,12 +128,12 @@ export async function readSnapshotSection(section: string, opts: { query?: strin
     if (!one) return { ok: false, output: "", error: `no ${key} item with id "${opts.id}"` };
     // A goal or project read in full comes with what it's connected to.
     const context = key === "projects" || key === "goals" ? `\n\n${renderFocus(snap, { kind: key === "goals" ? "goal" : "project", id: one.id })}` : "";
-    return { ok: true, output: cap(`${header}\n${JSON.stringify(one, null, 1)}${context}`) };
+    return { ok: true, output: cap(`${header}\n${JSON.stringify(one)}${context}`) };
   }
   if (opts.query) items = items.filter((i) => matches(i, opts.query!));
   // Notes are listed without bodies — ask for one by id to read it.
   const shown = key === "notes" ? items.map(({ body: _body, ...rest }) => rest) : items;
-  return { ok: true, output: cap(`${header} ${items.length} ${key}${opts.query ? ` matching "${opts.query}"` : ""}.\n${JSON.stringify(shown, null, 1)}`) };
+  return { ok: true, output: cap(`${header} ${items.length} ${key}${opts.query ? ` matching "${opts.query}"` : ""}.\n${JSON.stringify(shown)}`) };
 }
 
 // ---- focus: what a conversation's work serves ---------------------------------

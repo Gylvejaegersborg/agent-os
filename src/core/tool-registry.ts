@@ -1,3 +1,5 @@
+import type { ToolSpec } from "./model.js";
+
 // Tool registry — declarative metadata ABOUT the tools dispatchTool()
 // (agent-loop.ts) already executes through, kept deliberately separate
 // from execution itself. Before this file, "shell"/"skill"/"subagent"/
@@ -48,6 +50,39 @@ export interface ToolDefinition {
 }
 
 const registry = new Map<string, ToolDefinition>();
+
+/** A definition as the JSON-Schema spec the provider APIs take. */
+export function toToolSpec(d: ToolDefinition): ToolSpec {
+  return {
+    name: d.name,
+    description: d.description,
+    parameters: {
+      type: "object",
+      properties: Object.fromEntries(
+        Object.entries(d.inputSchema).map(([k, v]) => [k, { type: v.type, ...(v.description ? { description: v.description } : {}) }]),
+      ),
+      required: Object.entries(d.inputSchema)
+        .filter(([, v]) => v.required)
+        .map(([k]) => k),
+    },
+  };
+}
+
+/** Which tools an agent is shown at all (the gateway sets this — e.g. file
+ *  and shell tools only for the builder agent). Showing an agent a tool it
+ *  will only be refused costs tokens on every call and invites the call;
+ *  hiding it is not the enforcement — the tool.before hooks and the
+ *  permission policy still are, for any call that arrives anyway. */
+export type ToolVisibility = (agentId: string, toolName: string) => boolean;
+let visibility: ToolVisibility | undefined;
+
+export function setToolVisibility(fn: ToolVisibility | undefined): void {
+  visibility = fn;
+}
+
+export function toolVisibleTo(agentId: string, toolName: string): boolean {
+  return !visibility || visibility(agentId, toolName);
+}
 
 export function registerTool(definition: ToolDefinition): void {
   registry.set(definition.name, definition);

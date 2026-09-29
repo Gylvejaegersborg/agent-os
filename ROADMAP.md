@@ -221,9 +221,21 @@ agent-os plus the Workbench. The idea is what's worth taking.
 - [ ] Flows still run every step on the gateway default model
       (`server.ts`'s flow routes pass `deps.model`); route per step agent
       like chat turns do. **[gateway]**
-- [ ] Per-agent token budgets that pause an agent at its limit
-      (Paperclip's best idea). Token counts already exist
-      (`getSessionUsage()`). **[core]** **[UI]**
+- [x] Per-agent token budgets that pause an agent at its limit — done as
+      board controls (section 7). **[core]** **[UI]**
+- [x] Token efficiency pass. A three-caption hand-off cost 17,206 tokens:
+      each CLI call resent ~900 tokens of CLI overhead, ~870 of instructions
+      and ~1,800 of tool descriptions (no prompt caching through the CLI),
+      and most output was extended thinking. Now: thinking off by default
+      for `claude-cli` (`+think` opts in), agents only see tools they can
+      use (hidden shell/file tools for everyone but `claude`, and their
+      instructions with them), a compact text tool list, `work` done /
+      blocked / hand-back ends the turn without another call, compact
+      BaseSpace JSON, no tools on compaction calls. **[core]** **[gateway]**
+- [ ] Prompt caching: through the API adapters (`cache_control` on the
+      system prompt + tools) the fixed part would cost a tenth on repeat
+      calls; the CLI path can't do this. Worth it for agents on
+      `anthropic:`. **[core]**
 - [ ] Retire the `ANTHROPIC_TOKEN` direct-OAuth path once `claude-cli` has
       proven itself; keep `ANTHROPIC_API_KEY` (pay-per-token) as is. **[core]**
 

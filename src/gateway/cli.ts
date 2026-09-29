@@ -18,6 +18,7 @@ import {
   startTaskLivenessRenewer,
   startMemoryDreamingSweeper,
   registerHook,
+  setToolVisibility,
   installPermissionPolicy,
   DEFAULT_HARD_BLOCKLIST,
   SkillRegistry,
@@ -181,6 +182,10 @@ async function main(): Promise<void> {
       reason: `"${toolName}" is restricted to the "${ENGINEER_AGENT_ID}" agent — ask it directly if you need something inspected or fixed.`,
     };
   });
+  // …and the other agents aren't shown those tools at all: describing four
+  // tools an agent can only be refused costs tokens on every one of its
+  // model calls. The hook above stays the enforcement.
+  setToolVisibility((agentId, toolName) => !FILESYSTEM_TOOLS.includes(toolName) || agentId === ENGINEER_AGENT_ID);
   // Layer A, part 2: ENGINEER_AGENT_ID's own rules (see buildEngineerPolicy
   // above) — safe reads pre-approved, everything else durably queued for
   // approval in the Workbench's Approvals tab.

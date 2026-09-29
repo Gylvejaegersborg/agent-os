@@ -25,9 +25,26 @@ export interface ModelResponse {
   usage?: { inputTokens: number; outputTokens: number };
 }
 
+/** A tool as the provider APIs take it: name, description, JSON Schema. */
+export interface ToolSpec {
+  name: string;
+  description: string;
+  /** JSON Schema for the tool's arguments. */
+  parameters: Record<string, unknown>;
+}
+
+/** Per-call options. `tools` is the list this one call may use — runTurn
+ *  passes only the tools the agent can actually use this turn (see
+ *  agent-loop.ts's offeredTools), so a model isn't billed on every call for
+ *  describing tools it would only be refused. Omitted → the adapter's own
+ *  default (every registered tool). An empty list offers none. */
+export interface ModelCallOptions {
+  tools?: ToolSpec[];
+}
+
 export interface ModelAdapter {
   id: string;
-  complete(messages: ModelMessage[]): Promise<ModelResponse>;
+  complete(messages: ModelMessage[], callOpts?: ModelCallOptions): Promise<ModelResponse>;
   /** OPTIONAL: true incremental streaming. Returns the exact same final
    *  ModelResponse complete() would, but ALSO invokes `onDelta` with each
    *  chunk of assistant text as it arrives from the provider, before the
@@ -43,7 +60,7 @@ export interface ModelAdapter {
    *  deliberately synchronous (no return value) — an adapter's read loop
    *  should never have to await a caller's side effect (like publishing
    *  an event) between chunks. */
-  completeStream?(messages: ModelMessage[], onDelta: (deltaText: string) => void): Promise<ModelResponse>;
+  completeStream?(messages: ModelMessage[], onDelta: (deltaText: string) => void, callOpts?: ModelCallOptions): Promise<ModelResponse>;
 }
 
 /** Deterministic stub adapter: no network calls, no API key, fully
@@ -131,9 +148,9 @@ export function createRecordingModel(inner: ModelAdapter): ModelAdapter & { last
   let last: ModelMessage[] | undefined;
   return {
     id: inner.id,
-    async complete(messages: ModelMessage[]): Promise<ModelResponse> {
+    async complete(messages: ModelMessage[], callOpts?: ModelCallOptions): Promise<ModelResponse> {
       last = messages;
-      return inner.complete(messages);
+      return inner.complete(messages, callOpts);
     },
     // Only defined when the wrapped adapter itself supports streaming —
     // an `undefined` completeStream on this wrapper (when inner lacks
@@ -141,9 +158,9 @@ export function createRecordingModel(inner: ModelAdapter): ModelAdapter & { last
     // check correctly fall back to complete() even through this wrapper.
     ...(inner.completeStream
       ? {
-          completeStream: async (messages: ModelMessage[], onDelta: (deltaText: string) => void): Promise<ModelResponse> => {
+          completeStream: async (messages: ModelMessage[], onDelta: (deltaText: string) => void, callOpts?: ModelCallOptions): Promise<ModelResponse> => {
             last = messages;
-            return inner.completeStream!(messages, onDelta);
+            return inner.completeStream!(messages, onDelta, callOpts);
           },
         }
       : {}),

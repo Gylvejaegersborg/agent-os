@@ -336,6 +336,28 @@ overrides where the CLI is; `AGENT_OS_CLAUDE_CLI_TIMEOUT_MS` (default
 180000) caps one call. `npm run test-model-router` covers it with a fake
 CLI; it was also run live against a logged-in CLI.
 
+**What a call costs, and what keeps it down.** Every model call resends the
+whole system prompt, and through the CLI there's no prompt caching — so the
+fixed part is paid again on every tool step. Measured on one caption hand-off
+(Nyx on `claude-cli:haiku`, three calls): about 900 tokens of CLI overhead,
+~870 of instructions and ~1,800 describing tools per call, and most of the
+output was extended thinking. So:
+
+- **Thinking is off by default** for `claude-cli` (`MAX_THINKING_TOKENS=0`).
+  Turn it on for an agent that needs it with a `+think` suffix:
+  `claude-cli:sonnet+think`.
+- **Agents are only shown the tools they can use** (`offeredTools` in
+  `agent-loop.ts`): tools the turn hasn't switched on are left out, and the
+  gateway hides the shell and file tools from everyone but the builder agent
+  (`setToolVisibility` in `tool-registry.ts`), along with the instructions
+  that go with them. The `tool.before` hook is still what refuses them.
+- **The tool list is compact text** (a line per argument), not a JSON
+  Schema per tool. API providers still get their native tool format.
+- **Settling a work item ends the turn**: after `work` done / blocked /
+  hand-back there's no extra call to say "done".
+- BaseSpace reads come back as compact JSON; context compaction sends no
+  tools at all.
+
 ## Terminals inside the OS — Claude Code in BaseSpace
 
 With `AGENT_OS_TERMINAL=1`, the gateway runs interactive terminal sessions

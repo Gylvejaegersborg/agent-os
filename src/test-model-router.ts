@@ -25,6 +25,7 @@ import { createModelFromRef, parseModelRef } from "./core/models/real.js";
 import { createClaudeCliModel, parseToolCall, resetClaudeCliAvailability } from "./core/models/claude-cli.js";
 import { newSessionId, runTurn } from "./core/agent-loop.js";
 import { createStubWorker } from "./core/worker.js";
+import { setToolVisibility } from "./core/tool-registry.js";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) {
@@ -47,7 +48,7 @@ if (args[0] === "--version") { console.log("9.9.9 (Claude Code)"); process.exit(
 let stdin = "";
 process.stdin.on("data", (c) => (stdin += c));
 process.stdin.on("end", () => {
-  fs.appendFileSync(${JSON.stringify(callLog)}, JSON.stringify({ args, stdin }) + "\\n");
+  fs.appendFileSync(${JSON.stringify(callLog)}, JSON.stringify({ args, stdin, thinking: process.env.MAX_THINKING_TOKENS ?? null }) + "\\n");
   const out = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
   out({ type: "system", subtype: "init", tools: [] });
   const mode = process.env.FAKE_CLAUDE_MODE || "text";
@@ -69,7 +70,7 @@ process.stdin.on("end", () => {
 chmodSync(fakeClaude, 0o755);
 process.env.CLAUDE_CLI_PATH = fakeClaude;
 
-function calls(): { args: string[]; stdin: string }[] {
+function calls(): { args: string[]; stdin: string; thinking: string | null }[] {
   try {
     return readFileSync(callLog, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
   } catch {
@@ -136,6 +137,26 @@ async function testAdapterText(): Promise<void> {
   assert(flag("--model") === "sonnet", "the model is passed through");
   assert(flag("--system-prompt").startsWith("You are Hemera.") && flag("--system-prompt").includes("<tool_call>"), "the system prompt carries the agent's context and the tool protocol");
   assert(call.stdin.includes("[user]\nping"), "the conversation is sent on stdin");
+  assert(call.thinking === "0", "thinking is off by default (MAX_THINKING_TOKENS=0)");
+  assert(flag("--system-prompt").includes("(* = required") && !flag("--system-prompt").includes('"type":"object"'), "tools are listed compactly, not as JSON Schema");
+}
+
+async function testThinkingAndCallTools(): Promise<void> {
+  process.env.FAKE_CLAUDE_MODE = "text";
+  const think = createClaudeCliModel({ model: "sonnet+think" });
+  await think.complete([{ role: "user", content: "ping" }]);
+  let call = calls().at(-1)!;
+  const flag = (name: string) => call.args[call.args.indexOf(name) + 1];
+  assert(think.id === "claude-cli:sonnet+think" && flag("--model") === "sonnet" && call.thinking !== "0", "a +think suffix turns thinking on and isn't sent as part of the model name");
+
+  const model = createClaudeCliModel();
+  await model.complete([{ role: "user", content: "ping" }], { tools: [{ name: "basespace", description: "Reads the dashboard.", parameters: { type: "object", properties: { section: { type: "string", description: "Which part." } }, required: ["section"] } }] });
+  call = calls().at(-1)!;
+  const sys = flag("--system-prompt");
+  assert(sys.includes("- basespace: Reads the dashboard.") && sys.includes("section*: Which part.") && !sys.includes("- shell:"), "a call's own tool list replaces the full registry");
+  await model.complete([{ role: "user", content: "ping" }], { tools: [] });
+  call = calls().at(-1)!;
+  assert(!flag("--system-prompt").includes("# Tools"), "an empty tool list sends no tool protocol at all");
 }
 
 async function testAdapterToolCall(): Promise<void> {
@@ -205,6 +226,20 @@ async function testTurnThroughCli(): Promise<void> {
   assert(result.finalContent === "pong from the cli", "the tool result goes back to the CLI and its answer ends the turn");
   const last = calls().at(-1)!;
   assert(last.stdin.includes("[tool result]"), "the tool's output is fed back on the next call");
+  const sys = last.args[last.args.indexOf("--system-prompt") + 1];
+  assert(sys.includes("- shell:") && !sys.includes("- basespace:") && !sys.includes("- delegate:"), "a turn offers only the tools switched on for it (no BaseSpace tools without enableBaseSpace)");
+
+  // The gateway hides file/shell tools from everyone but the builder agent.
+  setToolVisibility((agentId, name) => !["shell", "read_file", "edit_file", "write_file"].includes(name) || agentId === "claude");
+  try {
+    process.env.FAKE_CLAUDE_MODE = "text";
+    await runTurn({ sessionId: newSessionId(), agentId: "hemera", userMessage: "hi", model: createClaudeCliModel(), worker: createStubWorker(), enableBaseSpace: true });
+    const hidden = calls().at(-1)!;
+    const hs = hidden.args[hidden.args.indexOf("--system-prompt") + 1];
+    assert(!hs.includes("- shell:") && !hs.includes("- read_file:") && !hs.includes("Prefer `read_file`") && hs.includes("- basespace:"), "hidden tools and their instructions are left out of the prompt");
+  } finally {
+    setToolVisibility(undefined);
+  }
 }
 
 async function main(): Promise<void> {
@@ -212,6 +247,7 @@ async function main(): Promise<void> {
   testParseToolCall();
   await testAdapterText();
   await testAdapterToolCall();
+  await testThinkingAndCallTools();
   await testAdapterError();
   await testRouter();
   await testTurnThroughCli();
