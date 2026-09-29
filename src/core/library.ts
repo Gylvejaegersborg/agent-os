@@ -1,0 +1,320 @@
+// The operator's music library: songs and beats they upload themselves (BaseSpace →
+// Beat DB → "Add song"). Files live on disk under <data>/library/files; the
+// catalog (songs, file records) is event-sourced like everything else, so it's
+// auditable and survives restarts.
+//
+// Why the gateway keeps them, not the browser: the same library shows on every
+// device, and agents can know what exists. What they get to know is only what's
+// here (title, kind, BPM, key, tags, a note): never anything invented.
+//
+// Safety, since this is an upload endpoint on a machine:
+//   - the file's extension must be an audio or image type from a short list, and
+//     the stored name is always a server-made id + that extension (the client's
+//     filename is only ever a display label, so no path can be chosen);
+//   - a size cap (AGENT_OS_LIBRARY_MAX_MB, default 300) enforced while streaming,
+//     so an oversized or endless upload is cut off and its partial file removed;
+//   - files are served with a content type derived from the extension and
+//     `nosniff`, and never executed.
+// Uploads/edits/deletes are operator routes only; agents get no tool for them.
+
+import { createWriteStream } from "node:fs";
+import { mkdir, rename, rm, stat } from "node:fs/promises";
+import path from "node:path";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import type { Readable } from "node:stream";
+import { appendEvent, project } from "./eventlog.js";
+import { generateId } from "./id.js";
+
+const LIBRARY_STREAM = "library";
+const DATA_DIR = process.env.AGENT_OS_DATA_DIR ?? path.join(process.cwd(), "data");
+export const LIBRARY_DIR = path.join(DATA_DIR, "library");
+export const FILES_DIR = path.join(LIBRARY_DIR, "files");
+
+export const AUDIO_TYPES: Record<string, string> = {
+  mp3: "audio/mpeg",
+  wav: "audio/wav",
+  flac: "audio/flac",
+  m4a: "audio/mp4",
+  aac: "audio/aac",
+  ogg: "audio/ogg",
+  oga: "audio/ogg",
+  opus: "audio/ogg",
+  aif: "audio/aiff",
+  aiff: "audio/aiff",
+};
+export const IMAGE_TYPES: Record<string, string> = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp" };
+
+export class LibraryError extends Error {
+  constructor(
+    public status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+export function maxFileBytes(): number {
+  const mb = Number(process.env.AGENT_OS_LIBRARY_MAX_MB ?? 300);
+  return (Number.isFinite(mb) && mb > 0 ? mb : 300) * 1024 * 1024;
+}
+
+export interface StoredFile {
+  id: string;
+  /** What the client called it: a label only, never a path. */
+  name: string;
+  ext: string;
+  size: number;
+  contentType: string;
+  kind: "audio" | "image";
+  createdAt: string;
+}
+
+export interface LibrarySong {
+  id: string;
+  title: string;
+  /** "beat" (an instrumental) or "song". */
+  category: "beat" | "song";
+  artist: string;
+  bpm?: number;
+  musicalKey?: string;
+  tags: string[];
+  note?: string;
+  durationSec?: number;
+  audioFileId?: string;
+  coverFileId?: string;
+  date: string;
+  updatedAt: string;
+}
+
+interface LibraryState {
+  files: Map<string, StoredFile>;
+  songs: Map<string, LibrarySong>;
+}
+
+async function projectLibrary(): Promise<LibraryState> {
+  return project<LibraryState>(LIBRARY_STREAM, { files: new Map(), songs: new Map() }, (state, e) => {
+    const p = e.payload as any;
+    if (e.type === "library.file.stored") state.files.set(p.file.id, p.file);
+    else if (e.type === "library.file.deleted") state.files.delete(p.id);
+    else if (e.type === "library.song.added") state.songs.set(p.song.id, p.song);
+    else if (e.type === "library.song.updated") {
+      const cur = state.songs.get(p.id);
+      if (cur) {
+        const next: Record<string, unknown> = { ...cur, ...p.patch, id: cur.id, updatedAt: e.timestamp };
+        for (const [k, v] of Object.entries(p.patch ?? {})) if (v === null) delete next[k]; // null = cleared
+        state.songs.set(p.id, next as unknown as LibrarySong);
+      }
+    } else if (e.type === "library.song.deleted") state.songs.delete(p.id);
+    return state;
+  });
+}
+
+const cleanName = (raw: string) => path.basename(String(raw).replace(/\\/g, "/")).replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 120) || "file";
+
+// ---- files ---------------------------------------------------------------------
+
+/** Streams an upload to disk. Nothing about the destination comes from the client. */
+export async function storeUpload(body: Readable, opts: { name: string; declaredBytes?: number }): Promise<StoredFile> {
+  const name = cleanName(opts.name);
+  const ext = path.extname(name).slice(1).toLowerCase();
+  const kind: StoredFile["kind"] | undefined = AUDIO_TYPES[ext] ? "audio" : IMAGE_TYPES[ext] ? "image" : undefined;
+  if (!kind) {
+    throw new LibraryError(415, `.${ext || "?"} isn't a supported type. Audio: ${Object.keys(AUDIO_TYPES).join(", ")}. Images: ${Object.keys(IMAGE_TYPES).join(", ")}.`);
+  }
+  const max = maxFileBytes();
+  if (opts.declaredBytes && opts.declaredBytes > max) {
+    throw new LibraryError(413, `That file is ${(opts.declaredBytes / 1048576).toFixed(0)} MB; the limit is ${(max / 1048576).toFixed(0)} MB (AGENT_OS_LIBRARY_MAX_MB).`);
+  }
+  await mkdir(FILES_DIR, { recursive: true });
+  const id = generateId().toLowerCase().replace(/[^a-z0-9]/g, "");
+  const tmp = path.join(FILES_DIR, `${id}.part`);
+  const final = path.join(FILES_DIR, `${id}.${ext}`);
+  let size = 0;
+  const counter = new Transform({
+    transform(chunk, _enc, cb) {
+      size += chunk.length;
+      if (size > max) cb(new LibraryError(413, `The upload went over the ${(max / 1048576).toFixed(0)} MB limit and was cut off.`));
+      else cb(null, chunk);
+    },
+  });
+  try {
+    await pipeline(body, counter, createWriteStream(tmp));
+  } catch (err) {
+    await rm(tmp, { force: true });
+    if (err instanceof LibraryError) throw err;
+    throw new LibraryError(400, "The upload was interrupted.");
+  }
+  if (size === 0) {
+    await rm(tmp, { force: true });
+    throw new LibraryError(400, "That file is empty.");
+  }
+  await rename(tmp, final);
+  const file: StoredFile = { id, name, ext, size, contentType: (kind === "audio" ? AUDIO_TYPES : IMAGE_TYPES)[ext]!, kind, createdAt: new Date().toISOString() };
+  await appendEvent(LIBRARY_STREAM, "library.file.stored", { file });
+  return file;
+}
+
+/** The file's record and where it is on disk, or undefined (unknown id, or gone from disk). */
+export async function getFile(id: string): Promise<{ file: StoredFile; path: string } | undefined> {
+  if (!/^[a-z0-9]+$/.test(id)) return undefined;
+  const file = (await projectLibrary()).files.get(id);
+  if (!file) return undefined;
+  const p = path.join(FILES_DIR, `${file.id}.${file.ext}`);
+  try {
+    await stat(p);
+  } catch {
+    return undefined;
+  }
+  return { file, path: p };
+}
+
+async function removeFile(id: string | undefined): Promise<void> {
+  if (!id) return;
+  const known = (await projectLibrary()).files.get(id);
+  if (!known) return;
+  await rm(path.join(FILES_DIR, `${known.id}.${known.ext}`), { force: true });
+  await appendEvent(LIBRARY_STREAM, "library.file.deleted", { id });
+}
+
+// ---- songs ---------------------------------------------------------------------
+
+export interface SongInput {
+  title?: unknown;
+  category?: unknown;
+  bpm?: unknown;
+  musicalKey?: unknown;
+  tags?: unknown;
+  note?: unknown;
+  durationSec?: unknown;
+  audioFileId?: unknown;
+  coverFileId?: unknown;
+}
+
+const str = (v: unknown, max: number) => (typeof v === "string" ? v.trim().slice(0, max) : "");
+
+/** Validates the editable fields; only the ones present are returned. */
+async function cleanSongFields(input: SongInput, state: LibraryState): Promise<Partial<LibrarySong>> {
+  const out: Partial<LibrarySong> = {};
+  if (input.title !== undefined) {
+    const title = str(input.title, 120);
+    if (!title) throw new LibraryError(400, "A song needs a title.");
+    out.title = title;
+  }
+  if (input.category !== undefined) {
+    if (input.category !== "beat" && input.category !== "song") throw new LibraryError(400, 'category must be "beat" or "song".');
+    out.category = input.category;
+  }
+  if (input.bpm !== undefined && input.bpm !== null && input.bpm !== "") {
+    const bpm = Number(input.bpm);
+    if (!Number.isFinite(bpm) || bpm < 20 || bpm > 400) throw new LibraryError(400, "BPM must be a number between 20 and 400.");
+    out.bpm = Math.round(bpm * 10) / 10;
+  } else if (input.bpm === null || input.bpm === "") out.bpm = undefined;
+  if (input.musicalKey !== undefined) out.musicalKey = str(input.musicalKey, 24) || undefined;
+  if (input.note !== undefined) out.note = str(input.note, 2000) || undefined;
+  if (input.tags !== undefined) {
+    if (!Array.isArray(input.tags)) throw new LibraryError(400, "tags must be a list.");
+    out.tags = [...new Set(input.tags.map((t) => str(t, 30)).filter(Boolean))].slice(0, 12);
+  }
+  if (input.durationSec !== undefined && input.durationSec !== null) {
+    const d = Number(input.durationSec);
+    if (Number.isFinite(d) && d > 0 && d < 24 * 3600) out.durationSec = Math.round(d);
+  }
+  for (const [key, kind] of [["audioFileId", "audio"], ["coverFileId", "image"]] as const) {
+    const v = input[key];
+    if (v === undefined) continue;
+    if (v === null || v === "") {
+      out[key] = undefined;
+      continue;
+    }
+    const f = typeof v === "string" ? state.files.get(v) : undefined;
+    if (!f || f.kind !== kind) throw new LibraryError(400, `${key} isn't an uploaded ${kind} file.`);
+    out[key] = f.id;
+  }
+  return out;
+}
+
+export async function listSongs(): Promise<LibrarySong[]> {
+  return [...(await projectLibrary()).songs.values()].sort((a, b) => b.date.localeCompare(a.date));
+}
+
+export async function addSong(input: SongInput, artist = "ISΛRK"): Promise<LibrarySong> {
+  const state = await projectLibrary();
+  const fields = await cleanSongFields({ category: "beat", tags: [], ...input }, state);
+  if (!fields.title) throw new LibraryError(400, "A song needs a title.");
+  if (!fields.audioFileId) throw new LibraryError(400, "Upload the audio first: a song needs an audio file.");
+  const now = new Date().toISOString();
+  const song: LibrarySong = { id: `lib-${generateId().toLowerCase().replace(/[^a-z0-9]/g, "")}`, artist, date: now, updatedAt: now, category: "beat", tags: [], title: fields.title, ...fields };
+  await appendEvent(LIBRARY_STREAM, "library.song.added", { song });
+  return song;
+}
+
+export async function updateSong(id: string, input: SongInput): Promise<LibrarySong> {
+  const state = await projectLibrary();
+  const cur = state.songs.get(id);
+  if (!cur) throw new LibraryError(404, `No song "${id}" in the library.`);
+  const patch = await cleanSongFields(input, state);
+  // JSON drops undefined, so a cleared field is stored as null (see projectLibrary).
+  const stored = Object.fromEntries(Object.entries(patch).map(([k, v]) => [k, v === undefined ? null : v]));
+  await appendEvent(LIBRARY_STREAM, "library.song.updated", { id, patch: stored });
+  // A replaced audio/cover file is no longer used by anything: remove it.
+  if ("audioFileId" in patch && patch.audioFileId !== cur.audioFileId) await removeFile(cur.audioFileId);
+  if ("coverFileId" in patch && patch.coverFileId !== cur.coverFileId) await removeFile(cur.coverFileId);
+  return (await projectLibrary()).songs.get(id)!;
+}
+
+/** Deletes the song and its files from disk. */
+export async function deleteSong(id: string): Promise<void> {
+  const cur = (await projectLibrary()).songs.get(id);
+  if (!cur) throw new LibraryError(404, `No song "${id}" in the library.`);
+  await appendEvent(LIBRARY_STREAM, "library.song.deleted", { id });
+  await removeFile(cur.audioFileId);
+  await removeFile(cur.coverFileId);
+}
+
+// ---- how the Beat DB sees a song -----------------------------------------------
+
+const GRADIENTS: [string, string][] = [
+  ["#36e0c8", "#0A2540"],
+  ["#a78bfa", "#1b1230"],
+  ["#f0a020", "#2a1a08"],
+  ["#ff5566", "#2b0d14"],
+  ["#46d369", "#0d2616"],
+  ["#5aa9ff", "#0d1f3a"],
+];
+
+function fmtSize(bytes: number): string {
+  return bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+/** The library's songs in the Beat DB's own Asset shape (BaseSpace maps the file
+ *  ids to URLs, since only it knows the gateway's prefix). */
+export async function listSongAssets(): Promise<Record<string, unknown>[]> {
+  const state = await projectLibrary();
+  return [...state.songs.values()]
+    .sort((a, b) => b.date.localeCompare(a.date))
+    .map((s) => {
+      const audio = s.audioFileId ? state.files.get(s.audioFileId) : undefined;
+      let h = 0;
+      for (const c of s.id) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+      return {
+        id: s.id,
+        title: s.title,
+        category: s.category,
+        artist: s.artist,
+        date: s.date,
+        tags: s.tags,
+        fileType: audio?.ext ?? "mp3",
+        ...(audio ? { fileSize: fmtSize(audio.size) } : {}),
+        source: "Uploaded",
+        gradient: GRADIENTS[h % GRADIENTS.length],
+        ...(s.note ? { note: s.note } : {}),
+        ...(s.bpm !== undefined ? { bpm: s.bpm } : {}),
+        ...(s.musicalKey ? { musicalKey: s.musicalKey } : {}),
+        ...(s.durationSec ? { durationSec: s.durationSec } : {}),
+        ...(s.audioFileId ? { audioFileId: s.audioFileId } : {}),
+        ...(s.coverFileId ? { coverFileId: s.coverFileId } : {}),
+        uploaded: true,
+      };
+    });
+}

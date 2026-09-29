@@ -212,11 +212,12 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: "basespace",
     description:
-      "Reads the operator's BaseSpace dashboard (a snapshot it syncs here): section = summary | goals | notes | projects | todos | events | crons | teams. " +
+      "Reads the operator's BaseSpace dashboard (a snapshot it syncs here): section = summary | goals | notes | projects | todos | events | crons | teams | songs " +
+      "(songs: the operator's music library: title, beat or song, BPM, key, tags, a note. Nothing else is known about a song; don't guess). " +
       "Goals are what the work is for; projects serve goals; todos and notes link to them. Use query to filter by text; use id to get one item in full " +
       "(a goal or project by id comes with its goal chain, linked notes and open todos; notes are listed without their text until you ask for one by id).",
     inputSchema: {
-      section: { type: "string", required: true, description: "summary, goals, notes, projects, todos, events, crons or teams." },
+      section: { type: "string", required: true, description: "summary, goals, notes, projects, todos, events, crons, teams or songs." },
       query: { type: "string", description: "Only items containing this text." },
       id: { type: "string", description: "Return this one item in full (for a note: its whole text)." },
     },

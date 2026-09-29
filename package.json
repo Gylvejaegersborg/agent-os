@@ -57,6 +57,7 @@
     "test-team-template": "tsc -b && node dist/test-team-template.js",
     "test-focus-runs": "tsc -b && node dist/test-focus-runs.js",
     "test-tool-args": "tsc -b && node dist/test-tool-args.js",
+    "test-library": "tsc -b && node dist/test-library.js",
     "team": "tsc -b && node dist/team-cli.js",
     "typecheck": "tsc -b --noEmit"
   },

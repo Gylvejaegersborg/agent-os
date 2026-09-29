@@ -133,6 +133,8 @@ import type { SessionStatus, ApprovalStatus, ApprovalRequest, TaskStatus, Nomina
 import type { SandboxPolicy } from "../core/permissions.js";
 import type { ConfiguredHook } from "../core/configured-hooks.js";
 import { handleMcp, type McpDeps } from "./mcp.js";
+import { handleLibrary } from "./library-routes.js";
+import { listSongAssets } from "../core/library.js";
 import type { SessionFocus } from "../core/types.js";
 import { closeAllTerminals, closeTerminal, setTerminalGatewayUrl, createTerminal, listTerminals, ptyBackend, resizeTerminal, streamTerminal, terminalsEnabled, writeTerminal } from "./terminal.js";
 import type { ArtifactType } from "../core/artifacts.js";
@@ -264,6 +266,11 @@ export function startGateway(deps: GatewayDeps, port = 0): Promise<GatewayHandle
         sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
       }
     });
+
+    // A music upload (a WAV can be 100+ MB) can take longer than Node's default 5 minute
+    // limit to arrive over a slow link. The gateway is loopback-only (reached through
+    // BaseSpace's proxy), so the slow-request guard can be generous.
+    server.requestTimeout = 30 * 60_000;
 
     server.listen(port, "127.0.0.1", () => {
       const address = server.address();
@@ -478,6 +485,9 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
     return;
   }
 
+  // ---- Music library (core/library.ts): the operator's own uploads. ----
+  if (segments[0] === "library" && (await handleLibrary(req, res, segments, url, { readJson: readRequestBody, sendJson }))) return;
+
   // ---- Team reviews (core/review.ts, review-loop.ts): what each lead's
   // review would look at (free — no model call), past reviews, and the
   // operator's "review now". ----
@@ -594,7 +604,10 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
     }
     if (segments[1] === "overlay") {
       if (method === "GET" && segments.length === 2) {
-        sendJson(res, 200, await loadOverlay());
+        // What agents added, plus the songs the operator uploaded (library.ts): the Beat
+        // DB already merges `library` from here.
+        const overlay = await loadOverlay();
+        sendJson(res, 200, { ...overlay, library: [...(Array.isArray(overlay.library) ? overlay.library : []), ...(await listSongAssets())] });
         return;
       }
       if (method === "DELETE" && segments.length === 4) {

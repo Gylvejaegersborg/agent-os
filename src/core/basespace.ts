@@ -120,6 +120,7 @@ export async function readSnapshotSection(section: string, opts: { query?: strin
         events: list("events").length,
         crons: list("crons").length,
         teams: list("teams").length,
+        songs: list("songs").length,
       },
       overdueOrDueThisWeek: openTodos.filter((t) => t.due && t.due.slice(0, 10) <= soon).map((t) => ({ id: t.id, title: t.title, due: t.due, priority: t.priority })),
       eventsThisWeek: list("events").filter((e) => e.date >= today && e.date <= soon).map((e) => ({ title: e.title, date: e.date, start: e.start })),
@@ -133,8 +134,8 @@ export async function readSnapshotSection(section: string, opts: { query?: strin
   }
 
   const key = section === "todo" ? "todos" : section === "goal" ? "goals" : section;
-  if (!["notes", "projects", "todos", "events", "crons", "teams", "goals"].includes(key)) {
-    return { ok: false, output: "", error: `unknown section "${section}" — use summary, goals, notes, projects, todos, events, crons or teams` };
+  if (!["notes", "projects", "todos", "events", "crons", "teams", "goals", "songs"].includes(key)) {
+    return { ok: false, output: "", error: `unknown section "${section}" — use summary, goals, notes, projects, todos, events, crons, teams or songs` };
   }
   let items = list(key);
   if (opts.id) {
