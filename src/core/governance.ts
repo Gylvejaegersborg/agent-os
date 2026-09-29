@@ -69,20 +69,39 @@ export async function gateToolCall(input: { agentId: string; sessionId: string; 
 
 const ID_RE = /^[a-z][a-z0-9-]{1,30}$/;
 
+interface Hire {
+  id: string;
+  name: string;
+  role: string;
+  persona: string;
+  reportsTo: string;
+  model: string;
+}
+
+/** A hire proposal as it would be carried out, or what's wrong with it. */
+async function readHire(args: Record<string, unknown>, proposedBy: string): Promise<Hire | string> {
+  const h = {
+    id: str(args, "id").toLowerCase(),
+    name: str(args, "name"),
+    role: str(args, "role"),
+    persona: str(args, "persona"),
+    reportsTo: str(args, "reportsTo") || proposedBy,
+    model: str(args, "model"),
+  };
+  if (!ID_RE.test(h.id) || h.id === OPERATOR) return `id must be lowercase letters, digits and dashes (got "${h.id}")`;
+  if (await getAgentIdentity(h.id)) return `there's already an agent "${h.id}"`;
+  if (!h.name || !h.role) return "a new agent needs a name and a role";
+  if (h.persona.length < 20) return "a new agent needs a persona (a few sentences: who it is and what it does)";
+  if (!str(args, "why")) return "say why the team needs it (why)";
+  if (h.reportsTo !== OPERATOR && !(await getAgentIdentity(h.reportsTo))) return `no agent "${h.reportsTo}" to report to`;
+  return h;
+}
+
 /** Carries out an APPROVED propose-agent call. */
 export async function hireAgent(args: Record<string, unknown>, proposedBy: string): Promise<ToolResult> {
-  const id = str(args, "id").toLowerCase();
-  const name = str(args, "name");
-  const role = str(args, "role");
-  const persona = str(args, "persona");
-  const reportsTo = str(args, "reportsTo") || proposedBy;
-  const model = str(args, "model");
-  const fail = (error: string): ToolResult => ({ ok: false, output: "", error });
-  if (!ID_RE.test(id) || id === OPERATOR) return fail(`id must be lowercase letters, digits and dashes (got "${id}")`);
-  if (await getAgentIdentity(id)) return fail(`there's already an agent "${id}"`);
-  if (!name || !role) return fail("a new agent needs a name and a role");
-  if (persona.length < 20) return fail("a new agent needs a persona (a few sentences: who it is and what it does)");
-  if (reportsTo !== OPERATOR && !(await getAgentIdentity(reportsTo))) return fail(`no agent "${reportsTo}" to report to`);
+  const h = await readHire(args, proposedBy);
+  if (typeof h === "string") return { ok: false, output: "", error: h };
+  const { id, name, role, persona, reportsTo, model } = h;
   const { registerAgent } = await import("./agents.js");
   await registerAgent({ id, name, role, persona, ...(model ? { defaultModel: model } : {}), ...(reportsTo !== OPERATOR ? { reportsTo } : {}) });
   // Same defaults the roster gets: it may read and write BaseSpace.
@@ -127,21 +146,42 @@ function parseSteps(raw: unknown): PlanStep[] | string {
   return steps;
 }
 
+interface Plan {
+  goalId: string;
+  goalTitle?: string;
+  steps: PlanStep[];
+}
+
+/** A plan as it would be carried out, or what's wrong with it. */
+async function readPlan(args: Record<string, unknown>, proposedBy: string, sessionFocus?: SessionFocus): Promise<Plan | string> {
+  const goalId = str(args, "goalId") || (sessionFocus?.kind === "goal" ? sessionFocus.id : "");
+  if (!goalId) return "which goal? pass goalId (see the basespace tool, section goals)";
+  const goals: any[] = ((await loadSnapshot()) ?? {}).goals ?? [];
+  const goal = goals.find((g) => g.id === goalId);
+  if (goals.length && !goal) return `no goal "${goalId}" in BaseSpace`;
+  const steps = parseSteps(args.steps);
+  if (typeof steps === "string") return steps;
+  // All-or-nothing: every step must be doable before any is created.
+  const known = new Set((await listAgentIdentities()).map((a) => a.id));
+  const bad = steps.find((s) => !known.has(s.to) || s.to === proposedBy);
+  if (bad) return bad.to === proposedBy ? `step "${bad.title}" is assigned to you — a plan is work for teammates; do your part yourself` : `no agent "${bad.to}"`;
+  return { goalId, ...(goal ? { goalTitle: String(goal.title) } : {}), steps };
+}
+
+/** What's wrong with a gated proposal, checked BEFORE it's filed — so the
+ *  agent can fix it now instead of the operator approving something that
+ *  then fails. Undefined = fine to file. */
+export async function checkProposal(toolName: string, args: Record<string, unknown>, agentId: string, sessionFocus?: SessionFocus): Promise<string | undefined> {
+  const r = toolName === "propose-agent" ? await readHire(args, agentId) : await readPlan(args, agentId, sessionFocus);
+  return typeof r === "string" ? r : undefined;
+}
+
 /** Carries out an APPROVED propose-plan call: one work item per step, all
  *  serving the goal, reported back to the session that proposed it. */
 export async function adoptPlan(args: Record<string, unknown>, proposedBy: string, sessionId: string, sessionFocus?: SessionFocus): Promise<ToolResult> {
-  const fail = (error: string): ToolResult => ({ ok: false, output: "", error });
-  const goalId = str(args, "goalId") || (sessionFocus?.kind === "goal" ? sessionFocus.id : "");
-  if (!goalId) return fail("which goal? pass goalId (see the basespace tool, section goals)");
-  const goals: any[] = ((await loadSnapshot()) ?? {}).goals ?? [];
-  const goal = goals.find((g) => g.id === goalId);
-  if (goals.length && !goal) return fail(`no goal "${goalId}" in BaseSpace`);
-  const steps = parseSteps(args.steps);
-  if (typeof steps === "string") return fail(steps);
-  // All-or-nothing: check every step before creating any.
-  const known = new Set((await listAgentIdentities()).map((a) => a.id));
-  const bad = steps.find((s) => !known.has(s.to) || s.to === proposedBy);
-  if (bad) return fail(bad.to === proposedBy ? `"${bad.title}" is assigned to you — do it yourself rather than planning it` : `no agent "${bad.to}"`);
+  const plan = await readPlan(args, proposedBy, sessionFocus);
+  if (typeof plan === "string") return { ok: false, output: "", error: plan };
+  const { goalId, goalTitle, steps } = plan;
   const ids: string[] = [];
   for (const s of steps) {
     const item = await createWork({
@@ -157,7 +197,7 @@ export async function adoptPlan(args: Record<string, unknown>, proposedBy: strin
   await appendEvent(GOVERNANCE_STREAM, "plan.adopted", { goalId, proposedBy, summary: str(args, "summary"), workIds: ids });
   return {
     ok: true,
-    output: `Plan adopted for ${goal ? `"${goal.title}"` : goalId}: ${steps.map((s, i) => `${s.to} — ${s.title} (${ids[i]})`).join("; ")}. ` +
+    output: `Plan adopted for ${goalTitle ? `"${goalTitle}"` : goalId}: ${steps.map((s, i) => `${s.to} — ${s.title} (${ids[i]})`).join("; ")}. ` +
       "They run in the background; results are posted back here.",
   };
 }

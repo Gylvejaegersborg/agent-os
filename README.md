@@ -512,6 +512,42 @@ tool set and step limit, the next review escalated it to the operator in one
 call (12k tokens), naming exactly what was missing. `npm run test-review`
 covers the rules.
 
+## Governance gates — hires and plans need you
+
+After Paperclip's board: the team can grow and plan, but you sign off first
+(`core/governance.ts`).
+
+- **`propose-agent`**: a lead proposes hiring a teammate (id, name, role,
+  persona, who it reports to, optional model, and why).
+- **`propose-plan`**: a lead proposes a plan for a goal, with up to 8 steps
+  for teammates. On approval each step becomes a work item serving the goal,
+  reported back to the proposing thread.
+- **Enforced in the harness, not a hook.** `runTurn()` never runs either
+  one; it files an approval and stops the turn, and dispatch refuses them
+  unless the operator approved (the gateway's `executeApprovedCall` path).
+  Proposing the same thing again reuses the pending request. Neither can be
+  always-allowed (`allowlist.ts` refuses), and only leads are offered them.
+- **Checked before filing.** A proposal with a problem (an id that exists, a
+  thin persona, a step assigned to the lead itself, an unknown agent or goal)
+  isn't filed; the problem goes straight back to the agent to fix. Plans are
+  all-or-nothing.
+- On approval, a hire is registered under its proposer with the roster's
+  BaseSpace defaults and no budget (you set that). BaseSpace shows both
+  proposals as readable cards in Approvals.
+
+**Agent config history.** An agent's name, role, persona, reporting line,
+model and budget are all events already; `listAgentRevisions()` folds them
+into a numbered history. `restoreAgentRevision()` writes a restore as new
+events, marked `restoredFrom`, so a restore can itself be undone. Routes:
+`GET /agents/:id/revisions`, `POST /agents/:id/revisions/:rev/restore`
+(operator-only). BaseSpace: agent editor → History.
+
+Live on `claude-cli:haiku`: Hemera proposed hiring Lyra (sync licensing).
+Her first plan for the Switch goal assigned step 1 to herself; that's what
+led to the pre-filing check. The re-proposed plan was approved in BaseSpace
+and became three work items for Nyx, Aether and Hermes, which the runner
+picked up. `npm run test-governance` covers the rules.
+
 ## Board controls — pause, resume, budgets
 
 The operator's live levers over each agent (`src/core/controls.ts`, from

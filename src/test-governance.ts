@@ -96,6 +96,12 @@ async function testGates(): Promise<void> {
   assert(pending.length === 1, "proposing the same thing again reuses the pending approval");
   assert(await throwsWith(addAllowRule({ agentId: "hemera", toolName: "propose-agent" }), /always needs your approval/), "a gated tool can't be always-allowed");
 
+  const selfPlan = { ...PLAN, steps: [{ to: "hemera", title: "Run the standup" }, ...PLAN.steps] };
+  const refused = await turn(hemera.id, "hemera", `call ${JSON.stringify({ name: "propose-plan", args: selfPlan })}`);
+  const { getSessionHistory } = await import("./core/index.js");
+  const toolMsg = (await getSessionHistory(hemera.id)).filter((m) => m.role === "tool").at(-1)?.content ?? "";
+  assert(refused.stopReason === "answered" && /not filed — fix this and propose again: step "Run the standup" is assigned to you/.test(toolMsg), "a flawed plan isn't filed: the problem goes straight back to the agent");
+  assert(!(await listApprovals({ status: "pending" })).some((a) => a.toolName === "propose-plan"), "and nothing waits in Approvals for it");
   const plan = await turn(hemera.id, "hemera", `call ${JSON.stringify({ name: "propose-plan", args: PLAN })}`);
   assert(plan.stopReason === "tool-blocked" && (await listApprovals({ status: "pending" })).some((a) => a.toolName === "propose-plan" && /2 work items/.test(a.reason)), "a plan proposal is filed too");
   assert(!(await listWork({ requestedBy: "hemera" })).length, "no work is created before approval");

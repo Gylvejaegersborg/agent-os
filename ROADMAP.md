@@ -401,11 +401,11 @@ Ordered so each step is safe before the next adds autonomy:
       changed since the last review, with a per-day cap. Escalated items
       show as "needs you" in BaseSpace. **[core]** **[gateway]** **[UI]**
       `review.ts`, `review-loop.ts`.
-- [ ] **Governance gates.** Agent-proposed hires (a new agent) and a lead's
-      plan for a goal go to the approval queue before anything runs.
-      Agent config changes (persona, model, budget) are revisioned with
-      rollback — the event log already keeps history; this needs a "restore
-      this version" action. **[core]** **[UI]**
+- [x] **Governance gates.** `propose-agent` (hire) and `propose-plan`
+      (work items for a goal) always go to Approvals, enforced in the
+      harness; checked before filing; never always-allowed. Agent config
+      (name, role, persona, reporting line, model, budget) has a revision
+      history with restore. **[core]** **[UI]** `governance.ts`.
 - [ ] **Task watchdog.** Opt-in per task tree: when every task in it has
       stopped (done, blocked, failed), a named verifier agent (Argus) checks
       the claims against the evidence and either accepts or re-opens with a

@@ -198,7 +198,7 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
       steps: {
         type: "array",
         required: true,
-        description: "Up to 8 steps, each {to: agent id, title: what to do, detail?: context}.",
+        description: "Up to 8 steps for teammates (not yourself), each {to: agent id, title: what to do, detail?: context}.",
         items: {
           type: "object",
           properties: { to: { type: "string" }, title: { type: "string" }, detail: { type: "string" } },

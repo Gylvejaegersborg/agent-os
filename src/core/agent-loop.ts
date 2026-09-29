@@ -6,7 +6,7 @@
 
 import { blockWork, cancelWork, completeWork, createWork, escalateWork, handBackWork, listWork, noteWork, reassignWork, reopenWork, orgContext, recordWorkUsage, workForSession, type WorkView } from "./work.js";
 import { AgentBlockedError, assertAgentMayRun, getAgentControlState, recordAgentUsage } from "./controls.js";
-import { GATED_TOOLS, adoptPlan, gateToolCall, hireAgent } from "./governance.js";
+import { GATED_TOOLS, adoptPlan, checkProposal, gateToolCall, hireAgent } from "./governance.js";
 import { hindsightConfigured, hindsightRecall, hindsightReflect, hindsightRetain } from "./hindsight.js";
 import { addOverlayItem, focusContext, readSnapshotSection, type OverlayKind } from "./basespace.js";
 import * as fs from "node:fs/promises";
@@ -462,7 +462,8 @@ async function dispatchTool(
   },
 ): Promise<ToolDispatchResult> {
   if (GATED_TOOLS.has(toolCall.name) && !ctx.approved) {
-    return { ok: false, output: "", error: `"${toolCall.name}" only runs once the operator approves it` };
+    const problem = await checkProposal(toolCall.name, toolCall.args, ctx.agentId, (await getSession(ctx.sessionId))?.focus);
+    return { ok: false, output: "", error: problem ? `not filed — fix this and propose again: ${problem}` : `"${toolCall.name}" only runs once the operator approves it` };
   }
   if (toolCall.name === "propose-agent") return hireAgent(toolCall.args, ctx.agentId);
   if (toolCall.name === "propose-plan") return adoptPlan(toolCall.args, ctx.agentId, ctx.sessionId, (await getSession(ctx.sessionId))?.focus);
@@ -853,8 +854,16 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       // Governance gates (governance.ts): hiring and goal plans never run
       // from a turn — they're filed for the operator's approval, whatever
       // any hook or allow rule would say.
-      const blockDecision = GATED_TOOLS.has(response.toolCall.name)
-        ? { block: true, reason: await gateToolCall({ agentId, sessionId, toolName: response.toolCall.name, args: response.toolCall.args ?? {} }) }
+      // A proposal with something wrong with it isn't filed: it falls
+      // through to dispatch, which hands the problem back to the agent.
+      const gated = GATED_TOOLS.has(response.toolCall.name);
+      const proposalProblem = gated
+        ? await checkProposal(response.toolCall.name, response.toolCall.args ?? {}, agentId, (await getSession(sessionId))?.focus)
+        : undefined;
+      const blockDecision = gated
+        ? proposalProblem
+          ? { block: false as const }
+          : { block: true, reason: await gateToolCall({ agentId, sessionId, toolName: response.toolCall.name, args: response.toolCall.args ?? {} }) }
         : await fireHook("tool.before", {
             agentId,
             sessionId,
