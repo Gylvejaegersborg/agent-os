@@ -50,6 +50,7 @@
     "test-controls": "tsc -b && node dist/test-controls.js",
     "test-goals": "tsc -b && node dist/test-goals.js",
     "test-work": "tsc -b && node dist/test-work.js",
+    "test-review": "tsc -b && node dist/test-review.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {

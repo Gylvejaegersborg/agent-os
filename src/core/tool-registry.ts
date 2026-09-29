@@ -153,13 +153,14 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: "work",
     description:
-      "Your work items: action = list | done | blocked | hand-back | note | cancel. done {id?, text: the result}; blocked {id?, text: why}; " +
-      "hand-back {id?, text: why} gives it to your manager; note {id, text}; cancel {id, text} only for work YOU asked for. " +
-      "id defaults to the item you're working in this conversation. You can't cancel work handed to you.",
+      "Your work items. action: list | done {text: the result} | blocked {text: why} | hand-back {text: why; goes to your manager} | note {id, text}. " +
+      "id defaults to the item this conversation is working. You can't cancel work handed to you. " +
+      "For work you asked for or your reports are doing: reopen {id, text: guidance} | reassign {id, to, text} | escalate {id, text: what the operator must decide} | cancel {id, text}.",
     inputSchema: {
-      action: { type: "string", required: true, description: "list, done, blocked, hand-back, note or cancel." },
-      id: { type: "string", description: "Work item id (defaults to the one this conversation is working)." },
-      text: { type: "string", description: "The result, reason or note." },
+      action: { type: "string", required: true, description: "list, done, blocked, hand-back, note, reopen, reassign, escalate or cancel." },
+      id: { type: "string", description: "Work item id." },
+      to: { type: "string", description: "reassign: the teammate's agent id." },
+      text: { type: "string", description: "The result, reason, guidance or note." },
     },
   },
   {

@@ -4,7 +4,7 @@
 // Every turn is written to the session's event stream, so resume/replay/
 // observability for free (see eventlog.ts).
 
-import { blockWork, cancelWork, completeWork, createWork, handBackWork, listWork, noteWork, orgContext, recordWorkUsage, workForSession, type WorkView } from "./work.js";
+import { blockWork, cancelWork, completeWork, createWork, escalateWork, handBackWork, listWork, noteWork, reassignWork, reopenWork, orgContext, recordWorkUsage, workForSession, type WorkView } from "./work.js";
 import { AgentBlockedError, assertAgentMayRun, getAgentControlState, recordAgentUsage } from "./controls.js";
 import { hindsightConfigured, hindsightRecall, hindsightReflect, hindsightRetain } from "./hindsight.js";
 import { addOverlayItem, focusContext, readSnapshotSection, type OverlayKind } from "./basespace.js";
@@ -579,8 +579,11 @@ async function dispatchTool(
         : action === "hand-back" ? await handBackWork(id, ctx.agentId, text)
         : action === "note" ? await noteWork(id, ctx.agentId, text)
         : action === "cancel" ? await cancelWork(id, ctx.agentId, text)
+        : action === "reopen" ? await reopenWork(id, ctx.agentId, text)
+        : action === "escalate" ? await escalateWork(id, ctx.agentId, text)
+        : action === "reassign" ? await reassignWork(id, ctx.agentId, String(toolCall.args.to ?? "").trim(), text)
         : undefined;
-      if (!item) return { ok: false, output: "", error: `unknown action "${action}" — use list, done, blocked, hand-back, note or cancel` };
+      if (!item) return { ok: false, output: "", error: `unknown action "${action}" — use list, done, blocked, hand-back, note, cancel, reopen, reassign or escalate` };
       return { ok: true, output: `Work ${item.id} is now ${item.status}${item.assignee !== ctx.agentId ? ` (with ${item.assignee})` : ""}.` };
     } catch (err) {
       return { ok: false, output: "", error: err instanceof Error ? err.message : String(err) };

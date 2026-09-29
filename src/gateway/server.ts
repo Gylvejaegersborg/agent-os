@@ -57,6 +57,10 @@ import {
   noteWork,
   reassignWork,
   reopenWork,
+  listLeads,
+  getAgentIdentity,
+  listReviews,
+  reviewDigest,
   type WorkStatus,
   AgentBlockedError,
   getAgentControlState,
@@ -111,6 +115,7 @@ import {
   consumeApproval,
 } from "../core/index.js";
 import { checkPathSandbox } from "../core/permissions.js";
+import { runReview } from "./review-loop.js";
 import type { SessionStatus, ApprovalStatus, ApprovalRequest, TaskStatus, NominationStatus } from "../core/types.js";
 import type { SandboxPolicy } from "../core/permissions.js";
 import type { ConfiguredHook } from "../core/configured-hooks.js";
@@ -411,6 +416,35 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
       else if (action === "reassign") await send(() => reassignWork(id, OPERATOR, text("to"), text("reason") || "reassigned by the operator"));
       else if (action === "note") await send(() => noteWork(id, OPERATOR, text("text")));
       else sendJson(res, 404, { error: `unknown work action ${action}` });
+      return;
+    }
+  }
+
+  // ---- Team reviews (core/review.ts, review-loop.ts): what each lead's
+  // review would look at (free — no model call), past reviews, and the
+  // operator's "review now". ----
+  if (segments[0] === "reviews") {
+    if (method === "GET" && segments.length === 1) {
+      const agentId = url.searchParams.get("agentId") ?? undefined;
+      const leads = await listLeads();
+      sendJson(res, 200, { leads: leads.map((l) => l.id), reviews: await listReviews(agentId) });
+      return;
+    }
+    if (method === "GET" && segments.length === 3 && segments[2] === "digest") {
+      sendJson(res, 200, await reviewDigest(segments[1]!));
+      return;
+    }
+    if (method === "POST" && segments.length === 2) {
+      const agentId = segments[1]!;
+      if (!(await getAgentIdentity(agentId))) {
+        sendJson(res, 404, { error: `no agent "${agentId}"` });
+        return;
+      }
+      try {
+        sendJson(res, 200, await runReview(agentId, deps, { trigger: "operator", force: true }));
+      } catch (err) {
+        sendJson(res, err instanceof AgentBlockedError ? 409 : 500, { error: err instanceof Error ? err.message : String(err) });
+      }
       return;
     }
   }

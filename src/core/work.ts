@@ -18,6 +18,9 @@
 //     what a request really cost across everyone it touched.
 //   - Items inherit the requesting session's focus (a goal or project), so
 //     delegated work keeps its "why".
+//   - Managing an item someone else is doing (reassign, reopen, escalate
+//     to the operator) is for whoever asked for it, the assignee's manager,
+//     or the operator — the lead's review (review.ts) runs on this.
 //
 // Running the work is the gateway's job (gateway/work-runner.ts); this file
 // is the ledger and its rules.
@@ -59,6 +62,9 @@ export interface WorkItem {
   sessionId?: string;
   result?: string;
   blockedReason?: string;
+  /** Raised to the operator by a lead (or the requester); cleared when the
+   *  item moves again (reopened, reassigned, finished, cancelled). */
+  escalation?: { by: string; reason: string; at: string };
   notes: WorkNote[];
   /** Tokens spent on this item itself. */
   tokens: number;
@@ -91,19 +97,22 @@ async function projectWork(): Promise<Map<string, WorkItem>> {
         touch({ notes: note(p.text) });
         break;
       case "work.completed":
-        touch({ status: "done", result: p.result, notes: note(`done: ${p.result}`) });
+        touch({ status: "done", result: p.result, escalation: undefined, notes: note(`done: ${p.result}`) });
         break;
       case "work.blocked":
         touch({ status: "blocked", blockedReason: p.reason, notes: note(`blocked: ${p.reason}`) });
         break;
       case "work.reassigned":
-        touch({ status: "open", assignee: p.to, sessionId: undefined, blockedReason: undefined, notes: note(`handed to ${p.to}: ${p.reason}`) });
+        touch({ status: "open", assignee: p.to, sessionId: undefined, blockedReason: undefined, escalation: undefined, notes: note(`handed to ${p.to}: ${p.reason}`) });
         break;
       case "work.reopened":
-        touch({ status: "open", sessionId: undefined, blockedReason: undefined, notes: note(`reopened: ${p.reason}`) });
+        touch({ status: "open", sessionId: undefined, blockedReason: undefined, escalation: undefined, notes: note(`reopened: ${p.reason}`) });
         break;
       case "work.cancelled":
-        touch({ status: "cancelled", notes: note(`cancelled: ${p.reason}`) });
+        touch({ status: "cancelled", escalation: undefined, notes: note(`cancelled: ${p.reason}`) });
+        break;
+      case "work.escalated":
+        touch({ escalation: { by: p.by, reason: p.reason, at: event.timestamp }, notes: note(`escalated to the operator: ${p.reason}`) });
         break;
       case "work.usage":
         touch({ tokens: (item?.tokens ?? 0) + (p.tokens ?? 0) });
@@ -218,6 +227,19 @@ export async function claimWork(id: string, by: string, sessionId: string): Prom
 
 const ACTIVE: WorkStatus[] = ["open", "in_progress", "blocked"];
 
+/** May `by` manage an item someone else is doing? The operator, whoever
+ *  asked for it, or the assignee's manager. */
+export async function mayManageWork(item: Pick<WorkItem, "assignee" | "requestedBy">, by: string): Promise<boolean> {
+  if (by === OPERATOR || by === item.requestedBy) return true;
+  return (await getAgentIdentity(item.assignee))?.reportsTo === by;
+}
+
+async function mustManage(item: WorkItem, by: string, what: string): Promise<void> {
+  if (!(await mayManageWork(item, by))) {
+    throw new WorkError(`only ${item.requestedBy === OPERATOR ? "the operator" : item.requestedBy}, ${item.assignee}'s manager or the operator can ${what} ${item.id}`);
+  }
+}
+
 export async function completeWork(id: string, by: string, result: string): Promise<WorkView> {
   return serialized(async () => {
     const item = await mustGet(id);
@@ -256,6 +278,8 @@ export async function handBackWork(id: string, by: string, reason: string): Prom
 export async function reassignWork(id: string, by: string, to: string, reason: string): Promise<WorkView> {
   return serialized(async () => {
     const item = await mustGet(id);
+    // The assignee passing it on is a hand-back (handBackWork checks that).
+    if (by !== item.assignee) await mustManage(item, by, "reassign");
     if (!ACTIVE.includes(item.status)) throw new WorkError(`${id} is already ${item.status}`);
     if (!(await getAgentIdentity(to))) throw new WorkError(`no agent "${to}"`);
     if (to === item.assignee) throw new WorkError(`${id} is already ${to}'s`);
@@ -270,9 +294,25 @@ export async function reassignWork(id: string, by: string, to: string, reason: s
 export async function reopenWork(id: string, by: string, reason: string): Promise<WorkView> {
   return serialized(async () => {
     const item = await mustGet(id);
+    await mustManage(item, by, "reopen");
     if (item.status === "done" || item.status === "cancelled") throw new WorkError(`${id} is ${item.status}`);
+    if (item.status === "open") throw new WorkError(`${id} is already open`);
     await appendEvent(WORK_STREAM, "work.reopened", { id, by, reason: reason.trim() || "reopened" });
     await publishEvent("work.reopened", { id, by });
+    return (await getWork(id))!;
+  });
+}
+
+/** Flags an item for the operator's attention — a lead's way of saying
+ *  "this needs you" without deciding it. Nothing else changes. */
+export async function escalateWork(id: string, by: string, reason: string): Promise<WorkView> {
+  return serialized(async () => {
+    const item = await mustGet(id);
+    await mustManage(item, by, "escalate");
+    if (!ACTIVE.includes(item.status)) throw new WorkError(`${id} is already ${item.status}`);
+    if (!reason.trim()) throw new WorkError("say what the operator needs to decide");
+    await appendEvent(WORK_STREAM, "work.escalated", { id, by, reason: reason.trim() });
+    await publishEvent("work.escalated", { id, by });
     return (await getWork(id))!;
   });
 }
