@@ -23,10 +23,16 @@ import type { ToolSpec } from "./model.js";
 // dispatchTool() itself, same as before this file existed.
 
 export interface ToolInputSchemaProperty {
-  type: "string" | "number" | "boolean" | "object";
+  type: "string" | "number" | "boolean" | "object" | "array";
   description?: string;
   required?: boolean;
+  /** For type "array": the JSON Schema of one element. */
+  items?: Record<string, unknown>;
 }
+
+/** Tools that always need the operator's approval and can never be
+ *  always-allowed (governance.ts): growing the team and planning a goal. */
+export const GATED_TOOL_NAMES = ["propose-agent", "propose-plan"];
 
 export interface ToolDefinition {
   name: string;
@@ -59,7 +65,10 @@ export function toToolSpec(d: ToolDefinition): ToolSpec {
     parameters: {
       type: "object",
       properties: Object.fromEntries(
-        Object.entries(d.inputSchema).map(([k, v]) => [k, { type: v.type, ...(v.description ? { description: v.description } : {}) }]),
+        Object.entries(d.inputSchema).map(([k, v]) => [
+          k,
+          { type: v.type, ...(v.description ? { description: v.description } : {}), ...(v.items ? { items: v.items } : {}) },
+        ]),
       ),
       required: Object.entries(d.inputSchema)
         .filter(([, v]) => v.required)
@@ -161,6 +170,41 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
       id: { type: "string", description: "Work item id." },
       to: { type: "string", description: "reassign: the teammate's agent id." },
       text: { type: "string", description: "The result, reason, guidance or note." },
+    },
+  },
+  {
+    name: "propose-agent",
+    description:
+      "Propose hiring a new agent onto the team — for recurring work no teammate fits. Always goes to the operator's Approvals; nothing is " +
+      "created unless they approve. Say plainly why the team needs it.",
+    inputSchema: {
+      id: { type: "string", required: true, description: "Short lowercase id, e.g. 'lyra' or 'sync-scout'." },
+      name: { type: "string", required: true, description: "Display name." },
+      role: { type: "string", required: true, description: "e.g. 'Sync licensing · Outreach'." },
+      persona: { type: "string", required: true, description: "A few sentences: who it is, what it does, what it must never do." },
+      reportsTo: { type: "string", description: "Its manager's agent id (defaults to you)." },
+      model: { type: "string", description: "Optional model, e.g. 'claude-cli:haiku'. Defaults to the gateway's." },
+      why: { type: "string", required: true, description: "What work it takes on and why no current teammate fits." },
+    },
+  },
+  {
+    name: "propose-plan",
+    description:
+      "Propose a plan for a goal: several work items for teammates. Always goes to the operator's Approvals first; once approved the items " +
+      "are created and run, and results come back here. For a single hand-off use `delegate`.",
+    inputSchema: {
+      goalId: { type: "string", description: "The goal it serves (defaults to this conversation's goal)." },
+      summary: { type: "string", required: true, description: "The plan in one or two sentences: the approach and why." },
+      steps: {
+        type: "array",
+        required: true,
+        description: "Up to 8 steps, each {to: agent id, title: what to do, detail?: context}.",
+        items: {
+          type: "object",
+          properties: { to: { type: "string" }, title: { type: "string" }, detail: { type: "string" } },
+          required: ["to", "title"],
+        },
+      },
     },
   },
   {

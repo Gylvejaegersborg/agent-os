@@ -28,6 +28,7 @@ export * from "./worker.js";
 export * from "./worker-registry.js";
 export * from "./tool-registry.js";
 export * from "./review.js";
+export * from "./governance.js";
 // OPTIONAL cross-harness delegation — NOT the default multiagent mechanism.
 // See cli-agent-worker.ts's header and README.md's "Cross-harness
 // delegation (optional, NOT the default)" section before using this.

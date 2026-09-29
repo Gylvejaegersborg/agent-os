@@ -6,6 +6,7 @@
 
 import { blockWork, cancelWork, completeWork, createWork, escalateWork, handBackWork, listWork, noteWork, reassignWork, reopenWork, orgContext, recordWorkUsage, workForSession, type WorkView } from "./work.js";
 import { AgentBlockedError, assertAgentMayRun, getAgentControlState, recordAgentUsage } from "./controls.js";
+import { GATED_TOOLS, adoptPlan, gateToolCall, hireAgent } from "./governance.js";
 import { hindsightConfigured, hindsightRecall, hindsightReflect, hindsightRetain } from "./hindsight.js";
 import { addOverlayItem, focusContext, readSnapshotSection, type OverlayKind } from "./basespace.js";
 import * as fs from "node:fs/promises";
@@ -456,8 +457,15 @@ async function dispatchTool(
     enableMemoryNominations?: boolean;
     enableArtifacts?: boolean;
     sandboxPolicy?: SandboxPolicy;
+    /** Set only by executeApprovedCall — the operator approved this call. */
+    approved?: boolean;
   },
 ): Promise<ToolDispatchResult> {
+  if (GATED_TOOLS.has(toolCall.name) && !ctx.approved) {
+    return { ok: false, output: "", error: `"${toolCall.name}" only runs once the operator approves it` };
+  }
+  if (toolCall.name === "propose-agent") return hireAgent(toolCall.args, ctx.agentId);
+  if (toolCall.name === "propose-plan") return adoptPlan(toolCall.args, ctx.agentId, ctx.sessionId, (await getSession(ctx.sessionId))?.focus);
   if (toolCall.name === "shell") {
     return ctx.worker.run(String(toolCall.args.command));
   }
@@ -625,7 +633,7 @@ const SETTLING_WORK_ACTIONS = new Set(["done", "blocked", "hand-back"]);
  *  hooks still refuse a hidden tool if it's called anyway. */
 function offeredTools(
   agentId: string,
-  on: { skills?: SkillRegistry; enableSubagents?: boolean; enableMemoryNominations?: boolean; enableArtifacts?: boolean; enableBaseSpace?: boolean },
+  on: { skills?: SkillRegistry; enableSubagents?: boolean; enableMemoryNominations?: boolean; enableArtifacts?: boolean; enableBaseSpace?: boolean; isLead?: boolean },
 ): ToolSpec[] {
   const enabled: Record<string, boolean | undefined> = {
     skill: !!on.skills && on.skills.listMetadata().length > 0,
@@ -637,6 +645,10 @@ function offeredTools(
     "basespace-add": on.enableBaseSpace,
     delegate: on.enableBaseSpace,
     work: on.enableBaseSpace,
+    // Growing the team and planning a goal are a lead's job (and always
+    // go to the operator first — governance.ts).
+    "propose-agent": on.enableBaseSpace && on.isLead,
+    "propose-plan": on.enableBaseSpace && on.isLead,
   };
   return listToolDefinitions()
     .filter((d) => !(d.name in enabled) || !!enabled[d.name])
@@ -710,7 +722,8 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // Reporting lines and open work (work.ts) — only for agents on the
   // operator's team (the same flag that turns on BaseSpace).
   const orgText = enableBaseSpace ? await orgContext(agentId) : "";
-  const tools = offeredTools(agentId, { skills, enableSubagents, enableMemoryNominations, enableArtifacts, enableBaseSpace }).filter(
+  const isLead = enableBaseSpace ? (await listAgentIdentities()).some((a) => a.reportsTo === agentId) : false;
+  const tools = offeredTools(agentId, { skills, enableSubagents, enableMemoryNominations, enableArtifacts, enableBaseSpace, isLead }).filter(
     (t) => !opts.onlyTools || opts.onlyTools.includes(t.name),
   );
   const offered = new Set(tools.map((t) => t.name));
@@ -837,11 +850,16 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
         break;
       }
 
-      const blockDecision = await fireHook("tool.before", {
-        agentId,
-        sessionId,
-        payload: response.toolCall,
-      });
+      // Governance gates (governance.ts): hiring and goal plans never run
+      // from a turn — they're filed for the operator's approval, whatever
+      // any hook or allow rule would say.
+      const blockDecision = GATED_TOOLS.has(response.toolCall.name)
+        ? { block: true, reason: await gateToolCall({ agentId, sessionId, toolName: response.toolCall.name, args: response.toolCall.args ?? {} }) }
+        : await fireHook("tool.before", {
+            agentId,
+            sessionId,
+            payload: response.toolCall,
+          });
       if (blockDecision.block) {
         stopReason = "tool-blocked";
         finalContent = `Tool call blocked: ${blockDecision.reason ?? "no reason given"}`;
@@ -1016,6 +1034,7 @@ export async function executeApprovedCall(opts: {
       enableMemoryNominations: opts.enableMemoryNominations,
       enableArtifacts: opts.enableArtifacts,
       sandboxPolicy: opts.sandboxPolicy,
+      approved: true,
     }),
     toolDef?.timeoutMs,
     () => ({ ok: false, output: "", error: `tool "${toolCall.name}" timed out after ${toolDef?.timeoutMs}ms` }),

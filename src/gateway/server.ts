@@ -58,6 +58,8 @@ import {
   reassignWork,
   reopenWork,
   listLeads,
+  listAgentRevisions,
+  restoreAgentRevision,
   getAgentIdentity,
   listReviews,
   reviewDigest,
@@ -597,6 +599,28 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
       }
       sendJson(res, 200, await getAgentControlState(agentId));
       return;
+    }
+    // ---- Config revisions (governance.ts): an agent's name, role,
+    // persona, reporting line, model and budget over time, and "restore
+    // this version". Operator-only, like the budgets it covers. ----
+    if (segments.length >= 3 && segments[2] === "revisions") {
+      const agentId = segments[1]!;
+      if (!(await getAgentRecord(agentId))) {
+        sendJson(res, 404, { error: `no such agent: ${agentId}` });
+        return;
+      }
+      if (method === "GET" && segments.length === 3) {
+        sendJson(res, 200, { revisions: await listAgentRevisions(agentId) });
+        return;
+      }
+      if (method === "POST" && segments.length === 5 && segments[4] === "restore") {
+        try {
+          sendJson(res, 200, { revisions: await restoreAgentRevision(agentId, Number(segments[3])) });
+        } catch (err) {
+          sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
+        }
+        return;
+      }
     }
     if (method === "GET" && segments.length === 1) {
       sendJson(res, 200, { agents: await listAgentRecords() });

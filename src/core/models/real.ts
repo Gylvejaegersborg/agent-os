@@ -551,7 +551,8 @@ async function projectAgentModelPreferences(): Promise<Map<string, string>> {
   return project<Map<string, string>>(AGENT_MODEL_PREF_STREAM, new Map(), (state, event) => {
     if (event.type === "agent.defaultModel.set") {
       const p = event.payload as any;
-      state.set(p.agentId, p.model);
+      if (p.model) state.set(p.agentId, p.model);
+      else state.delete(p.agentId); // "" = back to the gateway default
     }
     return state;
   });
@@ -704,6 +705,7 @@ export async function createModelForAgent(
   agentId: string,
   ollamaOpts: OllamaOptions = {},
 ): Promise<ModelAdapter | undefined> {
-  const preferred = (await getAgentDefaultModel(agentId)) ?? process.env.AGENT_OS_DEFAULT_MODEL;
+  // An empty preference (a restore back to "no model set") means the default.
+  const preferred = (await getAgentDefaultModel(agentId)) || process.env.AGENT_OS_DEFAULT_MODEL;
   return createModelFromRef(preferred, ollamaOpts);
 }
