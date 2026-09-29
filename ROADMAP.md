@@ -416,10 +416,12 @@ Ordered so each step is safe before the next adds autonomy:
       tasks that only renew liveness, and runs that ended lost / timed out /
       failed today. Shown as "Needs a look" in the Tasks panel; nothing is
       reassigned automatically. **[core]** **[UI]**
-- [ ] **Team templates.** Export/import a team (agents, personas, skills,
-      budgets, reporting lines) as markdown files, like Paperclip's
-      `COMPANY.md`/`TEAM.md`/`AGENTS.md` package, with secrets stripped.
-      Makes the ISΛRK team reproducible and shareable. **[core]** **[UI]**
+- [x] **Team templates.** The team as markdown files (`team-template.ts`):
+      `TEAM.md` (reporting tree), `agents/<id>.md` (frontmatter + persona),
+      `skills/*/SKILL.md`; secret-looking strings redacted. Import previews,
+      refuses on any problem, creates and updates (as config revisions),
+      deletes nothing. `GET /team/export`, `POST /team/import`,
+      `npm run team`, Teams panel → Team as files. **[core]** **[UI]**
 
 **Deliberately not copying:** multiple companies per instance and
 enterprise RBAC (one operator here); "not a chatbot" as a hard rule — the

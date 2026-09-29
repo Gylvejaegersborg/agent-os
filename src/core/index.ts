@@ -31,6 +31,7 @@ export * from "./review.js";
 export * from "./governance.js";
 export * from "./watchdog.js";
 export * from "./stale.js";
+export * from "./team-template.js";
 // OPTIONAL cross-harness delegation — NOT the default multiagent mechanism.
 // See cli-agent-worker.ts's header and README.md's "Cross-harness
 // delegation (optional, NOT the default)" section before using this.

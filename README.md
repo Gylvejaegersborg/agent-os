@@ -609,6 +609,34 @@ BaseSpace shows these as "Needs a look" at the top of the Tasks panel, with
 retry and cancel for stuck work items. Work that simply hasn't moved in a
 day belongs to the lead's team review. `npm run test-stale`.
 
+## Team templates — the team as files
+
+After Paperclip's company package: the whole team as plain markdown you can
+read, diff, keep in git and share (`core/team-template.ts`).
+
+- **Files**:
+  - `TEAM.md`: the reporting tree, the verifier and the skills;
+  - `agents/<id>.md`: frontmatter (`name`, `role`, `reportsTo`, `model`,
+    `budget: 40000/week`, `capabilities`) with the persona as the body;
+  - `skills/<name>/SKILL.md`: the agentskills.io files.
+- **Export** replaces secret-looking strings (API keys, tokens) with
+  `[redacted]` and says where in `TEAM.md`. Agent config holds no
+  credentials; those live in the gateway's environment. Pause state and usage
+  aren't part of a template.
+- **Import** makes the listed agents match the files:
+  - it creates missing agents and updates existing ones, where each change
+    is a config revision, restorable per agent;
+  - it never deletes an agent that isn't in the files;
+  - it checks everything first (frontmatter, budgets, unknown managers,
+    reporting loops) and changes nothing if there's a problem.
+- **Where**: `GET /team/export` (`{files, bundle}`), `POST /team/import
+  {bundle | files, apply}` (a preview unless `apply: true`),
+  `npm run team -- export <dir|file.md>` / `import <dir|file.md> [--apply]`.
+  In BaseSpace: Teams panel → Team as files (Export downloads one `.md`
+  bundle; Import previews first). Operator-only.
+
+`npm run test-team-template`.
+
 ## Board controls — pause, resume, budgets
 
 The operator's live levers over each agent (`src/core/controls.ts`, from

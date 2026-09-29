@@ -58,6 +58,11 @@ import {
   reassignWork,
   reopenWork,
   listLeads,
+  exportTeam,
+  bundleTeam,
+  unbundleTeam,
+  planTeamImport,
+  applyTeamImport,
   listStaleWork,
   staleRunMs,
   listWatches,
@@ -429,6 +434,32 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
       else if (action === "note") await send(() => noteWork(id, OPERATOR, text("text")));
       else if (action === "verify") await send(() => watchWork({ rootIds: [id], createdBy: OPERATOR, label: text("label") || undefined }));
       else sendJson(res, 404, { error: `unknown work action ${action}` });
+      return;
+    }
+  }
+
+  // ---- Team templates (core/team-template.ts): the team as markdown files.
+  // Operator-only, like everything that changes agent config. ----
+  if (segments[0] === "team") {
+    if (method === "GET" && segments.length === 2 && segments[1] === "export") {
+      const files = await exportTeam({ skills: deps.skills });
+      sendJson(res, 200, { files, bundle: bundleTeam(files) });
+      return;
+    }
+    if (method === "POST" && segments.length === 2 && segments[1] === "import") {
+      const body = await readRequestBody(req);
+      const files =
+        typeof body.bundle === "string" ? unbundleTeam(body.bundle)
+        : body.files && typeof body.files === "object" ? (body.files as Record<string, string>)
+        : undefined;
+      if (!files) {
+        sendJson(res, 400, { error: "send {bundle: string} or {files: {path: text}}, and apply: true to apply" });
+        return;
+      }
+      const plan = body.apply === true
+        ? await applyTeamImport(files, { skills: deps.skills, skillsDir: deps.skillsDir })
+        : await planTeamImport(files, { skills: deps.skills });
+      sendJson(res, plan.problems.length && body.apply === true && !plan.applied ? 409 : 200, plan);
       return;
     }
   }
