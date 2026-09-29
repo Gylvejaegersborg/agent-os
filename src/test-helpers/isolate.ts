@@ -37,3 +37,23 @@ rmSync(dir, { recursive: true, force: true });
 mkdirSync(dir, { recursive: true });
 
 process.env.AGENT_OS_DATA_DIR = dir;
+
+// Tests drive SCRIPTED models and assume no real provider answers. But when
+// nothing names a model, the router falls back to whatever it finds — and on
+// a machine that runs Ollama (the intended setup: local models) that's the
+// live Ollama on :11434, which then quietly replaces the scripted model in
+// anything that resolves a model per agent (the work runner, flows, crons):
+// the test's own model is never called and the assertions fail for reasons
+// that have nothing to do with the code. So the default Ollama port is
+// unreachable here. A test that really wants it (a live-model check) sets
+// AGENT_OS_TEST_ALLOW_OLLAMA=1 before importing this file.
+if (!process.env.AGENT_OS_TEST_ALLOW_OLLAMA) {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\]):11434(\/|$)/.test(url)) {
+      return Promise.reject(new TypeError("fetch failed (default Ollama port is blocked in tests)"));
+    }
+    return realFetch(input, init);
+  }) as typeof fetch;
+}

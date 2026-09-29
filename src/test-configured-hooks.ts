@@ -135,7 +135,10 @@ async function testExitZeroAllowsAndReceivesContext(): Promise<void> {
     [
       {
         event: "tool.before",
-        command: `node -e 'const fs=require("fs"); let d=""; process.stdin.on("data",c=>d+=c); process.stdin.on("end",()=>fs.writeFileSync("${markerFile}", d))'`,
+        // Double quotes around the script and the marker path passed as an
+        // argument: single quotes aren't quoting on Windows' cmd.exe, and a
+        // Windows path's backslashes can't sit inside a JS string literal.
+        command: `node -e "const fs=require('fs'); let d=''; process.stdin.on('data',c=>d+=c); process.stdin.on('end',()=>fs.writeFileSync(process.argv[1], d))" "${markerFile}"`,
         matchTool: "shell",
       },
     ],
