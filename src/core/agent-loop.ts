@@ -590,7 +590,15 @@ async function dispatchTool(
         const teamText = reports.length ? `\n\nYour reports' other work:\n${team.map(line).join("\n") || "- nothing"}` : "";
         return { ok: true, output: `Assigned to you:\n${mine.map(line).join("\n") || "- nothing"}\n\nYou asked for:\n${asked.map(line).join("\n") || "- nothing"}${teamText}` };
       }
-      const id = typeof toolCall.args.id === "string" && toolCall.args.id ? toolCall.args.id : (await workForSession(ctx.sessionId))?.id;
+      let id = typeof toolCall.args.id === "string" && toolCall.args.id ? toolCall.args.id : (await workForSession(ctx.sessionId))?.id;
+      // A verifier reopening/escalating "this item" means the item it's
+      // checking, not its own verification (seen live: it passed its own id).
+      const current = await workForSession(ctx.sessionId);
+      if (current?.kind === "verification" && id === current.id && (action === "reopen" || action === "escalate")) {
+        const checked = current.verifies ?? [];
+        if (checked.length !== 1) return { ok: false, output: "", error: `pass the id of the item you're sending back — one of: ${checked.join(", ")}` };
+        id = checked[0]!;
+      }
       if (!id) return { ok: false, output: "", error: "which work item? pass id (see action list)" };
       const item =
         action === "done" ? await completeWork(id, ctx.agentId, text)

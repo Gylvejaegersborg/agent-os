@@ -261,7 +261,8 @@ export async function mayManageWork(item: Pick<WorkItem, "id" | "assignee" | "re
 
 async function mustManage(item: WorkItem, by: string, what: string): Promise<void> {
   if (!(await mayManageWork(item, by, what))) {
-    throw new WorkError(`only ${item.requestedBy === OPERATOR ? "the operator" : item.requestedBy}, ${item.assignee}'s manager or the operator can ${what} ${item.id}`);
+    const who = item.requestedBy === OPERATOR ? `${item.assignee}'s manager or the operator` : `${item.requestedBy}, ${item.assignee}'s manager or the operator`;
+    throw new WorkError(`only ${who} can ${what} ${item.id}${item.kind === "verification" ? " (that's a verification — pass the id of the item it checks)" : ""}`);
   }
 }
 

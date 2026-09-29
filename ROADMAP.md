@@ -406,11 +406,11 @@ Ordered so each step is safe before the next adds autonomy:
       harness; checked before filing; never always-allowed. Agent config
       (name, role, persona, reporting line, model, budget) has a revision
       history with restore. **[core]** **[UI]** `governance.ts`.
-- [ ] **Task watchdog.** Opt-in per task tree: when every task in it has
-      stopped (done, blocked, failed), a named verifier agent (Argus) checks
-      the claims against the evidence and either accepts or re-opens with a
-      reason. Paperclip's rule: report problems, don't silently fix them.
-      **[core]**
+- [x] **Task watchdog.** Opt-in per work item or plan: once everything
+      under it has stopped, Argus checks each claim against the evidence
+      (the tool calls that really ran, and what was added to BaseSpace),
+      assembled in code. It reopens or escalates with a reason, never fixes;
+      up to two rounds, then the operator. **[core]** **[UI]** `watchdog.ts`.
 - [ ] **Stale-work visibility.** Work items with no movement for a day
       now show as "quiet" on the Team review card (and go to the lead's
       review). Still to do: runtime tasks (tasks.ts's

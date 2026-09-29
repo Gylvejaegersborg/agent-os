@@ -176,6 +176,29 @@ async function testLazyVerifier(): Promise<void> {
   assert(verdicts === 2 && w.status === "verified", "a verifier that sent an item back but ran out of steps still counts: the item re-ran and round 2 verified it");
 }
 
+async function testVerifierPassesOwnId(): Promise<void> {
+  // Argus live: reopened "the item" by passing his own verification's id.
+  const item = await createWork({ title: "Bio for the EPK", assignee: "theia", requestedBy: OPERATOR });
+  const v = await createWork({ title: "Verify: bio", assignee: "argus", requestedBy: OPERATOR, kind: "verification", verifies: [item.id] });
+  const { claimWork, completeWork } = await import("./core/index.js");
+  await claimWork(item.id, "theia", "s-bio");
+  await completeWork(item.id, "theia", "written");
+  const s = await createSession({ agentId: "argus" });
+  await claimWork(v.id, "argus", s.id);
+  const own: ModelAdapter = {
+    id: "own",
+    async complete(messages: ModelMessage[]): Promise<ModelResponse> {
+      if (messages[messages.length - 1]!.role === "tool") return { content: "Sent back." };
+      return { content: "", toolCall: { name: "work", args: { action: "reopen", id: v.id, text: "No bio was added anywhere." } } };
+    },
+  };
+  await runTurn({ sessionId: s.id, agentId: "argus", userMessage: "verify", model: own, worker: createStubWorker(), enableBaseSpace: true });
+  const after = (await getWork(item.id))!;
+  assert(after.status === "open" && after.notes.at(-1)?.text === "reopened: No bio was added anywhere.", "a verifier passing its own verification's id reopens the item it checks");
+  await cancelWork(item.id, OPERATOR, "tidy");
+  await cancelWork(v.id, OPERATOR, "tidy");
+}
+
 async function testGivesUp(): Promise<void> {
   const stems = await createWork({ title: "Stems for the remix", assignee: "aether", requestedBy: OPERATOR });
   const watch = await watchWork({ rootIds: [stems.id], createdBy: OPERATOR });
@@ -223,6 +246,7 @@ async function testRoutes(): Promise<void> {
 async function main(): Promise<void> {
   await seedDefaultAgents();
   await saveSnapshot({ schema: 1, notes: [] });
+  await testVerifierPassesOwnId(); // before the runner starts picking items up
   runner = startWorkRunner({ model: scripted, worker: createStubWorker(), enableBaseSpace: true, maxToolHops: 4 }, { intervalMs: 60_000 });
   const unsub = subscribeToAllEvents((type) => {
     if (type.startsWith("work.") || type === "watch.created") void checkWatches();

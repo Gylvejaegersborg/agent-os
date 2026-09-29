@@ -548,6 +548,54 @@ led to the pre-filing check. The re-proposed plan was approved in BaseSpace
 and became three work items for Nyx, Aether and Hermes, which the runner
 picked up. `npm run test-governance` covers the rules.
 
+## Watchdog — a verifier checks finished work
+
+After Paperclip's verifier: "trust, but verify" for handed-off work
+(`core/watchdog.ts`).
+
+- **Opt in**: on a work item, or on an approved plan, for the item and
+  everything it's split into.
+  - Agents: `delegate {verify: true}`, `propose-plan {verify: true}`.
+  - HTTP: `POST /work {verify: true}`, `POST /work/:id/verify`.
+  - MCP: `assign_work {verify: true}`.
+  - BaseSpace: the Assign form's checkbox, or "Verify when done" on an item.
+- **When everything under a watch has stopped** (done, blocked or
+  cancelled), the verifier gets one verification work item: Argus, or
+  `AGENT_OS_VERIFIER`. Its evidence is assembled in code, not left to the
+  verifier to dig for: each item's brief and claimed result, next to the tool
+  calls that really ran in its session (the `work` bookkeeping call excluded)
+  and the text of what it added to BaseSpace.
+- **The verifier reports, it doesn't fix.** It runs with only `work` and
+  `basespace`, and may reopen or escalate the items it's verifying, nothing
+  else. A reopened item (a done one can be reopened now) re-runs with the
+  reason at the top of its brief, and is verified again. After two rounds
+  the watch is left for the operator ("verification needs you"). If a
+  verifier sends items back but runs out of steps before writing a verdict,
+  its reasons become the verdict.
+- The verdict goes back to the thread the watch came from as a `[Work]`
+  note. `GET /watches` lists watches and verdicts. Off with
+  `AGENT_OS_WATCHDOG=off`.
+
+Live on `claude-cli:haiku`, two watched items. The first run exposed four
+problems, all now fixed:
+- The `basespace` tool couldn't see what agents had just added, so the
+  verifier sent back finished work. Reads now include the overlay.
+- Hermes added one note five times. The same title from the same agent now
+  updates the note.
+- A re-run wasn't told why it had been sent back, and Nyx spent 112k tokens
+  redoing her research. Re-runs now get the reason.
+- Verdicts were lost when the verifier ran out of steps.
+
+The second run:
+- Nyx's captions were accepted in one round (59k tokens).
+- Argus caught Hermes listing a distributor as a curator and sent it back;
+  Hermes fixed it.
+- In round two, Argus flagged Hermes' unbacked claim that the contacts were
+  "verified". He passed his own verification's id and was refused, so the
+  item wasn't sent back. Such a call now maps to the checked item.
+
+`npm run test-watchdog` covers it with the real runner and a scripted team.
+
 ## Board controls — pause, resume, budgets
 
 The operator's live levers over each agent (`src/core/controls.ts`, from
