@@ -28,6 +28,7 @@ const SNAPSHOT = path.join(DIR, "snapshot.json");
 const OVERLAY = path.join(DIR, "overlay.json");
 const MAX_OUTPUT = 12_000;
 const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
+const MAX_LIST_ITEMS = 30;
 
 export type OverlayKind = "note" | "todo" | "project-update";
 
@@ -144,9 +145,16 @@ export async function readSnapshotSection(section: string, opts: { query?: strin
     return { ok: true, output: cap(`${header}\n${JSON.stringify(one)}${context}`) };
   }
   if (opts.query) items = items.filter((i) => matches(i, opts.query!));
-  // Notes are listed without bodies — ask for one by id to read it.
-  const shown = key === "notes" ? items.map(({ body: _body, ...rest }) => rest) : items;
-  return { ok: true, output: cap(`${header} ${items.length} ${key}${opts.query ? ` matching "${opts.query}"` : ""}.\n${JSON.stringify(shown)}`) };
+  // Notes are listed without bodies (and without other bulky/duplicate
+  // frontmatter like `props`, which usually just repeats `tags`) — ask for
+  // one by id to read it in full. Small local models have tight context
+  // windows (often 4096 tokens), so a big flat listing can overflow and get
+  // silently cut mid-item; capping item count here (not just bytes) keeps
+  // every shown item complete. Compact JSON: every character is context.
+  const shown = key === "notes" ? items.map(({ id, title, folder, tags }) => ({ id, title, folder, tags })) : items;
+  const limited = shown.length > MAX_LIST_ITEMS ? shown.slice(0, MAX_LIST_ITEMS) : shown;
+  const more = shown.length > MAX_LIST_ITEMS ? `\n… ${shown.length - MAX_LIST_ITEMS} more — narrow with query (folder/tag/title text) to see them.` : "";
+  return { ok: true, output: cap(`${header} ${items.length} ${key}${opts.query ? ` matching "${opts.query}"` : ""}.\n${JSON.stringify(limited)}${more}`) };
 }
 
 // ---- focus: what a conversation's work serves ---------------------------------

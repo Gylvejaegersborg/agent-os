@@ -958,7 +958,16 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       continue;
     }
 
-    finalContent = response.content;
+    // A small local model that just got a tool result back sometimes ends
+    // its turn with a genuinely empty completion — no further tool call,
+    // no text either (seen with qwen2.5:3b after a `basespace` call). Left
+    // as "" this reads as the reply silently vanishing, same failure shape
+    // the maxHops fallback below already guards against.
+    finalContent =
+      response.content ||
+      (toolCalled
+        ? `Got the ${toolCalled} result but didn't produce a reply — try asking again or rephrasing.`
+        : "No reply came back for that message — try again or rephrase.");
     await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent });
     break;
   }
