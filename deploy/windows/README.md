@@ -11,6 +11,15 @@ Layout assumed: `agent-os` and `BaseOStest` are cloned side by side in one folde
 |---|---|
 | gateway | `127.0.0.1:8787` (agent-os binds loopback itself, nothing else can reach it) |
 | BaseSpace | `<tailscale ip>:5173`, the Tailscale interface only; it proxies `/agent-os` to the gateway |
+| Hindsight (the agents' long-term memory) | `127.0.0.1:8888`, forced: its own default is `0.0.0.0` and it has no auth |
+
+Hindsight runs through `uvx` (needs `uv`), extracts facts with Hindsight's `claude-code`
+provider on Haiku (your Claude login; measured against local models in the main README,
+"Which LLM should extract the facts?"), and is on by default. The first start downloads its
+models and takes a while. To run without it, create an empty file `<root>\os-server\hindsight.off`
+and restart; to use another extraction model set `HINDSIGHT_LLM_PROVIDER` / `HINDSIGHT_LLM_MODEL`
+as machine environment variables. It needs `PYTHONUTF8=1`, which the supervisor sets (its
+startup banner crashes on Windows' default encoding when output goes to a file).
 
 Nothing listens on the LAN or Wi-Fi address. **Fails closed:** with no Tailscale
 address the supervisor waits and starts nothing; it never falls back to a LAN

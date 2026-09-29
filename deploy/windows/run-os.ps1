@@ -40,15 +40,48 @@ function Get-TailscaleIp {
 }
 
 function Stop-Ports {
-  foreach ($port in 8787, 5173) {
+  foreach ($port in 8787, 5173, 8888) {
     Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue |
       ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
   }
   Start-Sleep -Seconds 1
 }
 
+# Hindsight: the agents' long-term memory (github.com/vectorize-io/hindsight), a
+# Python server run through uvx. Create os-server\hindsight.off to run without it.
+#   - extraction LLM: Hindsight's own claude-code provider (your Claude login) with
+#     Haiku. Measured on this machine (see the README): qwen2.5:3b kept none of the
+#     durable specifics, llama3.1:8b took 17 minutes and failed 2 of 6 turns on a
+#     4 GB GPU, claude-code+Haiku kept everything in ~3 minutes and leaves the GPU
+#     to the agents. Override with HINDSIGHT_LLM_PROVIDER / HINDSIGHT_LLM_MODEL.
+#   - bound to 127.0.0.1: its default is 0.0.0.0 and it has no auth by default.
+#   - PYTHONUTF8: its startup banner crashes on Windows' cp1252 when stdout is a file.
+$hindsightVersion = '0.10.1'   # the version agent-os's client was checked against
+$hindsightOn      = -not (Test-Path (Join-Path $PSScriptRoot 'hindsight.off'))
+$hsProvider       = if ($env:HINDSIGHT_LLM_PROVIDER) { $env:HINDSIGHT_LLM_PROVIDER } else { 'claude-code' }
+$hsModel          = if ($env:HINDSIGHT_LLM_MODEL)    { $env:HINDSIGHT_LLM_MODEL }    else { 'haiku' }
+
+function Start-Hindsight {
+  $env:PYTHONUTF8 = '1'
+  $env:PYTHONIOENCODING = 'utf-8'
+  $env:HINDSIGHT_API_LLM_PROVIDER = $hsProvider
+  $env:HINDSIGHT_API_LLM_MODEL = $hsModel
+  if ($hsProvider -eq 'ollama') { $env:HINDSIGHT_API_LLM_BASE_URL = 'http://localhost:11434/v1' }
+  try {
+    Start-Process -FilePath 'uvx' -ArgumentList @('--from', "hindsight-api==$hindsightVersion", 'hindsight-api', '--host', '127.0.0.1', '--port', '8888') `
+      -WorkingDirectory $root -WindowStyle Hidden -PassThru `
+      -RedirectStandardOutput (Join-Path $logs 'hindsight.log') -RedirectStandardError (Join-Path $logs 'hindsight.err.log')
+  } finally {
+    # keep these out of the gateway's environment
+    'PYTHONUTF8', 'PYTHONIOENCODING', 'HINDSIGHT_API_LLM_PROVIDER', 'HINDSIGHT_API_LLM_MODEL', 'HINDSIGHT_API_LLM_BASE_URL' |
+      ForEach-Object { Remove-Item "Env:$_" -ErrorAction SilentlyContinue }
+  }
+}
+
 function Start-Gateway {
   Remove-Item Env:AGENT_OS_TERMINAL -ErrorAction SilentlyContinue   # terminals stay off
+  # Agents recall from Hindsight when this is set; a down or still-starting Hindsight just means "no recall".
+  if ($hindsightOn) { $env:HINDSIGHT_URL = 'http://127.0.0.1:8888' } else { Remove-Item Env:HINDSIGHT_URL -ErrorAction SilentlyContinue }
   $env:BASEOS_REPO_DIR = $baseSpace
   Start-Process -FilePath 'node' -ArgumentList 'dist/gateway/cli.js' -WorkingDirectory $agentOs -WindowStyle Hidden -PassThru `
     -RedirectStandardOutput (Join-Path $logs 'gateway.log') -RedirectStandardError (Join-Path $logs 'gateway.err.log')
@@ -74,6 +107,14 @@ Push-Location $agentOs
 if ($LASTEXITCODE -ne 0) { Log 'WARNING: the agent-os build reported errors (see build.log) - starting the existing build' }
 Pop-Location
 
+$hs = $null
+if ($hindsightOn) {
+  $hs = Start-Hindsight
+  Log ("started Hindsight pid {0} (127.0.0.1:8888, extraction: {1}/{2}); the first start downloads models" -f $hs.Id, $hsProvider, $hsModel)
+} else {
+  Log 'Hindsight is off (hindsight.off exists): agents run without long-term memory'
+}
+$hsStart = Get-Date
 $gw = Start-Gateway
 $bs = Start-BaseSpace $ts
 $gwStart = Get-Date
@@ -82,6 +123,13 @@ Log ("started gateway pid {0} (127.0.0.1:8787) and BaseSpace pid {1} ({2}:5173)"
 
 while ($true) {
   Start-Sleep -Seconds 10
+
+  if ($hindsightOn -and $hs.HasExited) {
+    Log ("Hindsight exited (code {0}) - restarting" -f $hs.ExitCode)
+    if (((Get-Date) - $hsStart).TotalSeconds -lt 60) { Start-Sleep -Seconds 120 }   # crash loop: back off
+    $hs = Start-Hindsight
+    $hsStart = Get-Date
+  }
 
   if ($gw.HasExited) {
     Log ("gateway exited (code {0}) - restarting" -f $gw.ExitCode)
