@@ -58,6 +58,8 @@ import {
   reassignWork,
   reopenWork,
   listLeads,
+  listStaleWork,
+  staleRunMs,
   listWatches,
   verifierId,
   watchWork,
@@ -429,6 +431,13 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
       else sendJson(res, 404, { error: `unknown work action ${action}` });
       return;
     }
+  }
+
+  // ---- Stale work (core/stale.ts): stuck runs and runs that ended badly,
+  // for the operator to look at — nothing is reassigned automatically. ----
+  if (segments[0] === "stale" && method === "GET" && segments.length === 1) {
+    sendJson(res, 200, { stale: await listStaleWork(), quietMinutes: staleRunMs() / 60_000 });
+    return;
   }
 
   // ---- Watchdog (core/watchdog.ts): watches and their verdicts. ----

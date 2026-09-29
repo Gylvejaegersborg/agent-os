@@ -596,6 +596,19 @@ The second run:
 
 `npm run test-watchdog` covers it with the real runner and a scripted team.
 
+## Stale work — what's stuck
+
+`GET /stale` (`core/stale.ts`) lists what needs a look, and changes nothing:
+- work "in progress" whose run has gone quiet, with no session activity for
+  `AGENT_OS_STALE_RUN_MIN` (20). A hung model call looks like this;
+- tasks still "running" with nothing but liveness renewals, which only prove
+  the process is up;
+- runs that ended lost, timed out or failed in the last day.
+
+BaseSpace shows these as "Needs a look" at the top of the Tasks panel, with
+retry and cancel for stuck work items. Work that simply hasn't moved in a
+day belongs to the lead's team review. `npm run test-stale`.
+
 ## Board controls — pause, resume, budgets
 
 The operator's live levers over each agent (`src/core/controls.ts`, from

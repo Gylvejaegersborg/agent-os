@@ -411,10 +411,11 @@ Ordered so each step is safe before the next adds autonomy:
       (the tool calls that really ran, and what was added to BaseSpace),
       assembled in code. It reopens or escalates with a reason, never fixes;
       up to two rounds, then the operator. **[core]** **[UI]** `watchdog.ts`.
-- [ ] **Stale-work visibility.** Work items with no movement for a day
-      now show as "quiet" on the Team review card (and go to the lead's
-      review). Still to do: runtime tasks (tasks.ts's
-      `reconcileLostTasks()`) on the same dashboard. **[UI]**
+- [x] **Stale-work visibility.** `GET /stale` (`stale.ts`) lists in-progress
+      work whose run has gone quiet (20 min, `AGENT_OS_STALE_RUN_MIN`), running
+      tasks that only renew liveness, and runs that ended lost / timed out /
+      failed today. Shown as "Needs a look" in the Tasks panel; nothing is
+      reassigned automatically. **[core]** **[UI]**
 - [ ] **Team templates.** Export/import a team (agents, personas, skills,
       budgets, reporting lines) as markdown files, like Paperclip's
       `COMPANY.md`/`TEAM.md`/`AGENTS.md` package, with secrets stripped.
