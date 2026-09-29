@@ -358,6 +358,10 @@ output was extended thinking. So:
 - BaseSpace reads come back as compact JSON; context compaction sends no
   tools at all.
 
+Same work item rerun after these changes (same snapshot, same model): 6,713
+tokens in two calls (6,082 in / 631 out), down from 17,206 in three calls
+(13,104 in / 4,102 out). One run each, so treat it as indicative.
+
 ## Terminals inside the OS — Claude Code in BaseSpace
 
 With `AGENT_OS_TERMINAL=1`, the gateway runs interactive terminal sessions
