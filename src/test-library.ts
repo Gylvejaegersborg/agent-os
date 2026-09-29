@@ -97,8 +97,11 @@ async function main(): Promise<void> {
     const before = (await readdir(FILES_DIR)).length;
     const big = await upload("huge.mp3", Buffer.alloc(5000, 1));
     assert(big.status === 413 && /limit/.test((await json(big)).error), "an oversized upload (declared) is refused with a 413");
+    // "Endless" but bounded (1.2 MB against a ~1 KB cap), so a late cut-off can't run away with memory.
+    let sent = 0;
     const chunked = new ReadableStream<Uint8Array>({
       pull(c) {
+        if (sent++ >= 2000) return c.close();
         c.enqueue(new Uint8Array(600).fill(2));
       },
     });

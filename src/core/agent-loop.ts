@@ -27,6 +27,8 @@ import type { ArtifactType } from "./artifacts.js";
 import type { EpisodicKind } from "./types.js";
 import { checkPathSandbox, type SandboxPolicy } from "./permissions.js";
 import { recordFileRevision } from "./file-revisions.js";
+import { dispatchAudio, dispatchLibrary } from "./library-tools.js";
+import { renderDesktopReport } from "./desktop.js";
 
 export interface AgentTurnResult {
   sessionId: string;
@@ -138,7 +140,13 @@ export interface RunTurnOptions {
  *  (a nomination has zero effect until a human approves it; recording
  *  an artifact just registers metadata about something already
  *  produced some other way). */
-const PLAN_MODE_BLOCKED_TOOLS = new Set(["shell", "edit_file", "write_file", "subagent"]);
+export const PLAN_MODE_BLOCKED_TOOLS = new Set(["shell", "edit_file", "write_file", "subagent"]);
+
+/** `library` add/update and `audio` edit write something; their list/read/info don't, so plan mode allows those. */
+export function changesLibraryOrAudio(call: { name: string; args: Record<string, unknown> }): boolean {
+  const action = String(call.args.action ?? "");
+  return (call.name === "library" && (action === "add" || action === "update")) || (call.name === "audio" && action === "edit");
+}
 
 function sessionStream(sessionId: string): string {
   return `session:${sessionId}`;
@@ -622,6 +630,9 @@ async function dispatchTool(
     const id = typeof toolCall.args.id === "string" ? toolCall.args.id : undefined;
     return readSnapshotSection(section, { query, id });
   }
+  if (toolCall.name === "desktop") return { ok: true, output: await renderDesktopReport(typeof toolCall.args.day === "string" ? toolCall.args.day : undefined) };
+  if (toolCall.name === "library") return dispatchLibrary(toolCall.args, ctx.agentId, ctx.sandboxPolicy);
+  if (toolCall.name === "audio") return dispatchAudio(toolCall.args, ctx.sandboxPolicy);
   if (toolCall.name === "basespace-add") {
     const kind = String(toolCall.args.kind ?? "") as OverlayKind;
     // Linked back to whatever this session's work serves (its focus).
@@ -674,6 +685,8 @@ function offeredTools(
     "recall-memory": hindsightConfigured() && on.recallFoundNothing,
     basespace: on.enableBaseSpace,
     "basespace-add": on.enableBaseSpace,
+    library: on.enableBaseSpace,
+    desktop: on.enableBaseSpace,
     delegate: on.enableBaseSpace,
     work: on.enableBaseSpace,
     // Growing the team and planning a goal are a lead's job (and always
@@ -871,7 +884,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       // it's merely told about. subagent is blocked too — a delegated
       // subagent can itself mutate files, so plan mode has to cover it
       // too to mean anything.
-      if (planMode && PLAN_MODE_BLOCKED_TOOLS.has(response.toolCall.name)) {
+      if (planMode && (PLAN_MODE_BLOCKED_TOOLS.has(response.toolCall.name) || changesLibraryOrAudio(response.toolCall))) {
         stopReason = "tool-blocked";
         finalContent = `Tool call blocked: plan mode is active — "${response.toolCall.name}" would change something, and plan mode only allows read-only inspection. Describe what you'd do instead; the operator can turn plan mode off to actually execute it.`;
         await appendEvent(sessionStream(sessionId), "session.message", {

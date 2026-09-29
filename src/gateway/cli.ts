@@ -53,7 +53,11 @@ const ENGINEER_AGENT_ID = "claude";
 // capability, same restriction, just a cleaner primitive for the model
 // (and a diff-able one for the Approvals tab) instead of an opaque
 // command string.
-const FILESYSTEM_TOOLS = ["shell", "read_file", "edit_file", "write_file"];
+const FILESYSTEM_TOOLS = ["shell", "read_file", "edit_file", "write_file", "audio"];
+
+/** Who may read the operator's desktop activity: the lead (coaching) and the agent that
+ *  keeps the team's memory tidy (the learning loop). Everyone else doesn't see the tool. */
+const DESKTOP_READERS = ["hemera", "mnemosyne"];
 
 /** Builds the Layer-A PermissionPolicy for ENGINEER_AGENT_ID. Read-only
  *  inspection (shell's own safe-command list, plus read_file uncondition-
@@ -84,6 +88,8 @@ function buildEngineerPolicy() {
       },
       { tool: "shell", decision: "allow" as const, argsPattern: SAFE_READONLY },
       { tool: "read_file", decision: "allow" as const },
+      // Measuring a file changes nothing; an audio edit writes a new file, so it asks.
+      { tool: "audio", decision: "allow" as const, argsPattern: /"action":\s*"info"/ },
       // No further rules: anything else (shell edits, git add/commit/push,
       // npm/apt installs, rm, edit_file, write_file, ...) falls through to
       // the default "ask".
@@ -179,6 +185,9 @@ async function main(): Promise<void> {
   // "whichever agent happens to be open."
   registerHook("tool.before", async (ctx) => {
     const toolName = String(ctx.payload.name ?? "");
+    if (toolName === "desktop" && !DESKTOP_READERS.includes(ctx.agentId)) {
+      return { block: true, reason: `"desktop" (the operator's activity) is only for ${DESKTOP_READERS.join(" and ")}.` };
+    }
     if (!FILESYSTEM_TOOLS.includes(toolName)) return;
     if (ctx.agentId === ENGINEER_AGENT_ID) return;
     return {
@@ -189,7 +198,10 @@ async function main(): Promise<void> {
   // …and the other agents aren't shown those tools at all: describing four
   // tools an agent can only be refused costs tokens on every one of its
   // model calls. The hook above stays the enforcement.
-  setToolVisibility((agentId, toolName) => !FILESYSTEM_TOOLS.includes(toolName) || agentId === ENGINEER_AGENT_ID);
+  setToolVisibility(
+    (agentId, toolName) =>
+      (!FILESYSTEM_TOOLS.includes(toolName) || agentId === ENGINEER_AGENT_ID) && (toolName !== "desktop" || DESKTOP_READERS.includes(agentId)),
+  );
   // Layer A, part 2: ENGINEER_AGENT_ID's own rules (see buildEngineerPolicy
   // above) — safe reads pre-approved, everything else durably queued for
   // approval in the Workbench's Approvals tab.
@@ -207,7 +219,8 @@ async function main(): Promise<void> {
   // policy asks by default — may also use the other harness tools that
   // can't touch files or a shell. Editable per agent from the Workbench.
   const seededRules = await seedAllowRules([
-    ...roster.flatMap((a) => ["basespace", "basespace-add"].map((toolName) => ({ agentId: a.id, toolName }))),
+    ...roster.flatMap((a) => ["basespace", "basespace-add", "library"].map((toolName) => ({ agentId: a.id, toolName }))),
+    ...DESKTOP_READERS.map((agentId) => ({ agentId, toolName: "desktop" })),
     ...["recall-memory", "skill", "nominate-memory", "record-artifact"].map((toolName) => ({ agentId: ENGINEER_AGENT_ID, toolName })),
   ]);
   if (seededRules) console.log(`[gateway] allowlist: seeded ${seededRules} default rule(s)`);

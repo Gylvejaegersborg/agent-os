@@ -126,6 +126,12 @@ import {
   EXACT_ONLY_TOOLS,
   executeApprovedCall,
   consumeApproval,
+  recordDesktopBatch,
+  getDesktopFocus,
+  desktopTimeline,
+  desktopDaySummary,
+  renderDesktopDigest,
+  localDay,
 } from "../core/index.js";
 import { checkPathSandbox } from "../core/permissions.js";
 import { runReview } from "./review-loop.js";
@@ -573,6 +579,37 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
   // Which model providers this gateway can use, for BaseSpace's agent
   // editor. An agent's defaultModel can name any of them ("claude-cli:sonnet",
   // "ollama:llama3.2:3b", ...); see models/real.ts's provider router.
+  // ---- Desktop activity (core/desktop.ts) — the operator's machine posts
+  // finished app/window spans; everything else is a projection. ----
+  if (segments[0] === "desktop") {
+    const day = url.searchParams.get("day") ?? localDay(new Date());
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+      sendJson(res, 400, { error: "day must be YYYY-MM-DD" });
+      return;
+    }
+    if (method === "POST" && segments.length === 2 && segments[1] === "spans") {
+      try {
+        sendJson(res, 200, await recordDesktopBatch(await readRequestBody(req)));
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+    if (method === "GET" && segments.length === 2 && segments[1] === "now") {
+      sendJson(res, 200, { focus: getDesktopFocus() ?? null });
+      return;
+    }
+    if (method === "GET" && segments.length === 2 && segments[1] === "timeline") {
+      sendJson(res, 200, { day, spans: await desktopTimeline(day) });
+      return;
+    }
+    if (method === "GET" && segments.length === 2 && segments[1] === "summary") {
+      const summary = await desktopDaySummary(day);
+      sendJson(res, 200, { summary, digest: renderDesktopDigest(summary) });
+      return;
+    }
+  }
+
   if (method === "GET" && segments.length === 1 && segments[0] === "providers") {
     sendJson(res, 200, { providers: await listProviders(), defaultModel: deps.model.id });
     return;

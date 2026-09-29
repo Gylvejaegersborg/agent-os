@@ -5,3 +5,9 @@ data-test/
 *.log
 *.tsbuildinfo
 .DS_Store
+
+# desktop sensor: local privacy rules and offline spool never go in git
+desktop/sensor/privacy.json
+desktop/sensor/spool.jsonl
+desktop/sensor/spool.tmp
+desktop/sensor/__pycache__/

@@ -42,3 +42,4 @@ export * from "./agent-loop.js";
 export * from "./controls.js";
 export * from "./work.js";
 export * from "./observability.js";
+export * from "./desktop.js";

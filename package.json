@@ -58,8 +58,10 @@
     "test-focus-runs": "tsc -b && node dist/test-focus-runs.js",
     "test-tool-args": "tsc -b && node dist/test-tool-args.js",
     "test-library": "tsc -b && node dist/test-library.js",
+    "test-library-tools": "tsc -b && node dist/test-library-tools.js",
     "team": "tsc -b && node dist/team-cli.js",
-    "typecheck": "tsc -b --noEmit"
+    "typecheck": "tsc -b --noEmit",
+    "test-desktop": "tsc -b && node dist/test-desktop.js"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

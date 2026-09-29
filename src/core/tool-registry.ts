@@ -243,6 +243,62 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
   {
+    name: "library",
+    description:
+      "The operator's music library (songs uploaded through BaseSpace's Beat DB): action = list | read | add | update. " +
+      "list: every uploaded song with its id. read: one song in full, including its lyrics if any have been written down. " +
+      "add: put an audio file from disk into the library as a song {path, title, kind? beat|song, bpm?, key?, tags?, note?, lyrics?} (needs file access). " +
+      "update: change a song's title, kind, bpm, key, tags, note or lyrics {id, ...}. There is no delete: only the operator removes songs. " +
+      "Only write down what you were told. Never invent BPM, key or lyrics; leave a field out when unknown. You can't hear audio.",
+    inputSchema: {
+      action: { type: "string", required: true, description: "list, read, add or update." },
+      id: { type: "string", description: "Song id (from list). Required for read and update." },
+      path: { type: "string", description: "add: path to the audio file (mp3, wav, flac, m4a, aac, ogg, aiff)." },
+      title: { type: "string", description: "Song title." },
+      kind: { type: "string", description: "beat (an instrumental) or song." },
+      bpm: { type: "number", description: "Tempo, only if known." },
+      key: { type: "string", description: "Musical key, only if known." },
+      tags: { type: "array", description: "Tags.", items: { type: "string" } },
+      note: { type: "string", description: "A short note." },
+      lyrics: { type: "string", description: "The lyrics, exactly as given to you. Empty string clears them." },
+    },
+  },
+  {
+    name: "desktop",
+    description:
+      "What the operator has been doing on their computer: time per app, time per BaseSpace project or goal (matched from window titles), app switches and focus blocks " +
+      "for a day, plus the window in front right now. Window titles only: keystrokes, typed text, the clipboard, audio and screenshots are never recorded. " +
+      "Private windows show as (private). It says where time went, not why: don't guess intent, and say so when nothing was recorded.",
+    inputSchema: { day: { type: "string", description: "YYYY-MM-DD, local time. Default: today." } },
+  },
+  {
+    name: "audio",
+    description:
+      "Audio editing with ffmpeg, like the practical parts of Audacity. action = info | edit. info {path}: length, format, peak and average level, loudness in LUFS. " +
+      "edit {path, output, ...}: writes a NEW file (never overwrites; output ends in .wav .mp3 .flac .ogg or .m4a) applying, in one pass: " +
+      "trim_start, trim_end (seconds), reverse, speed (0.25-4), pitch_semitones (-12..12, keeps length), high_pass_hz, low_pass_hz, gain_db, " +
+      "normalize_peak_db (e.g. -1), limit_db, fade_in_sec, fade_out_sec, bit_depth (16|24, wav). Give only the edits you need. " +
+      "It measures levels; it can't judge how something sounds.",
+    inputSchema: {
+      action: { type: "string", required: true, description: "info or edit." },
+      path: { type: "string", required: true, description: "The input audio file." },
+      output: { type: "string", description: "edit: the new file to write." },
+      trim_start: { type: "number", description: "Seconds to cut from the start." },
+      trim_end: { type: "number", description: "Seconds at which to stop." },
+      reverse: { type: "boolean", description: "Play backwards." },
+      speed: { type: "number", description: "Speed factor (changes length, keeps pitch)." },
+      pitch_semitones: { type: "number", description: "Shift pitch, keeps length." },
+      high_pass_hz: { type: "number", description: "Cut frequencies below this." },
+      low_pass_hz: { type: "number", description: "Cut frequencies above this." },
+      gain_db: { type: "number", description: "Louder (+) or quieter (-)." },
+      normalize_peak_db: { type: "number", description: "Set the loudest peak to this level, e.g. -1." },
+      limit_db: { type: "number", description: "Hard ceiling, e.g. -1." },
+      fade_in_sec: { type: "number", description: "Fade in length." },
+      fade_out_sec: { type: "number", description: "Fade out length." },
+      bit_depth: { type: "number", description: "16 or 24 (wav output)." },
+    },
+  },
+  {
     name: "read_file",
     description: "Reads a file's full text content from disk, subject to the session's SandboxPolicy (if one is configured).",
     inputSchema: { path: { type: "string", required: true, description: "Path to the file, absolute or relative to the sandbox's workspaceRoot." } },

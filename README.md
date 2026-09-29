@@ -1382,6 +1382,16 @@ Nothing is invented: BPM and key stay blank unless typed.
 - **Agents** can read the catalog with the `basespace` tool (`section: "songs"`): title,
   kind, BPM, key, tags, note. They can't hear audio, and the tool says nothing else is known.
 - Reaching the gateway over Tailscale: a 30-minute `requestTimeout` covers big uploads.
+- **Agent tools** (`core/library-tools.ts`). `library`: `list`, `read` (with lyrics when
+  someone has written them down), `add` (an audio file from disk; only agents with file
+  access, sandbox-checked, audio types only) and `update` (title, kind, BPM, key, tags,
+  note, lyrics; never the audio). **There is no delete**; only the operator removes songs.
+  Each song records who added it. Nothing about a song is generated: fields stay empty
+  unless someone provides them. `audio` (engineer only, `core/audio.ts`): `info`
+  (length, peak, loudness) and `edit` (trim, reverse, speed, pitch, EQ, gain,
+  peak-normalize, limiter, fades, convert) writing a new file via ffmpeg
+  (`AGENT_OS_FFMPEG`); it never overwrites, edits ask for approval, `info` doesn't.
+  Plan mode allows the reads and blocks the writes. Tests: `npm run test-library-tools`.
 
 Test: `npm run test-library`.
 

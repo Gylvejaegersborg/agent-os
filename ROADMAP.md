@@ -312,6 +312,13 @@ wraps apps' own backends as JSON-emitting CLIs, each with a `SKILL.md` in
 the same format as `skills/`. That suits small models far better than
 screenshot-driven computer use.
 
+- Decision (2026-09): CLI-Anything's Audacity CLI is a pure-Python WAV
+  processor, not a remote control for the app, and its OBS CLI only edits
+  scene-collection JSON. The operator wants the Audacity capabilities, so
+  they are built in natively: the `audio` tool (`core/audio.ts`, ffmpeg:
+  info/loudness, trim, fades, gain, peak-normalize, limiter, EQ filters,
+  speed, pitch, convert; new file only, engineer-only, edits need approval).
+  OBS is dropped until something needs it.
 - [ ] `parseSkillFile` reads YAML block scalars (`description: >-`) as the
       literal text `">-"`, so every CLI-Anything skill imports with an empty
       description. Tested against `cli-anything-audacity`. **[core]**
@@ -449,3 +456,38 @@ Ordered so each step is safe before the next adds autonomy:
 enterprise RBAC (one operator here); "not a chatbot" as a hard rule — the
 Workbench keeps chat, but work that comes out of a chat should become a
 task attached to a goal; dollar-cost tracking without a real price source.
+
+## 8. Own HUD mode — learns from what the operator actually does
+
+Handoff and specs for the open items: `docs/hud-mode-handoff.md`.
+
+Hermes' HUD mode is a draggable overlay that looks at the screen only when
+asked. Ours adds the missing half: a continuous, privacy-filtered record of
+desktop activity, tied to BaseSpace goals and projects, feeding the same
+memory gate as everything else.
+
+- [x] Desktop activity stream. A stdlib-only Windows sensor posts
+      app/window/idle spans; stored as `desktop:YYYY-MM-DD`, projected into
+      a day summary (time per app, per project/goal, switches, focus
+      blocks). Never keystrokes, text, clipboard or screenshots. **[core]**
+      `desktop.ts`; **[gateway]** `/desktop/spans|now|timeline|summary`,
+      MCP `desktop_activity`; sensor in `desktop/sensor/`.
+- [x] Agents can read it: a `desktop` tool in the registry (read-only,
+      same digest as the MCP tool, allowed in plan mode). Only Hemera and
+      Mnemosyne see it (enforced by a `tool.before` hook, not just hidden).
+      Focus-block times are now local time. **[core]** `renderDesktopReport`.
+- [ ] Learning loop: an evening automation turns the day's summary into
+      episodic entries/nominations (patterns, not raw logs) — through the
+      existing dreaming gate, so nothing reaches curated memory without
+      approval. **[core]**
+- [ ] Coach: a `review.ts`-style code-built weekly digest (time vs. goals,
+      fragmented days, work that serves no goal); a model turn only when
+      something changed and matters. **[core]** **[UI]**
+- [ ] HUD shell: a small always-on-top, click-through window (Tauri or
+      Electron) loading a `/hud` route of BaseOStest — composer + last reply,
+      session focused on the goal matched from `desktop.focus`. **[UI]**
+- [ ] Push-to-talk in the HUD: local faster-whisper on the operator's
+      machine (the mic is there), text sent as a normal turn. **[UI]**
+- [ ] "This": on demand, screenshot → OCR text for small local models;
+      the image itself only when the agent is routed to `claude-cli`
+      (depends on multimodal input above). **[core]** **[UI]**
