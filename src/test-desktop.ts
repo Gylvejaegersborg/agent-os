@@ -12,6 +12,7 @@ import {
   desktopDaySummary,
   renderDesktopDigest,
   getDesktopFocus,
+  cleanDevice,
   renderDesktopReport,
   getToolDefinition,
   changesLibraryOrAudio,
@@ -178,7 +179,35 @@ async function testGateway(): Promise<void> {
   }
 }
 
+async function testDevices(): Promise<void> {
+  // Yesterday, so it doesn't mix with the single-device day above.
+  const yb = new Date(base.getTime() - 24 * 3600_000);
+  const yat = (min: number) => new Date(yb.getTime() + min * 60_000).toISOString();
+  const yday = localDay(yb);
+  const s = (id: string, kind: "active" | "idle", app: string, from: number, to: number) => ({ id, kind, app, title: app === "" ? "" : `${app} window`, start: yat(from), end: yat(to) });
+
+  // Same span ids from two computers must not collide; a hostile device name is reduced to plain characters.
+  const a = await recordDesktopBatch({ device: "server", spans: [s("x1", "active", "Code.exe", 0, 60), s("x2", "idle", "", 90, 100)] });
+  const b = await recordDesktopBatch({ device: "PC<script>-1", spans: [s("x1", "active", "FL64.exe", 30, 90), s("x2", "idle", "", 95, 110)] });
+  assert(a.stored === 2 && b.stored === 2, "the same span ids from two computers are both stored (dedup is per device)");
+  const again = await recordDesktopBatch({ device: "server", spans: [s("x1", "active", "Code.exe", 0, 60)] });
+  assert(again.skipped === 1, "…and a resend from the same computer is still skipped");
+  assert(cleanDevice("PC<script>-1") === "PCscript-1" && cleanDevice(42) === "" && cleanDevice("x".repeat(99)).length === 40, "device names are reduced to plain characters and 40 long");
+
+  const sum = await desktopDaySummary(yday);
+  assert(sum.activeSec === 90 * 60, `overlapping time on two computers is counted once (90 min, got ${sum.activeSec / 60})`);
+  const server = sum.byDevice.find((d) => d.device === "server");
+  const other = sum.byDevice.find((d) => d.device === "PCscript-1");
+  assert(server?.sec === 30 * 60 && other?.sec === 60 * 60, "where both are active, the window that came to the front last gets the time (server 30 min, other 60 min)");
+  assert(sum.idleSec === 20 * 60, `idle is only the time no computer was active (20 min, got ${sum.idleSec / 60})`);
+  assert(/Computers: .*server 30m/.test(renderDesktopDigest(sum)), "the digest lists the computers when there is more than one");
+  assert(!/Computers:/.test(renderDesktopDigest(await desktopDaySummary(day))), "a one-computer day has no computers line");
+  const tl = await desktopTimeline(yday);
+  assert(tl.every((x, i) => i === 0 || Date.parse(x.start) >= Date.parse(tl[i - 1]!.end)), "the merged timeline never overlaps itself");
+}
+
 await testIngest();
+await testDevices();
 await testFocus();
 await testSummary();
 await testGateway();

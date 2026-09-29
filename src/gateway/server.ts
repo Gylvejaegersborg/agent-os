@@ -131,6 +131,8 @@ import {
   desktopTimeline,
   desktopDaySummary,
   renderDesktopDigest,
+  weekDigest,
+  recordDesktopCorrection,
   localDay,
 } from "../core/index.js";
 import { checkPathSandbox } from "../core/permissions.js";
@@ -606,6 +608,22 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
     if (method === "GET" && segments.length === 2 && segments[1] === "summary") {
       const summary = await desktopDaySummary(day);
       sendJson(res, 200, { summary, digest: renderDesktopDigest(summary) });
+      return;
+    }
+    // The Monday-to-Sunday week containing `day`: for the goal/project pages ("3 h 20 m this week").
+    if (method === "GET" && segments.length === 2 && segments[1] === "week") {
+      sendJson(res, 200, await weekDigest(day));
+      return;
+    }
+    // The operator disagreeing with something learned ("no, that wasn't work"): the strongest memory signal there is.
+    if (method === "POST" && segments.length === 2 && segments[1] === "correction") {
+      try {
+        const body = await readRequestBody(req);
+        await recordDesktopCorrection(String(body.text ?? ""));
+        sendJson(res, 200, { ok: true });
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
       return;
     }
   }

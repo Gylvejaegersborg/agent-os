@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -227,10 +228,11 @@ class Sender:
     """Posts spans; anything that couldn't be sent waits in spool.jsonl and
     goes with the next successful flush (span ids make resends harmless)."""
 
-    def __init__(self, gateway: str, spool: Path, post: Optional[Callable[[str, dict], dict]] = None) -> None:
+    def __init__(self, gateway: str, spool: Path, post: Optional[Callable[[str, dict], dict]] = None, device: str = "") -> None:
         self.url = gateway.rstrip("/") + "/desktop/spans"
         self.spool = spool
         self.post = post or self._http_post
+        self.device = device
 
     @staticmethod
     def _http_post(url: str, body: dict) -> dict:
@@ -265,7 +267,7 @@ class Sender:
         pending = self._read_spool() + fresh
         try:
             for i in range(0, max(len(pending), 1), 500):
-                self.post(self.url, {"spans": pending[i:i + 500], "focus": focus})
+                self.post(self.url, {"spans": pending[i:i + 500], "focus": focus, "device": self.device})
         except (urllib.error.URLError, OSError, ValueError):
             self._write_spool(pending)
             return False
@@ -276,6 +278,8 @@ class Sender:
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="agent-os desktop sensor")
     ap.add_argument("--gateway", default=os.environ.get("AGENT_OS_GATEWAY_URL", "http://127.0.0.1:8787"))
+    ap.add_argument("--device", default=os.environ.get("AGENT_OS_DEVICE", socket.gethostname()),
+                    help="name of this computer in the activity log (default: its hostname)")
     ap.add_argument("--privacy", default=str(HERE / "privacy.json"))
     ap.add_argument("--spool", default=str(HERE / "spool.jsonl"))
     ap.add_argument("--dry-run", action="store_true", help="print spans instead of posting")
@@ -287,10 +291,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     platform = WindowsPlatform()
     tracker = Tracker(Privacy.load(Path(args.privacy)))
-    sender = Sender(args.gateway, Path(args.spool))
+    sender = Sender(args.gateway, Path(args.spool), device=args.device)
     last_flush = time.time()
     was_down = False
-    print(f"[sensor] watching → {sender.url}{' (dry run)' if args.dry_run else ''}")
+    print(f"[sensor] {args.device}: watching → {sender.url}{' (dry run)' if args.dry_run else ''}")
 
     try:
         while True:

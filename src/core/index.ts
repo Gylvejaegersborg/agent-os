@@ -43,3 +43,4 @@ export * from "./controls.js";
 export * from "./work.js";
 export * from "./observability.js";
 export * from "./desktop.js";
+export * from "./desktop-learning.js";

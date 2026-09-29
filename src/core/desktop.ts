@@ -33,12 +33,21 @@ export interface DesktopSpan {
   title: string;
   start: string;
   end: string;
+  /** Which of the operator's computers this came from (the sensor's `--device`).
+   *  Absent on spans recorded before devices existed. */
+  device?: string;
 }
 
 export interface DesktopFocus {
   app: string;
   title: string;
   since: string;
+  device?: string;
+}
+
+/** A device name is a label: short, plain characters only. */
+export function cleanDevice(raw: unknown): string {
+  return typeof raw === "string" ? raw.replace(/[^\p{L}\p{N} ._-]/gu, "").trim().slice(0, 40) : "";
 }
 
 const MAX_BATCH = 500;
@@ -69,13 +78,13 @@ const streamFor = (day: string) => `desktop:${day}`;
 async function idsFor(day: string): Promise<Set<string>> {
   let set = seenIds.get(day);
   if (!set) {
-    set = new Set((await readStream(streamFor(day))).map((e) => String(e.payload.id)));
+    set = new Set((await readStream(streamFor(day))).map((e) => `${e.payload.device ?? ""}|${e.payload.id}`));
     seenIds.set(day, set);
   }
   return set;
 }
 
-function parseSpan(raw: unknown, now: number): DesktopSpan | string {
+function parseSpan(raw: unknown, now: number, device: string): DesktopSpan | string {
   if (typeof raw !== "object" || raw === null) return "not an object";
   const r = raw as Record<string, unknown>;
   const kind = r.kind === "idle" ? "idle" : r.kind === "active" ? "active" : undefined;
@@ -96,6 +105,7 @@ function parseSpan(raw: unknown, now: number): DesktopSpan | string {
     title: kind === "idle" ? "" : String(r.title ?? "").slice(0, MAX_TITLE),
     start: new Date(start).toISOString(),
     end: new Date(end).toISOString(),
+    ...(device ? { device } : {}),
   };
 }
 
@@ -105,24 +115,26 @@ export async function recordDesktopBatch(body: Record<string, unknown>): Promise
   const spans = Array.isArray(body.spans) ? body.spans : [];
   if (spans.length > MAX_BATCH) throw new Error(`batch too large (${spans.length} > ${MAX_BATCH} spans)`);
   const now = Date.now();
+  const device = cleanDevice(body.device);
   let stored = 0;
   let skipped = 0;
   const rejected: { index: number; reason: string }[] = [];
 
   for (let i = 0; i < spans.length; i++) {
-    const span = parseSpan(spans[i], now);
+    const span = parseSpan(spans[i], now, device);
     if (typeof span === "string") {
       rejected.push({ index: i, reason: span });
       continue;
     }
     const day = localDay(span.start);
     const ids = await idsFor(day);
-    if (ids.has(span.id)) {
+    const key = `${device}|${span.id}`;
+    if (ids.has(key)) {
       skipped++;
       continue;
     }
     await appendEvent(streamFor(day), `desktop.span.${span.kind}`, { ...span });
-    ids.add(span.id);
+    ids.add(key);
     stored++;
   }
 
@@ -132,6 +144,7 @@ export async function recordDesktopBatch(body: Record<string, unknown>): Promise
       app: f.app.slice(0, MAX_APP),
       title: String(f.title ?? "").slice(0, MAX_TITLE),
       since: typeof f.since === "string" && !Number.isNaN(Date.parse(f.since)) ? f.since : new Date(now).toISOString(),
+      ...(device ? { device } : {}),
     };
     const changed = !currentFocus || currentFocus.app !== next.app || currentFocus.title !== next.title;
     currentFocus = next;
@@ -152,11 +165,63 @@ export function getDesktopFocus(): DesktopFocus | undefined {
   return currentFocus;
 }
 
+type Interval = [number, number];
+
+function unionOf(list: Interval[]): Interval[] {
+  const out: Interval[] = [];
+  for (const [a, b] of [...list].sort((x, y) => x[0] - y[0])) {
+    const last = out[out.length - 1];
+    if (last && a <= last[1]) last[1] = Math.max(last[1], b);
+    else out.push([a, b]);
+  }
+  return out;
+}
+
+function subtractOf(from: Interval[], cut: Interval[]): Interval[] {
+  const out: Interval[] = [];
+  for (const [a, b] of from) {
+    let cur = a;
+    for (const [c, d] of cut) {
+      if (d <= cur || c >= b) continue;
+      if (c > cur) out.push([cur, c]);
+      cur = Math.max(cur, d);
+    }
+    if (cur < b) out.push([cur, b]);
+  }
+  return out;
+}
+
+/** With more than one computer reporting, the operator is only at one at a time,
+ *  yet two machines can both look active (a Remote Desktop session is active on
+ *  both ends). So overlapping time is counted once: where several active spans
+ *  cover the same moment, the one that started last wins (it's the window that
+ *  was just brought to the front); idle time is only what no device covers. */
+function oneAtATime(spans: DesktopSpan[]): DesktopSpan[] {
+  const t = (iso: string) => Date.parse(iso);
+  const active = spans.filter((s) => s.kind === "active");
+  const bounds = [...new Set(active.flatMap((s) => [t(s.start), t(s.end)]))].sort((a, b) => a - b);
+  const out: DesktopSpan[] = [];
+  for (let i = 0; i < bounds.length - 1; i++) {
+    const a = bounds[i]!;
+    const b = bounds[i + 1]!;
+    let best: DesktopSpan | undefined;
+    for (const s of active) if (t(s.start) <= a && t(s.end) >= b && (!best || t(s.start) >= t(best.start))) best = s;
+    if (best) out.push({ ...best, start: new Date(a).toISOString(), end: new Date(b).toISOString() });
+  }
+  const covered = unionOf(active.map((s): Interval => [t(s.start), t(s.end)]));
+  const idle = subtractOf(unionOf(spans.filter((s) => s.kind === "idle").map((s): Interval => [t(s.start), t(s.end)])), covered);
+  for (const [a, b] of idle) {
+    out.push({ id: `idle-${a}`, kind: "idle", app: "", title: "", start: new Date(a).toISOString(), end: new Date(b).toISOString() });
+  }
+  return out;
+}
+
 /** The day's spans in time order, adjacent identical windows merged. */
 export async function desktopTimeline(day: string): Promise<DesktopSpan[]> {
-  const spans = (await readStream(streamFor(day)))
-    .map((e) => e.payload as unknown as DesktopSpan)
-    .sort((a, b) => a.start.localeCompare(b.start));
+  const stored = (await readStream(streamFor(day))).map((e) => e.payload as unknown as DesktopSpan);
+  const devices = new Set(stored.map((s) => s.device ?? ""));
+  // One computer: its spans can't overlap, so they're used as recorded.
+  const spans = (devices.size > 1 ? oneAtATime(stored) : stored).sort((a, b) => a.start.localeCompare(b.start));
   const out: DesktopSpan[] = [];
   for (const s of spans) {
     const prev = out[out.length - 1];
@@ -165,6 +230,7 @@ export async function desktopTimeline(day: string): Promise<DesktopSpan[]> {
       prev.kind === s.kind &&
       prev.app === s.app &&
       prev.title === s.title &&
+      (prev.device ?? "") === (s.device ?? "") &&
       Date.parse(s.start) - Date.parse(prev.end) <= MERGE_GAP_MS
     ) {
       if (s.end > prev.end) prev.end = s.end;
@@ -206,6 +272,8 @@ export interface DesktopDaySummary {
   /** Changes of foreground app between active spans (idle doesn't count). */
   switches: number;
   byApp: { app: string; sec: number }[];
+  /** Active time per computer (empty label = recorded before devices existed). */
+  byDevice: { device: string; sec: number }[];
   topWindows: { app: string; title: string; sec: number }[];
   focusBlocks: { app: string; start: string; end: string; sec: number }[];
   /** Time whose window title matched a BaseSpace project or goal. */
@@ -218,11 +286,13 @@ export async function desktopDaySummary(day: string): Promise<DesktopDaySummary>
   const active = timeline.filter((s) => s.kind === "active");
 
   const byApp = new Map<string, number>();
+  const byDevice = new Map<string, number>();
   const byWindow = new Map<string, { app: string; title: string; sec: number }>();
   let switches = 0;
   for (let i = 0; i < active.length; i++) {
     const s = active[i]!;
     byApp.set(s.app, (byApp.get(s.app) ?? 0) + secs(s));
+    byDevice.set(s.device ?? "", (byDevice.get(s.device ?? "") ?? 0) + secs(s));
     const k = `${s.app}\u0000${s.title}`;
     const w = byWindow.get(k) ?? { app: s.app, title: s.title, sec: 0 };
     w.sec += secs(s);
@@ -273,6 +343,7 @@ export async function desktopDaySummary(day: string): Promise<DesktopDaySummary>
     idleSec: round(timeline.filter((s) => s.kind === "idle").reduce((n, s) => n + secs(s), 0)),
     switches,
     byApp: [...byApp].map(([app, sec]) => ({ app, sec: round(sec) })).sort((a, b) => b.sec - a.sec),
+    byDevice: [...byDevice].map(([device, sec]) => ({ device, sec: round(sec) })).sort((a, b) => b.sec - a.sec),
     topWindows: [...byWindow.values()].map((w) => ({ ...w, sec: round(w.sec) })).sort((a, b) => b.sec - a.sec).slice(0, 10),
     focusBlocks: focusBlocks.map((b) => ({ ...b, sec: round(b.sec) })),
     byWork: [...byWork.values()].map((w) => ({ ...w, sec: round(w.sec) })).sort((a, b) => b.sec - a.sec),
@@ -299,6 +370,7 @@ export function renderDesktopDigest(s: DesktopDaySummary): string {
     `Desktop activity ${s.day}: ${hm(s.activeSec)} active, ${hm(s.idleSec)} idle, ${s.switches} app switches.`,
     `Apps: ${s.byApp.slice(0, 6).map((a) => `${a.app} ${hm(a.sec)}`).join(", ")}.`,
   ];
+  if (s.byDevice.length > 1) lines.push(`Computers: ${s.byDevice.map((d) => `${d.device || "unnamed"} ${hm(d.sec)}`).join(", ")} (overlapping time counted once).`);
   if (s.byWork.length) lines.push(`BaseSpace work: ${s.byWork.map((w) => `${w.kind} "${w.name}" ${hm(w.sec)}`).join(", ")}; ${hm(s.unmatchedSec)} not matched to any project or goal.`);
   else lines.push(`No window matched a BaseSpace project or goal (${hm(s.unmatchedSec)} unmatched).`);
   lines.push(

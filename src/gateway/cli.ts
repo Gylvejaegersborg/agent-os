@@ -17,6 +17,7 @@ import {
   startTaskTimeoutSweeper,
   startTaskLivenessRenewer,
   startMemoryDreamingSweeper,
+  startDesktopLearning,
   registerHook,
   setToolVisibility,
   subscribeToAllEvents,
@@ -122,6 +123,9 @@ async function main(): Promise<void> {
   // dreaming itself is cheap (no model call, pure scoring) when there's
   // nothing newly eligible to phrase.
   startMemoryDreamingSweeper();
+  // Turns each finished day of desktop activity into a few fixed-wording observations
+  // for dreaming to weigh (desktop-learning.ts). No model call; nothing without a sensor.
+  if (process.env.AGENT_OS_DESKTOP_LEARNING !== "off") startDesktopLearning();
 
   // Skills (skills.ts) previously had ZERO wiring into the live gateway —
   // SkillRegistry.fromDirectory() existed, was tested, and had a full
