@@ -636,6 +636,21 @@ const FILE_TOOLS = new Set(["read_file", "edit_file", "write_file"]);
  *  full model call on "Done!". */
 const SETTLING_WORK_ACTIONS = new Set(["done", "blocked", "hand-back"]);
 
+/** User messages the harness itself wrote: the work runner's briefs, a lead's
+ *  review digest, an approval decision, a team cron's standup prompt. What
+ *  comes out of them already lives somewhere durable (work items, BaseSpace
+ *  notes, approvals), and filing them as long-term memory records the
+ *  harness's own bookkeeping as things "the user" said ("User assigned a work
+ *  item…", seen live in Hindsight). */
+const HARNESS_MESSAGE = /^\s*(\[(Work|Review|Approvals)\]|It's time for ")/;
+
+/** Is this finished turn worth sending to Hindsight (each one costs an LLM
+ *  extraction)? Only a real answer to something the operator wrote — not a
+ *  blocked, out-of-steps or cancelled turn, and not the harness talking. */
+function worthRetaining(userMessage: string, stopReason: AgentTurnResult["stopReason"]): boolean {
+  return stopReason === "answered" && !HARNESS_MESSAGE.test(userMessage);
+}
+
 /** The tools this agent can actually use this turn: the ones the turn has
  *  switched on, minus the ones the gateway hides from this agent
  *  (tool-registry.ts's setToolVisibility). Everything offered is described
@@ -644,14 +659,19 @@ const SETTLING_WORK_ACTIONS = new Set(["done", "blocked", "hand-back"]);
  *  hooks still refuse a hidden tool if it's called anyway. */
 function offeredTools(
   agentId: string,
-  on: { skills?: SkillRegistry; enableSubagents?: boolean; enableMemoryNominations?: boolean; enableArtifacts?: boolean; enableBaseSpace?: boolean; isLead?: boolean },
+  on: { skills?: SkillRegistry; enableSubagents?: boolean; enableMemoryNominations?: boolean; enableArtifacts?: boolean; enableBaseSpace?: boolean; isLead?: boolean; recallFoundNothing?: boolean },
 ): ToolSpec[] {
   const enabled: Record<string, boolean | undefined> = {
     skill: !!on.skills && on.skills.listMetadata().length > 0,
     subagent: on.enableSubagents,
     "nominate-memory": on.enableMemoryNominations,
     "record-artifact": on.enableArtifacts,
-    "recall-memory": hindsightConfigured(),
+    // What memory has on this message is already injected into the turn's
+    // system prompt, so the tool would just repeat that search — and a small
+    // local model handed it loops on it (seen live: 4 identical calls, then
+    // out of steps, with the answer in every result). It's the fallback for
+    // when that automatic recall found nothing: a chance to search differently.
+    "recall-memory": hindsightConfigured() && on.recallFoundNothing,
     basespace: on.enableBaseSpace,
     "basespace-add": on.enableBaseSpace,
     delegate: on.enableBaseSpace,
@@ -734,7 +754,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // operator's team (the same flag that turns on BaseSpace).
   const orgText = enableBaseSpace ? await orgContext(agentId) : "";
   const isLead = enableBaseSpace ? (await listAgentIdentities()).some((a) => a.reportsTo === agentId) : false;
-  const tools = offeredTools(agentId, { skills, enableSubagents, enableMemoryNominations, enableArtifacts, enableBaseSpace, isLead }).filter(
+  const tools = offeredTools(agentId, { skills, enableSubagents, enableMemoryNominations, enableArtifacts, enableBaseSpace, isLead, recallFoundNothing: recalled.length === 0 }).filter(
     (t) => !opts.onlyTools || opts.onlyTools.includes(t.name),
   );
   const offered = new Set(tools.map((t) => t.name));
@@ -790,7 +810,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       : "The operator runs a dashboard called BaseSpace (notes, projects, todos, calendar, cron jobs, teams). Read it with the `basespace` tool " +
       "(start with section \"summary\") before answering questions about their work, and use `basespace-add` to leave a note, a todo or a " +
       "project update there — that's how your work shows up for them. Only add things they'd want to see." +
-      (hindsightConfigured() ? " Use `recall-memory` to look up what you've learned in earlier conversations." : "");
+      (offered.has("recall-memory") ? " Nothing relevant was recalled automatically; use `recall-memory` to search what you've learned in earlier conversations." : "");
     const fileToolsText = ![...FILE_TOOLS].some((t) => offered.has(t))
       ? ""
       : "Prefer `read_file`/`edit_file`/`write_file` over shell redirection or `sed` for reading or changing a file's content — " +
@@ -1013,9 +1033,9 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     const working = await workForSession(sessionId, { anyStatus: true });
     if (working) await recordWorkUsage(working.id, usage.inputTokens + usage.outputTokens);
   }
-  if (!cancelled && finalContent) {
-    // Every completed exchange goes to Hindsight (when configured) so it can
-    // extract facts/experiences from it; no-op otherwise.
+  if (!cancelled && finalContent && worthRetaining(userMessage, stopReason)) {
+    // A real exchange goes to Hindsight (when configured) so it can extract
+    // facts/experiences from it; no-op otherwise.
     void hindsightRetain(agentId, `User: ${userMessage}\n\n${agentId}: ${finalContent}`, { context: "conversation turn", tags: ["turn"] });
   }
   await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled, usage });

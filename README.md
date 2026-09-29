@@ -1372,11 +1372,22 @@ down Hindsight never breaks a turn.
 
 When it's on:
 
-- every completed exchange and every episodic memory write is retained into the
-  agent's own bank (`<HINDSIGHT_BANK_PREFIX or "agent-os">-<agentId>`);
+- a finished exchange is retained into the agent's own bank
+  (`<HINDSIGHT_BANK_PREFIX or "agent-os">-<agentId>`), and so is every episodic memory
+  write. **Only real conversations count:** a turn the harness wrote itself (`[Work]`
+  briefs, `[Review]` digests, `[Approvals]` notes, cron standup prompts) and a turn that
+  didn't end in an answer (blocked, out of steps, cancelled) are not retained. Each
+  retain costs an LLM extraction, and the outcome of those already lives in work items,
+  notes and approvals; retaining them filed the harness's own bookkeeping as things
+  "the user" said ("User assigned a work item…").
 - each turn's system message gets a "Recalled from long-term memory" block for the
   user's message (recalled once per turn, not on every tool step);
-- agents get a `recall-memory` tool ({query, deep?}; `deep` uses reflect).
+- agents get a `recall-memory` tool ({query, deep?}; `deep` uses reflect), **but only when
+  that automatic recall found nothing**. With something recalled it would just repeat the
+  same search, and a small local model handed it looped on it until it ran out of steps,
+  with the answer in every result.
+- A new agent has no bank until its first retain; recalling from it is an empty result,
+  not an error (and doesn't use up the one-time failure warning).
 
 Run it (one container with its own embedded Postgres; it needs an LLM key for fact
 extraction):
@@ -1402,8 +1413,40 @@ HINDSIGHT_API_LLM_BASE_URL=http://localhost:11434/v1 \
 It refuses to run as root (its embedded Postgres won't). In a BaseOStest Codespace, set
 the secret `HINDSIGHT_ENABLED=1` and `.devcontainer/hindsight.sh` does this for you.
 
+**Always pass `--host 127.0.0.1`.** Hindsight's default is `0.0.0.0` and it has no auth
+unless you set a key, so the plain commands above publish everyone's long-term memory to
+the network. **On Windows** also set `PYTHONUTF8=1`: its startup banner crashes on the
+default `cp1252` encoding when stdout is redirected to a file. `deploy/windows/`
+(see its README) runs it under the supervisor with both handled.
+
 Optional: `HINDSIGHT_API_KEY` (Bearer token), `HINDSIGHT_BANK_PREFIX`,
 `HINDSIGHT_RECALL_TOKENS` (default 600). The Hindsight UI is on port 9999.
+
+### Which LLM should extract the facts?
+
+Measured, not guessed: the same six turns (four durable facts, one "ok thanks", one
+harness `[Work]` turn) sent through Hindsight 0.10.1 on a machine with 16 GB RAM and a
+4 GB GTX 1050 Ti, retained synchronously, with each candidate:
+
+| extraction model | 6 turns | kept the durable specifics? | notes |
+|---|---|---|---|
+| `ollama` `qwen2.5:3b` | 225 s | **no**: lost lowercase/no-hashtags, the week-by-week plan, zero budget, the reference track | vague ("User informs about Switch release date and cover art details"), duplicates, "User acknowledges assistance" |
+| `ollama` `llama3.1:8b` | 998 s | partly | only 2.4 of 5.9 GB fit in VRAM; **2 of 6 retains failed** after ~345 s; 83 s to decide "ok thanks" has nothing |
+| `claude-code` + `haiku` | **199 s** | **yes, all of it** | 7 s for "ok thanks" (nothing stored); no GPU use, so it doesn't queue in front of your agents' replies |
+
+So the recommendation is Hindsight's own `claude-code` provider with Haiku
+(`HINDSIGHT_API_LLM_PROVIDER=claude-code HINDSIGHT_API_LLM_MODEL=haiku`), which uses your
+Claude login through the CLI. Its cost is subscription usage per retained turn, which
+isn't measured anywhere (Hindsight doesn't report it); the retain filter above is what keeps
+that volume to real conversations. On a machine with more VRAM, or a model that really
+extracts well locally, re-run the comparison before switching. Every fact appears twice
+in recall (two formats): that is Hindsight's own dual extraction, not a duplicate write.
+
+Live check on the running gateway: one operator sentence became two clean facts; a
+`[Work]` turn stored nothing; and in a **new conversation** Claude Haiku answered "Your
+mastering reference track is Bicep - Glue, and you never use hashtags in captions" from
+recall alone, with no tool call. The same question to `llama3.2` (3B) looped on tools and
+didn't answer: memory was fine there, the model can't drive this many tools.
 
 ## Repo layout
 

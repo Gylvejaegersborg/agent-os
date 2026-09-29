@@ -257,17 +257,32 @@ per-item `tags` and `budget: "low"` are real fields.
       `HINDSIGHT_ENABLED=1`: runs the server through `uvx`, uses the
       Codespace's Ollama for fact extraction, and sets `HINDSIGHT_URL` for
       the gateway. **[Codespace]** `hindsight.sh`, `start.sh`.
-- [ ] Pick the extraction LLM deliberately. Hindsight's default for Ollama
-      is `gemma3:12b` (too big here); the Codespace uses the agents' own
-      3B model, which extracts poorly. `HINDSIGHT_LLM_PROVIDER=claude-code`
-      (Hindsight's own Claude CLI provider) is worth trying once the CLI is
-      logged in.
+- [x] Pick the extraction LLM deliberately. Measured on the Windows server
+      (16 GB RAM, 4 GB GPU) with the same six turns: `qwen2.5:3b` lost the
+      durable specifics (225 s), `llama3.1:8b` took 998 s and failed 2 of 6,
+      `claude-code` + Haiku kept everything in 199 s and leaves the GPU to the
+      agents. Chosen: `claude-code` + `haiku` (the supervisor's default; env
+      overrides). Numbers and caveats (cost is subscription usage, unmeasured)
+      are in the README. **[gateway]** `deploy/windows/run-os.ps1`.
+- [x] What gets retained: only real operator conversations. `[Work]`,
+      `[Review]`, `[Approvals]` and cron-standup turns and turns that didn't
+      end in an answer are skipped: they cost an extraction and filed the
+      harness's own bookkeeping as "the user" facts. `recall-memory` is only
+      offered when the automatic recall found nothing (it duplicated it, and a
+      3B model looped on it). A missing bank (a new agent) is an empty recall,
+      not an error. Tolerant tool-argument parsing so a local model's
+      malformed arguments no longer kill the turn. **[core]**
+- [x] Windows: Hindsight runs under the supervisor on `127.0.0.1` only (its
+      default is `0.0.0.0`, no auth) with `PYTHONUTF8=1` (its banner crashes
+      on cp1252). **[gateway]**
 - [ ] Use what's unused: mental models (`/mental-models`, living documents
       Hindsight keeps current), tag-filtered recall, document ingestion
       (`/files/retain`) for Notes. **[core]**
-- Note: episodic writes are mirrored into Hindsight too, but the only live
-  caller is an approved memory nomination, so that's a small, deliberate
-  duplicate of a human-confirmed fact, not double extraction of every turn.
+- Note: episodic writes are mirrored into Hindsight too (an approved memory
+  nomination: a small, deliberate duplicate of a human-confirmed fact). **But
+  every finished operator turn is also retained** (`agent-loop.ts`, after the
+  turn), so each real conversation costs one extraction. An earlier version of
+  this note said otherwise; that was wrong.
 
 ## 3. Knowledge graph (not built yet)
 
