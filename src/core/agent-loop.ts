@@ -4,21 +4,25 @@
 // Every turn is written to the session's event stream, so resume/replay/
 // observability for free (see eventlog.ts).
 
+import { blockWork, cancelWork, completeWork, createWork, escalateWork, handBackWork, listWork, noteWork, reassignWork, reopenWork, orgContext, recordWorkUsage, workForSession, type WorkView } from "./work.js";
+import { AgentBlockedError, assertAgentMayRun, getAgentControlState, recordAgentUsage } from "./controls.js";
+import { GATED_TOOLS, adoptPlan, checkProposal, gateToolCall, hireAgent } from "./governance.js";
+import { watchWork } from "./watchdog.js";
 import { hindsightConfigured, hindsightRecall, hindsightReflect, hindsightRetain } from "./hindsight.js";
-import { addOverlayItem, readSnapshotSection, type OverlayKind } from "./basespace.js";
+import { addOverlayItem, focusContext, readSnapshotSection, type OverlayKind } from "./basespace.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { appendEvent, project } from "./eventlog.js";
 import { publishEvent } from "./eventbus.js";
-import type { ModelAdapter, ModelMessage } from "./model.js";
+import type { ModelAdapter, ModelMessage, ToolSpec } from "./model.js";
 import type { Worker } from "./worker.js";
 import { fireHook } from "./hooks.js";
 import { generateId } from "./id.js";
 import { SkillRegistry, renderSkillCatalog } from "./skills.js";
 import { retrieveMemoryContext } from "./memory.js";
-import { getAgentIdentity } from "./identity.js";
+import { getAgentIdentity, listAgentIdentities } from "./identity.js";
 import { ensureSession, isSessionCancelled, getSession } from "./session.js";
-import { getToolDefinition, withTimeout } from "./tool-registry.js";
+import { getToolDefinition, listToolDefinitions, toToolSpec, toolVisibleTo, withTimeout } from "./tool-registry.js";
 import type { ArtifactType } from "./artifacts.js";
 import type { EpisodicKind } from "./types.js";
 import { checkPathSandbox, type SandboxPolicy } from "./permissions.js";
@@ -37,6 +41,11 @@ export interface AgentTurnResult {
    *  reported usage at all (the stub model, or a provider response that
    *  didn't carry it), never a fabricated {0,0}. */
   usage?: { inputTokens: number; outputTokens: number };
+  /** How the turn ended: a real answer, a tool call the harness refused
+   *  (plan mode, policy, an approval still pending), out of tool steps, or
+   *  cancelled. Lets callers like the work runner tell "finished" from
+   *  "stopped". */
+  stopReason: "answered" | "tool-blocked" | "max-hops" | "cancelled";
 }
 
 export interface RunTurnOptions {
@@ -96,6 +105,10 @@ export interface RunTurnOptions {
    *  message — on for the live gateway, off by default so a bare runTurn()
    *  keeps producing exactly the system message it always did. */
   enableBaseSpace?: boolean;
+  /** Offer only these tools this turn (still subject to what's enabled and
+   *  visible) — for turns with one job, like a lead's team review, where
+   *  every other tool is prompt weight and a detour. */
+  onlyTools?: string[];
   /** When provided, read_file/edit_file/write_file (and, independently,
    *  createSandboxedWorker-wrapped shell calls — see worker.ts) are
    *  confined to this policy's workspace roots via permissions.ts's
@@ -129,6 +142,16 @@ const PLAN_MODE_BLOCKED_TOOLS = new Set(["shell", "edit_file", "write_file", "su
 
 function sessionStream(sessionId: string): string {
   return `session:${sessionId}`;
+}
+
+/** Posts a note from the harness into a session without running a turn —
+ *  e.g. "Nyx finished the work you handed over". Stored as a user-role
+ *  message with a `[Tag] ` prefix (like approval decisions), so the agent
+ *  sees it next turn and BaseSpace shows it as a system note. Publishes
+ *  `session.note` so an open chat refreshes. */
+export async function appendSessionNote(sessionId: string, tag: string, text: string): Promise<void> {
+  await appendEvent(sessionStream(sessionId), "session.message", { role: "user", content: `[${tag}] ${text}` });
+  await publishEvent("session.note", { sessionId, tag });
 }
 
 export async function getSessionHistory(sessionId: string): Promise<ModelMessage[]> {
@@ -249,7 +272,7 @@ async function maybeCompactSession(sessionId: string, model: ModelAdapter): Prom
           "Summarize the following conversation concisely but completely — preserve concrete facts, decisions, file paths, and anything a continuation would genuinely need. Prose is fine; do not editorialize or add commentary about the summarization itself.",
       },
       { role: "user", content: `${priorSummaryPart}Conversation to summarize:\n\n${transcript}` },
-    ]);
+    ], { tools: [] });
     await appendEvent(sessionStream(sessionId), "session.compacted", { summary: result.content, throughIndex: newThroughIndex });
   } catch (err) {
     console.error(`[agent-loop] context compaction failed for session ${sessionId} (continuing uncompacted):`, err instanceof Error ? err.message : err);
@@ -293,7 +316,7 @@ export async function getSessionUsage(sessionId: string): Promise<SessionUsage> 
  *  documents produce empty sections rather than empty-but-labeled ones,
  *  so a fresh agent with no promoted memories yet doesn't inject a
  *  confusing "MEMORY.md: (nothing here)" block into every turn. */
-async function renderMemoryContext(agentId: string, queryText: string): Promise<string> {
+async function renderMemoryContext(agentId: string, queryText: string, recalled: string[]): Promise<string> {
   const retrieved = await retrieveMemoryContext(agentId, queryText);
   const parts: string[] = [];
   if (retrieved.memoryLines.length > 0) {
@@ -309,8 +332,9 @@ async function renderMemoryContext(agentId: string, queryText: string): Promise<
     parts.push(`# USER.md (user profile/preferences learned over time)${note}\n${retrieved.userProfileLines.join("\n")}`);
   }
   // Optional Hindsight layer (hindsight.ts) — empty unless HINDSIGHT_URL is
-  // set and reachable.
-  const recalled = await hindsightRecall(agentId, queryText);
+  // set and reachable. Fetched once per turn by runTurn(), not here: this
+  // function runs on every tool hop, and the query (the user's message)
+  // doesn't change between hops.
   if (recalled.length > 0) {
     parts.push(`# Recalled from long-term memory (Hindsight)\n${recalled.map((l) => `- ${l}`).join("\n")}`);
   }
@@ -434,8 +458,16 @@ async function dispatchTool(
     enableMemoryNominations?: boolean;
     enableArtifacts?: boolean;
     sandboxPolicy?: SandboxPolicy;
+    /** Set only by executeApprovedCall — the operator approved this call. */
+    approved?: boolean;
   },
 ): Promise<ToolDispatchResult> {
+  if (GATED_TOOLS.has(toolCall.name) && !ctx.approved) {
+    const problem = await checkProposal(toolCall.name, toolCall.args, ctx.agentId, (await getSession(ctx.sessionId))?.focus);
+    return { ok: false, output: "", error: problem ? `not filed — fix this and propose again: ${problem}` : `"${toolCall.name}" only runs once the operator approves it` };
+  }
+  if (toolCall.name === "propose-agent") return hireAgent(toolCall.args, ctx.agentId);
+  if (toolCall.name === "propose-plan") return adoptPlan(toolCall.args, ctx.agentId, ctx.sessionId, (await getSession(ctx.sessionId))?.focus);
   if (toolCall.name === "shell") {
     return ctx.worker.run(String(toolCall.args.command));
   }
@@ -464,6 +496,7 @@ async function dispatchTool(
     const result = await spawnSubagentTask({
       agentId: ctx.agentId,
       goal,
+      focus: (await getSession(ctx.sessionId))?.focus,
       model: ctx.model,
       worker: ctx.worker,
       skills: ctx.skills,
@@ -521,6 +554,68 @@ async function dispatchTool(
     const lines = await hindsightRecall(ctx.agentId, query);
     return { ok: true, output: lines.length ? lines.map((l) => `- ${l}`).join("\n") : "Nothing relevant remembered." };
   }
+  if (toolCall.name === "delegate") {
+    const str = (k: string) => (typeof toolCall.args[k] === "string" ? (toolCall.args[k] as string).trim() : "");
+    try {
+      const current = await workForSession(ctx.sessionId);
+      const item = await createWork({
+        title: str("title"),
+        detail: str("detail") || undefined,
+        assignee: str("to"),
+        requestedBy: ctx.agentId,
+        requestedFromSessionId: ctx.sessionId,
+        parentId: current?.id,
+        focus: (await getSession(ctx.sessionId))?.focus,
+      });
+      const watched = toolCall.args.verify === true ? await watchWork({ rootIds: [item.id], createdBy: ctx.agentId, originSessionId: ctx.sessionId }) : undefined;
+      const control = await getAgentControlState(item.assignee);
+      const waiting = control.blocked ? ` Note: ${item.assignee} is ${control.blocked === "paused" ? "paused" : "over budget"}, so it waits until that lifts.` : "";
+      return { ok: true, output: `Handed "${item.title}" to ${item.assignee} as work item ${item.id}. It runs in the background; the result will be posted back in this conversation.${watched ? ` ${watched.verifier} verifies it when it's finished.` : ""}${waiting}` };
+    } catch (err) {
+      return { ok: false, output: "", error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+  if (toolCall.name === "work") {
+    const action = String(toolCall.args.action ?? "list");
+    const text = typeof toolCall.args.text === "string" ? toolCall.args.text : "";
+    try {
+      if (action === "list") {
+        const active = (w: { status: string }) => w.status === "open" || w.status === "in_progress" || w.status === "blocked";
+        const mine = (await listWork({ assignee: ctx.agentId })).filter(active);
+        const asked = (await listWork({ requestedBy: ctx.agentId })).filter((w) => active(w) || w.status === "done").slice(0, 10);
+        // A lead also sees what its reports are doing, whoever asked for it.
+        const reports = (await listAgentIdentities()).filter((a) => a.reportsTo === ctx.agentId).map((a) => a.id);
+        const team = (await listWork()).filter((w) => active(w) && reports.includes(w.assignee) && w.requestedBy !== ctx.agentId);
+        const line = (w: WorkView) => `- ${w.id}: "${w.title}" — ${w.status}${w.assignee !== ctx.agentId ? ` (${w.assignee})` : ` (from ${w.requestedBy})`}${w.result ? ` → ${w.result.slice(0, 160)}` : ""}${w.blockedReason ? ` — ${w.blockedReason}` : ""}`;
+        const teamText = reports.length ? `\n\nYour reports' other work:\n${team.map(line).join("\n") || "- nothing"}` : "";
+        return { ok: true, output: `Assigned to you:\n${mine.map(line).join("\n") || "- nothing"}\n\nYou asked for:\n${asked.map(line).join("\n") || "- nothing"}${teamText}` };
+      }
+      let id = typeof toolCall.args.id === "string" && toolCall.args.id ? toolCall.args.id : (await workForSession(ctx.sessionId))?.id;
+      // A verifier reopening/escalating "this item" means the item it's
+      // checking, not its own verification (seen live: it passed its own id).
+      const current = await workForSession(ctx.sessionId);
+      if (current?.kind === "verification" && id === current.id && (action === "reopen" || action === "escalate")) {
+        const checked = current.verifies ?? [];
+        if (checked.length !== 1) return { ok: false, output: "", error: `pass the id of the item you're sending back — one of: ${checked.join(", ")}` };
+        id = checked[0]!;
+      }
+      if (!id) return { ok: false, output: "", error: "which work item? pass id (see action list)" };
+      const item =
+        action === "done" ? await completeWork(id, ctx.agentId, text)
+        : action === "blocked" ? await blockWork(id, ctx.agentId, text)
+        : action === "hand-back" ? await handBackWork(id, ctx.agentId, text)
+        : action === "note" ? await noteWork(id, ctx.agentId, text)
+        : action === "cancel" ? await cancelWork(id, ctx.agentId, text)
+        : action === "reopen" ? await reopenWork(id, ctx.agentId, text)
+        : action === "escalate" ? await escalateWork(id, ctx.agentId, text)
+        : action === "reassign" ? await reassignWork(id, ctx.agentId, String(toolCall.args.to ?? "").trim(), text)
+        : undefined;
+      if (!item) return { ok: false, output: "", error: `unknown action "${action}" — use list, done, blocked, hand-back, note, cancel, reopen, reassign or escalate` };
+      return { ok: true, output: `Work ${item.id} is now ${item.status}${item.assignee !== ctx.agentId ? ` (with ${item.assignee})` : ""}.` };
+    } catch (err) {
+      return { ok: false, output: "", error: err instanceof Error ? err.message : String(err) };
+    }
+  }
   if (toolCall.name === "basespace") {
     const section = String(toolCall.args.section ?? "summary");
     const query = typeof toolCall.args.query === "string" ? toolCall.args.query : undefined;
@@ -529,9 +624,47 @@ async function dispatchTool(
   }
   if (toolCall.name === "basespace-add") {
     const kind = String(toolCall.args.kind ?? "") as OverlayKind;
-    return addOverlayItem(kind, toolCall.args, ctx.agentId);
+    // Linked back to whatever this session's work serves (its focus).
+    return addOverlayItem(kind, toolCall.args, ctx.agentId, (await getSession(ctx.sessionId))?.focus);
   }
   return { ok: false, output: "", error: `unknown tool: ${toolCall.name}` };
+}
+
+const FILE_TOOLS = new Set(["read_file", "edit_file", "write_file"]);
+/** `work` actions that settle the item: once one succeeds the agent has
+ *  nothing left to say, so the turn ends there instead of spending another
+ *  full model call on "Done!". */
+const SETTLING_WORK_ACTIONS = new Set(["done", "blocked", "hand-back"]);
+
+/** The tools this agent can actually use this turn: the ones the turn has
+ *  switched on, minus the ones the gateway hides from this agent
+ *  (tool-registry.ts's setToolVisibility). Everything offered is described
+ *  in every model call, so offering a tool that can only fail is paid for
+ *  on each hop. Hiding isn't the enforcement — dispatch and the tool.before
+ *  hooks still refuse a hidden tool if it's called anyway. */
+function offeredTools(
+  agentId: string,
+  on: { skills?: SkillRegistry; enableSubagents?: boolean; enableMemoryNominations?: boolean; enableArtifacts?: boolean; enableBaseSpace?: boolean; isLead?: boolean },
+): ToolSpec[] {
+  const enabled: Record<string, boolean | undefined> = {
+    skill: !!on.skills && on.skills.listMetadata().length > 0,
+    subagent: on.enableSubagents,
+    "nominate-memory": on.enableMemoryNominations,
+    "record-artifact": on.enableArtifacts,
+    "recall-memory": hindsightConfigured(),
+    basespace: on.enableBaseSpace,
+    "basespace-add": on.enableBaseSpace,
+    delegate: on.enableBaseSpace,
+    work: on.enableBaseSpace,
+    // Growing the team and planning a goal are a lead's job (and always
+    // go to the operator first — governance.ts).
+    "propose-agent": on.enableBaseSpace && on.isLead,
+    "propose-plan": on.enableBaseSpace && on.isLead,
+  };
+  return listToolDefinitions()
+    .filter((d) => !(d.name in enabled) || !!enabled[d.name])
+    .filter((d) => toolVisibleTo(agentId, d.name))
+    .map(toToolSpec);
 }
 
 export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
@@ -544,6 +677,19 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // that never pre-created a Session keep working unchanged, and now get
   // a real, listable/cancellable registry entry for free.
   await ensureSession(sessionId, agentId);
+
+  // Board controls (controls.ts): a paused or over-budget agent takes no new
+  // turns, whichever path the turn came from. Recorded in the session so the
+  // conversation shows why instead of the message vanishing.
+  try {
+    await assertAgentMayRun(agentId);
+  } catch (err) {
+    if (err instanceof AgentBlockedError) {
+      await appendEvent(sessionStream(sessionId), "session.message", { role: "user", content: userMessage });
+      await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: err.message, blocked: err.blocked });
+    }
+    throw err;
+  }
 
   await appendEvent(sessionStream(sessionId), "agent.turn.start", { agentId, userMessage });
   await fireHook("agent.turn.start", { agentId, sessionId, payload: { userMessage } });
@@ -567,6 +713,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // comment) — stays {0,0} and is omitted from agent.turn.end entirely
   // when nothing ever reported usage (the stub model, or a provider that
   // doesn't report it), rather than claiming a fabricated zero.
+  let stopReason: AgentTurnResult["stopReason"] = "answered";
   let usageInputTokens = 0;
   let usageOutputTokens = 0;
   let sawUsage = false;
@@ -575,6 +722,22 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // own doc comment for why (unlike memory/skills, identity isn't expected
   // to change mid-turn).
   const personaText = await renderIdentityContext(agentId);
+  // Hindsight recall, also once per turn: the query is the user's message,
+  // which doesn't change between hops. Recalling inside the hop loop used
+  // to repeat the same HTTP call (up to 4s each) on every tool step.
+  const recalled = injectMemory ? await hindsightRecall(agentId, userMessage) : [];
+  // What this session's work serves (a BaseSpace goal or project, if the
+  // session is focused on one): the chain up to the top goal, linked notes
+  // and open todos. Once per turn — it's the same for every hop.
+  const focusText = await focusContext((await getSession(sessionId))?.focus);
+  // Reporting lines and open work (work.ts) — only for agents on the
+  // operator's team (the same flag that turns on BaseSpace).
+  const orgText = enableBaseSpace ? await orgContext(agentId) : "";
+  const isLead = enableBaseSpace ? (await listAgentIdentities()).some((a) => a.reportsTo === agentId) : false;
+  const tools = offeredTools(agentId, { skills, enableSubagents, enableMemoryNominations, enableArtifacts, enableBaseSpace, isLead }).filter(
+    (t) => !opts.onlyTools || opts.onlyTools.includes(t.name),
+  );
+  const offered = new Set(tools.map((t) => t.name));
 
   // Checked once per turn, BEFORE the hop loop builds its first set of
   // messages — so if this turn is the one that pushes history over
@@ -612,14 +775,14 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
         "will be blocked outright by the harness regardless of anything else — this is not a suggestion you can reason your way around. Investigate, " +
         "then describe the concrete plan (what you'd read/change/run and why) for the operator to review; they'll turn plan mode off to actually execute it."
       : "";
-    const catalogText = skills ? renderSkillCatalog(skills.listMetadata()) : "";
-    const subagentText = enableSubagents
+    const catalogText = skills && offered.has("skill") ? renderSkillCatalog(skills.listMetadata()) : "";
+    const subagentText = enableSubagents && offered.has("subagent")
       ? "You can delegate a focused sub-task to an isolated subagent by calling the `subagent` tool with {goal}. The subagent runs independently and only its final result returns to you — its own reasoning and tool calls stay isolated."
       : "";
-    const nominationText = enableMemoryNominations
+    const nominationText = enableMemoryNominations && offered.has("nominate-memory")
       ? "You can propose something worth remembering long-term by calling the `nominate-memory` tool with {content, kind}. This does NOT write to memory directly — it creates a pending nomination that a human must explicitly approve before it can ever influence curated memory."
       : "";
-    const artifactText = enableArtifacts
+    const artifactText = enableArtifacts && offered.has("record-artifact")
       ? "When you produce a real output worth attaching to this task (a file you wrote, a report, a plan), call the `record-artifact` tool with {type, location, description?} to register it. This does not create the content itself — produce it first (e.g. via the shell tool), then record where it lives."
       : "";
     const baseSpaceText = !enableBaseSpace
@@ -628,8 +791,9 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       "(start with section \"summary\") before answering questions about their work, and use `basespace-add` to leave a note, a todo or a " +
       "project update there — that's how your work shows up for them. Only add things they'd want to see." +
       (hindsightConfigured() ? " Use `recall-memory` to look up what you've learned in earlier conversations." : "");
-    const fileToolsText =
-      "Prefer `read_file`/`edit_file`/`write_file` over shell redirection or `sed` for reading or changing a file's content — " +
+    const fileToolsText = ![...FILE_TOOLS].some((t) => offered.has(t))
+      ? ""
+      : "Prefer `read_file`/`edit_file`/`write_file` over shell redirection or `sed` for reading or changing a file's content — " +
       "`edit_file` takes {path, old_string, new_string} and fails with no write made if old_string isn't found or isn't unique in the file " +
       "(pass replace_all:true to replace every occurrence instead), rather than silently touching the wrong spot." +
       (sandboxPolicy
@@ -639,11 +803,11 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     // comment for why. Only ever populated by the dreaming pass
     // (memory.ts), never by this turn's own conversation, so a chatty
     // session cannot inject its own unvetted "memory" into itself.
-    const memoryText = injectMemory ? await renderMemoryContext(agentId, userMessage) : "";
+    const memoryText = injectMemory ? await renderMemoryContext(agentId, userMessage, recalled) : "";
     // personaText first — "who you are" precedes "what you remember/can do"
     // in the assembled system message, matching how a human-written system
     // prompt would order identity before capability context.
-    const systemParts = [personaText, memoryText, catalogText, subagentText, nominationText, artifactText, baseSpaceText, fileToolsText, planModeText].filter(
+    const systemParts = [personaText, focusText, orgText, memoryText, catalogText, subagentText, nominationText, artifactText, baseSpaceText, fileToolsText, planModeText].filter(
       Boolean,
     );
     const messages: ModelMessage[] = systemParts.length
@@ -659,12 +823,16 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     // "session.message" event below remains the durable record, same as
     // always, so the event log doesn't balloon with one entry per token.
     const response = model.completeStream
-      ? await model.completeStream(messages, (delta) => {
-          publishEvent("agent.turn.delta", { sessionId, agentId, delta }).catch((err) => {
-            console.error("[agent-loop] failed to publish turn delta:", err instanceof Error ? err.message : err);
-          });
-        })
-      : await model.complete(messages);
+      ? await model.completeStream(
+          messages,
+          (delta) => {
+            publishEvent("agent.turn.delta", { sessionId, agentId, delta }).catch((err) => {
+              console.error("[agent-loop] failed to publish turn delta:", err instanceof Error ? err.message : err);
+            });
+          },
+          { tools },
+        )
+      : await model.complete(messages, { tools });
 
     if (response.usage) {
       sawUsage = true;
@@ -684,6 +852,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       // subagent can itself mutate files, so plan mode has to cover it
       // too to mean anything.
       if (planMode && PLAN_MODE_BLOCKED_TOOLS.has(response.toolCall.name)) {
+        stopReason = "tool-blocked";
         finalContent = `Tool call blocked: plan mode is active — "${response.toolCall.name}" would change something, and plan mode only allows read-only inspection. Describe what you'd do instead; the operator can turn plan mode off to actually execute it.`;
         await appendEvent(sessionStream(sessionId), "session.message", {
           role: "assistant",
@@ -692,12 +861,26 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
         break;
       }
 
-      const blockDecision = await fireHook("tool.before", {
-        agentId,
-        sessionId,
-        payload: response.toolCall,
-      });
+      // Governance gates (governance.ts): hiring and goal plans never run
+      // from a turn — they're filed for the operator's approval, whatever
+      // any hook or allow rule would say.
+      // A proposal with something wrong with it isn't filed: it falls
+      // through to dispatch, which hands the problem back to the agent.
+      const gated = GATED_TOOLS.has(response.toolCall.name);
+      const proposalProblem = gated
+        ? await checkProposal(response.toolCall.name, response.toolCall.args ?? {}, agentId, (await getSession(sessionId))?.focus)
+        : undefined;
+      const blockDecision = gated
+        ? proposalProblem
+          ? { block: false as const }
+          : { block: true, reason: await gateToolCall({ agentId, sessionId, toolName: response.toolCall.name, args: response.toolCall.args ?? {} }) }
+        : await fireHook("tool.before", {
+            agentId,
+            sessionId,
+            payload: response.toolCall,
+          });
       if (blockDecision.block) {
+        stopReason = "tool-blocked";
         finalContent = `Tool call blocked: ${blockDecision.reason ?? "no reason given"}`;
         await appendEvent(sessionStream(sessionId), "session.message", {
           role: "assistant",
@@ -755,6 +938,15 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
         call: callLabel,
       });
       hops++;
+      // Settling a work item (done / blocked / hand-back) is the last thing
+      // the agent has to do — end here, with the result as the reply,
+      // rather than one more model call to say so.
+      if (response.toolCall.name === "work" && result.ok && SETTLING_WORK_ACTIONS.has(String(response.toolCall.args?.action ?? ""))) {
+        const text = typeof response.toolCall.args?.text === "string" ? response.toolCall.args.text.trim() : "";
+        finalContent = text || response.content?.trim() || result.output;
+        await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent });
+        break;
+      }
       // Re-checked immediately after the tool actually ran (not just at
       // the top of the next hop) so a cancellation that arrives WHILE a
       // tool call is in flight is honored before the next model call is
@@ -774,6 +966,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     const message = err instanceof Error ? err.message : String(err);
     finalContent = `⚠ ${message}`;
     const usage = sawUsage ? { inputTokens: usageInputTokens, outputTokens: usageOutputTokens } : undefined;
+    if (usage) await recordAgentUsage(agentId, usage, sessionId);
     await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent, error: true });
     await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled, error: message, usage });
     await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled, error: message, usage } });
@@ -784,6 +977,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // Used up every tool step without a final answer — say so instead of
   // ending the turn with nothing (which reads as the reply vanishing).
   if (!cancelled && !finalContent && hops >= maxHops) {
+    stopReason = "max-hops";
     finalContent =
       `I used all ${maxHops} tool steps I get per message before finishing` +
       (toolCalled ? ` (last one: ${toolCalled})` : "") +
@@ -801,6 +995,15 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   }
 
   const usage = sawUsage ? { inputTokens: usageInputTokens, outputTokens: usageOutputTokens } : undefined;
+  // Counts toward the agent's budget (controls.ts) — including a cancelled
+  // turn's tokens, since those were spent too.
+  if (usage) {
+    await recordAgentUsage(agentId, usage, sessionId);
+    // Tokens spent in a work session count on that work item (and roll up
+    // to whoever asked for it — work.ts's totalTokens).
+    const working = await workForSession(sessionId, { anyStatus: true });
+    if (working) await recordWorkUsage(working.id, usage.inputTokens + usage.outputTokens);
+  }
   if (!cancelled && finalContent) {
     // Every completed exchange goes to Hindsight (when configured) so it can
     // extract facts/experiences from it; no-op otherwise.
@@ -810,7 +1013,8 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled, usage } });
   await publishEvent("agent.turn.end", { sessionId, agentId, finalContent, toolCalled, cancelled, usage });
 
-  return { sessionId, finalContent, toolCalled, cancelled: cancelled || undefined, usage };
+  if (cancelled) stopReason = "cancelled";
+  return { sessionId, finalContent, toolCalled, cancelled: cancelled || undefined, usage, stopReason };
 }
 
 /** Runs a tool call the operator approved in the Approvals tab, in the
@@ -849,6 +1053,7 @@ export async function executeApprovedCall(opts: {
       enableMemoryNominations: opts.enableMemoryNominations,
       enableArtifacts: opts.enableArtifacts,
       sandboxPolicy: opts.sandboxPolicy,
+      approved: true,
     }),
     toolDef?.timeoutMs,
     () => ({ ok: false, output: "", error: `tool "${toolCall.name}" timed out after ${toolDef?.timeoutMs}ms` }),

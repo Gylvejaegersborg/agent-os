@@ -33,7 +33,7 @@ independently — see `docs/architecture.md §0`.
 |---|---|---|
 | Event log (append-only, JSONL, projections) | ✅ working | `src/core/eventlog.ts` |
 | Agent loop (turn = LLM call + tool calls, event-sourced) | ✅ working | `src/core/agent-loop.ts` |
-| Model abstraction (swappable adapter interface) | ✅ working — stub + real Anthropic/OpenAI/Ollama adapters | `src/core/model.ts`, `src/core/models/real.ts` |
+| Model abstraction (swappable adapter interface) | ✅ working — stub + real Anthropic/OpenAI/Ollama/Claude-CLI adapters, per-agent provider routing | `src/core/model.ts`, `src/core/models/real.ts`, `src/core/models/claude-cli.ts` |
 | Worker abstraction (execution environment, separate from Agent identity) | ✅ working (local-shell + stub) | `src/core/worker.ts` |
 | Task / Flow (OpenClaw's ledger + orchestration split, with optimistic-concurrency revisioning) — **timeout + 'lost' enforcement, real notifyPolicy wiring, and Flow.kind:'mirrored' now implemented** | ✅ working | `src/core/tasks.ts` |
 | Subagent delegation (in-process, isolated context, same harness) | ✅ working — PRIMARY/default multiagent mechanism | `src/core/subagent.ts` |
@@ -296,6 +296,380 @@ npm run test-live-model
 
 If none of the above are available, the command exits with a clear error
 instead of silently falling back to the stub.
+
+## Model providers — one gateway, several providers
+
+Each agent's model preference (`defaultModel`, set in BaseSpace's agent
+editor or via `POST/PUT /agents`) can name its provider, so agents on the
+same gateway can run on different ones:
+
+| Preference | Provider | Needs on the gateway machine |
+|---|---|---|
+| `claude-cli:sonnet` (or `:opus`, `:haiku`, a full id) | Your Claude subscription through the official Claude Code CLI | `claude` installed and logged in once (`claude` → `/login`) |
+| `anthropic:<model id>` | Anthropic API, pay per token | `ANTHROPIC_API_KEY` |
+| `openai:<model id>` | OpenAI, or any OpenAI-compatible server | `OPENAI_API_KEY`, and/or `OPENAI_BASE_URL` (e.g. LM Studio `http://localhost:1234/v1`) |
+| `ollama:<model>` (e.g. `ollama:llama3.2:3b`) | Local Ollama | `ollama serve` reachable |
+| a bare name (`llama3.2:3b`, `claude-sonnet-5`, …) | As before: Anthropic → OpenAI → Ollama; a bare `claude-…` name uses the CLI when there's no Anthropic key | — |
+
+A preference can only pick a provider the gateway already has access to;
+anything else falls back to the default with a one-time warning.
+`AGENT_OS_DEFAULT_MODEL` (same syntax) sets the default for agents without
+a preference, e.g. `AGENT_OS_DEFAULT_MODEL=claude-cli:sonnet`.
+`GET /providers` lists what this gateway can use.
+
+**How `claude-cli` works** (`src/core/models/claude-cli.ts`): each model call
+is one `claude -p --output-format stream-json` run, fed the conversation on
+stdin, with Claude Code's own tools switched off (`--tools ""`). The model asks
+for a tool with a `<tool_call>` block; because Claude sometimes falls back to
+the shapes it was trained on (`<function_calls>` JSON or `<invoke>` XML,
+`<call>`, OpenAI-style `function`/`arguments`), all of those are accepted,
+only the first call is taken, and anything written after it is dropped —
+that's where a model invents results. Agent-OS's
+tools are described in the system prompt and the model asks for one with a
+`<tool_call>{"name": …, "args": …}</tool_call>` block, which the adapter
+turns back into a normal tool call — so plan mode, permissions, hooks,
+approvals and the sandbox all still apply. This is the same way Orca and
+Paperclip use a Claude subscription: through Anthropic's own CLI rather
+than by sending the subscription's token to the API from a third-party app
+(which is what the older `ANTHROPIC_TOKEN` path does). `CLAUDE_CLI_PATH`
+overrides where the CLI is; `AGENT_OS_CLAUDE_CLI_TIMEOUT_MS` (default
+180000) caps one call. `npm run test-model-router` covers it with a fake
+CLI; it was also run live against a logged-in CLI.
+
+**What a call costs, and what keeps it down.** Every model call resends the
+whole system prompt, and through the CLI there's no prompt caching — so the
+fixed part is paid again on every tool step. Measured on one caption hand-off
+(Nyx on `claude-cli:haiku`, three calls): about 900 tokens of CLI overhead,
+~870 of instructions and ~1,800 describing tools per call, and most of the
+output was extended thinking. So:
+
+- **Thinking is off by default** for `claude-cli` (`MAX_THINKING_TOKENS=0`).
+  Turn it on for an agent that needs it with a `+think` suffix:
+  `claude-cli:sonnet+think`.
+- **Agents are only shown the tools they can use** (`offeredTools` in
+  `agent-loop.ts`): tools the turn hasn't switched on are left out, and the
+  gateway hides the shell and file tools from everyone but the builder agent
+  (`setToolVisibility` in `tool-registry.ts`), along with the instructions
+  that go with them. The `tool.before` hook is still what refuses them.
+- **The tool list is compact text** (a line per argument), not a JSON
+  Schema per tool. API providers still get their native tool format.
+- **Settling a work item ends the turn**: after `work` done / blocked /
+  hand-back there's no extra call to say "done".
+- BaseSpace reads come back as compact JSON; context compaction sends no
+  tools at all.
+
+Same work item rerun after these changes (same snapshot, same model): 6,713
+tokens in two calls (6,082 in / 631 out), down from 17,206 in three calls
+(13,104 in / 4,102 out). One run each, so treat it as indicative.
+
+## Terminals inside the OS — Claude Code in BaseSpace
+
+With `AGENT_OS_TERMINAL=1`, the gateway runs interactive terminal sessions
+that BaseSpace shows in the Workbench's **Terminal** panel: **Claude Code**
+(the real, full `claude` CLI, logged in with your own subscription) or a
+**shell**. Both start in BaseOStest's checkout (`BASEOS_REPO_DIR`), so Claude
+Code works on the OS itself. The first time, pick a theme and run `/login`;
+that same login is what the `claude-cli:` model provider uses.
+
+- The gateway owns the processes (`src/gateway/terminal.ts`): closing the
+  panel or reloading the page leaves them running, and reopening re-attaches
+  with recent scrollback. They end when the gateway restarts.
+- Plain HTTP, no WebSocket: output streams over SSE
+  (`GET /terminals/:id/stream`), keystrokes are `POST /terminals/:id/input`,
+  plus `POST /terminals` (`{profile: "claude" | "shell", cols, rows}`),
+  `POST /terminals/:id/resize`, `DELETE /terminals/:id` and `GET /terminals`.
+- PTY: `node-pty`, an **optional** dependency (it compiles a native module;
+  if that fails, `npm install` still succeeds). Without it, util-linux's
+  `script` provides the PTY and everything works except live resizing.
+  `AGENT_OS_TERMINAL_BACKEND=script` forces the fallback.
+- **Off by default, and it's a full shell as the gateway's user.** The
+  gateway has no auth, so only enable it where the gateway is reachable by
+  you alone. BaseOStest's Codespace turns it on because forwarded ports are
+  private to your GitHub login by default; never make them public while it's
+  on. (Anyone who can reach the gateway could already approve the `claude`
+  agent's shell commands, so this widens less than it sounds, but it skips
+  approvals entirely.)
+
+`npm run test-terminal` covers both PTY backends through the real routes.
+
+## The OS over MCP — for Claude Code and other MCP clients
+
+`POST /mcp` makes the gateway an MCP server (Model Context Protocol,
+Streamable HTTP in its simplest form: one JSON-RPC request per POST, a JSON
+reply; no dependency). Tools (`src/gateway/mcp.ts`):
+
+| Tool | Does |
+|---|---|
+| `basespace_read` | Reads the BaseSpace snapshot (summary, notes, projects, todos, events, crons, teams) |
+| `basespace_add` | Adds a note, todo or project update to BaseSpace (internal to the operator's own dashboard) |
+| `list_agents` | The agent team: role, model, status, capabilities |
+| `ask_agent` | Runs a turn with an agent, exactly like chatting in the Workbench; `sessionId` continues it |
+| `list_approvals` | The approval queue, read-only |
+
+There is deliberately no tool that approves or rejects: that stays with the
+operator. Every Claude Code session started from the Terminal panel gets
+this server automatically (`--mcp-config`) plus a line of context saying it
+runs inside the OS. Any other MCP client can use it too:
+
+```bash
+claude mcp add --transport http agent-os http://127.0.0.1:8787/mcp
+```
+
+Same trust as the rest of the gateway: no auth, so keep it private.
+`npm run test-mcp` covers it; it was also verified with the real Claude
+Code CLI.
+
+## Goals and focus — the "why" behind the work
+
+BaseSpace goals (what the work is for) link projects, sub-goals, notes and
+todos; the snapshot carries those links, and agents read them with the
+`basespace` tool (`section: goals`; a goal or project read by id comes with
+its chain, linked notes and open todos).
+
+A session can be **focused** on a goal or project — `POST /sessions` with
+`{focus: {kind: "goal" | "project", id}}`, or `PUT /sessions/:id/focus`
+(`{focus: null}` clears it). Each turn in a focused session then gets a
+"What this work serves" block (`focusContext()` in `src/core/basespace.ts`):
+the project's status and next moves, the goal chain up to the top goal with
+each goal's *why* and target, linked notes (with ids to read them), and the
+open todos serving it. Once per turn, from the snapshot — no model call.
+
+Continuity back into BaseSpace: a note an agent adds from a focused session
+gets a `Serves: [[Name]]` link (so it shows under that goal/project), a todo
+gets its `projectId`/`goalId`, and a `project-update` defaults to the
+focused project. Subagents inherit the focus (session and Task). Over MCP,
+`ask_agent` and `basespace_add` take `goalId`/`projectId`.
+
+`npm run test-goals` covers it.
+
+**Flows and team crons take a focus too.**
+- `POST /flows {steps, focus}` runs every step in a session focused on that
+  goal or project. The flow remembers it for a resume, and steps get the
+  BaseSpace tools.
+- A BaseSpace team cron with a focus runs its standup the same way, and its
+  prompt says what the meeting serves.
+- Both sessions are linked to their task, so "Needs a look" sees their
+  activity.
+- `npm run test-focus-runs`.
+
+## Work — handing tasks between agents
+
+Agents hand each other work as tracked **work items** (`src/core/work.ts`),
+not chat messages — Paperclip's model:
+
+- **Reporting lines**: each identity can have `reportsTo` (set in BaseSpace's
+  agent editor, or `PUT /agents/:id {reportsTo}`; `null` = the operator).
+  Seeded once: Nyx, Aether, Hermes, Theia, Mnemosyne → Hemera; Hemera, Argus
+  and Claude → the operator. Loops are rejected. Each turn gets a "Your team"
+  block: who you report to, who reports to you, what's assigned to you.
+- **Tools**: `delegate {to, title, detail?}` creates an item for a teammate
+  (it keeps the thread's goal/project focus); `work {action: list | done |
+  blocked | hand-back | note | cancel, id?, text?}`.
+- **Rules**: one assignee, claimed atomically; the assignee can't cancel —
+  it finishes, marks it blocked with a reason, or hands it back to its
+  manager (no manager → blocked for the operator); only the requester or
+  the operator cancels; at most 3 hand-offs deep; handing work straight
+  back to whoever asked is refused. Tokens spent working an item are
+  recorded on it, and `totalTokens` includes everything it was split into.
+- **Runner** (`src/gateway/work-runner.ts`, `AGENT_OS_WORK_RUNNER=off` to
+  disable): works open items one at a time (`AGENT_OS_WORK_CONCURRENCY`), in
+  a fresh session for the assignee with the item's focus; skips paused or
+  over-budget assignees until that lifts. A turn that ends with a real
+  answer completes the item with it (if the agent didn't call `work`
+  itself); one that stopped — a refused tool, a pending approval, out of
+  tool steps (`AgentTurnResult.stopReason`) — leaves it blocked with why. The
+  outcome is posted into the requester's thread as a `[Work]` note; no turn
+  runs on the requester's side, so agents can't ping-pong.
+- **HTTP**: `GET /work?assignee=&requestedBy=&involving=&team=&status=`
+  (`team`: a lead's own work plus its reports'), `GET /work/:id`, `POST /work
+  {assignee, title, detail?, focus?}` (as the operator), `POST
+  /work/:id/cancel|reopen|reassign|note`. **MCP**: `assign_work`, `list_work`.
+
+`npm run test-work` covers it; it was also run live on the Claude CLI.
+
+### Team review — leads manage their team's work
+
+A lead (any agent with reports; Hemera by default) reviews its team's work
+(`core/review.ts`, run by `gateway/review-loop.ts`), after Paperclip's
+heartbeat.
+
+- **The digest is plain code, with no model call**: its reports' blocked
+  work, work handed back to it, and work with no movement for
+  `AGENT_OS_STALE_HOURS` (default 24). Each item carries who asked and what for,
+  so the lead decides from the digest instead of searching for context.
+- **A model turn only when needed**: something needs attention *and* it
+  differs from what the lead saw at its last review. An unchanged team costs
+  nothing.
+- **The lead acts through `work`**: `reopen {id, text}` with guidance,
+  `reassign {id, to, text}`, `escalate {id, text}` to the operator (the item
+  shows as "needs you" until it moves), or `delegate`. Only the requester,
+  the assignee's manager or the operator may do these; an assignee still
+  can't cancel. A review turn offers only `work`, `delegate` and `basespace`,
+  with two tool steps per item.
+- **When**: every `AGENT_OS_REVIEW_INTERVAL_MIN` (240), and
+  `AGENT_OS_REVIEW_DEBOUNCE_MIN` (10) after work is blocked or handed back.
+  At most `AGENT_OS_REVIEW_MAX_PER_DAY` (6) automatic reviews per lead;
+  paused or over-budget leads are skipped. Each lead reviews in one
+  long-lived "Team review" thread. Off with `AGENT_OS_REVIEW=off`.
+- **HTTP**: `GET /reviews?agentId=` (leads, past reviews with tokens and
+  summary), `GET /reviews/:id/digest` (free), `POST /reviews/:id` (review
+  now, even if nothing changed).
+
+Live on `claude-cli:haiku`: Nyx blocked on a cover-photo pick (no access to
+the shoot files). Hemera's first review browsed BaseSpace for all 8 steps
+and never acted (64k tokens). With the digest carrying the ask, the focused
+tool set and step limit, the next review escalated it to the operator in one
+call (12k tokens), naming exactly what was missing. `npm run test-review`
+covers the rules.
+
+## Governance gates — hires and plans need you
+
+After Paperclip's board: the team can grow and plan, but you sign off first
+(`core/governance.ts`).
+
+- **`propose-agent`**: a lead proposes hiring a teammate (id, name, role,
+  persona, who it reports to, optional model, and why).
+- **`propose-plan`**: a lead proposes a plan for a goal, with up to 8 steps
+  for teammates. On approval each step becomes a work item serving the goal,
+  reported back to the proposing thread.
+- **Enforced in the harness, not a hook.** `runTurn()` never runs either
+  one; it files an approval and stops the turn, and dispatch refuses them
+  unless the operator approved (the gateway's `executeApprovedCall` path).
+  Proposing the same thing again reuses the pending request. Neither can be
+  always-allowed (`allowlist.ts` refuses), and only leads are offered them.
+- **Checked before filing.** A proposal with a problem (an id that exists, a
+  thin persona, a step assigned to the lead itself, an unknown agent or goal)
+  isn't filed; the problem goes straight back to the agent to fix. Plans are
+  all-or-nothing.
+- On approval, a hire is registered under its proposer with the roster's
+  BaseSpace defaults and no budget (you set that). BaseSpace shows both
+  proposals as readable cards in Approvals.
+
+**Agent config history.** An agent's name, role, persona, reporting line,
+model and budget are all events already; `listAgentRevisions()` folds them
+into a numbered history. `restoreAgentRevision()` writes a restore as new
+events, marked `restoredFrom`, so a restore can itself be undone. Routes:
+`GET /agents/:id/revisions`, `POST /agents/:id/revisions/:rev/restore`
+(operator-only). BaseSpace: agent editor → History.
+
+Live on `claude-cli:haiku`: Hemera proposed hiring Lyra (sync licensing).
+Her first plan for the Switch goal assigned step 1 to herself; that's what
+led to the pre-filing check. The re-proposed plan was approved in BaseSpace
+and became three work items for Nyx, Aether and Hermes, which the runner
+picked up. `npm run test-governance` covers the rules.
+
+## Watchdog — a verifier checks finished work
+
+After Paperclip's verifier: "trust, but verify" for handed-off work
+(`core/watchdog.ts`).
+
+- **Opt in**: on a work item, or on an approved plan, for the item and
+  everything it's split into.
+  - Agents: `delegate {verify: true}`, `propose-plan {verify: true}`.
+  - HTTP: `POST /work {verify: true}`, `POST /work/:id/verify`.
+  - MCP: `assign_work {verify: true}`.
+  - BaseSpace: the Assign form's checkbox, or "Verify when done" on an item.
+- **When everything under a watch has stopped** (done, blocked or
+  cancelled), the verifier gets one verification work item: Argus, or
+  `AGENT_OS_VERIFIER`. Its evidence is assembled in code, not left to the
+  verifier to dig for: each item's brief and claimed result, next to the tool
+  calls that really ran in its session (the `work` bookkeeping call excluded)
+  and the text of what it added to BaseSpace.
+- **The verifier reports, it doesn't fix.** It runs with only `work` and
+  `basespace`, and may reopen or escalate the items it's verifying, nothing
+  else. A reopened item (a done one can be reopened now) re-runs with the
+  reason at the top of its brief, and is verified again. After two rounds
+  the watch is left for the operator ("verification needs you"). If a
+  verifier sends items back but runs out of steps before writing a verdict,
+  its reasons become the verdict.
+- The verdict goes back to the thread the watch came from as a `[Work]`
+  note. `GET /watches` lists watches and verdicts. Off with
+  `AGENT_OS_WATCHDOG=off`.
+
+Live on `claude-cli:haiku`, two watched items. The first run exposed four
+problems, all now fixed:
+- The `basespace` tool couldn't see what agents had just added, so the
+  verifier sent back finished work. Reads now include the overlay.
+- Hermes added one note five times. The same title from the same agent now
+  updates the note.
+- A re-run wasn't told why it had been sent back, and Nyx spent 112k tokens
+  redoing her research. Re-runs now get the reason.
+- Verdicts were lost when the verifier ran out of steps.
+
+The second run:
+- Nyx's captions were accepted in one round (59k tokens).
+- Argus caught Hermes listing a distributor as a curator and sent it back;
+  Hermes fixed it.
+- In round two, Argus flagged Hermes' unbacked claim that the contacts were
+  "verified". He passed his own verification's id and was refused, so the
+  item wasn't sent back. Such a call now maps to the checked item.
+
+`npm run test-watchdog` covers it with the real runner and a scripted team.
+
+## Stale work — what's stuck
+
+`GET /stale` (`core/stale.ts`) lists what needs a look, and changes nothing:
+- work "in progress" whose run has gone quiet, with no session activity for
+  `AGENT_OS_STALE_RUN_MIN` (20). A hung model call looks like this;
+- tasks still "running" with nothing but liveness renewals, which only prove
+  the process is up;
+- runs that ended lost, timed out or failed in the last day.
+
+BaseSpace shows these as "Needs a look" at the top of the Tasks panel, with
+retry and cancel for stuck work items. Work that simply hasn't moved in a
+day belongs to the lead's team review. `npm run test-stale`.
+
+## Team templates — the team as files
+
+After Paperclip's company package: the whole team as plain markdown you can
+read, diff, keep in git and share (`core/team-template.ts`).
+
+- **Files**:
+  - `TEAM.md`: the reporting tree, the verifier and the skills;
+  - `agents/<id>.md`: frontmatter (`name`, `role`, `reportsTo`, `model`,
+    `budget: 40000/week`, `capabilities`) with the persona as the body;
+  - `skills/<name>/SKILL.md`: the agentskills.io files.
+- **Export** replaces secret-looking strings (API keys, tokens) with
+  `[redacted]` and says where in `TEAM.md`. Agent config holds no
+  credentials; those live in the gateway's environment. Pause state and usage
+  aren't part of a template.
+- **Import** makes the listed agents match the files:
+  - it creates missing agents and updates existing ones, where each change
+    is a config revision, restorable per agent;
+  - it never deletes an agent that isn't in the files;
+  - it checks everything first (frontmatter, budgets, unknown managers,
+    reporting loops) and changes nothing if there's a problem.
+- **Where**: `GET /team/export` (`{files, bundle}`), `POST /team/import
+  {bundle | files, apply}` (a preview unless `apply: true`),
+  `npm run team -- export <dir|file.md>` / `import <dir|file.md> [--apply]`.
+  In BaseSpace: Teams panel → Team as files (Export downloads one `.md`
+  bundle; Import previews first). Operator-only.
+
+`npm run test-team-template`.
+
+## Board controls — pause, resume, budgets
+
+The operator's live levers over each agent (`src/core/controls.ts`, from
+Paperclip's "board powers"):
+
+- **Pause/resume:** `POST /agents/:id/pause` (`{reason?}`) and
+  `POST /agents/:id/resume`. A paused agent takes no new turns.
+- **Budgets:** `PUT /agents/:id/budget` with `{period: "day" | "week" |
+  "month", limitTokens, warnAt?}` (`limitTokens: null` removes it). An
+  `agent.budget.warning` event fires once at `warnAt` (default 80%) and
+  `agent.budget.exceeded` once at the limit; from then on new turns are
+  refused until the period rolls over (UTC) or the limit is raised — the
+  block is derived from usage, never stuck.
+- Enforced in `runTurn()`, so it covers chat, flows, crons, heartbeats,
+  subagents and MCP. A refused turn is written to the session with the
+  reason and answered with HTTP 409 `{blocked}`. Crons, heartbeats and
+  automations skip a blocked agent instead of recording failures. A turn
+  already running finishes.
+- Tokens, not dollars: what each provider reports (the Claude CLI includes
+  cached input). Every agent record carries `control` (pause, budget, this
+  period's usage, `blocked`). No agent tool can change any of this.
+
+`npm run test-controls` covers it.
 
 ## Skills — the open agentskills.io format
 
@@ -1001,7 +1375,7 @@ When it's on:
 - every completed exchange and every episodic memory write is retained into the
   agent's own bank (`<HINDSIGHT_BANK_PREFIX or "agent-os">-<agentId>`);
 - each turn's system message gets a "Recalled from long-term memory" block for the
-  user's message;
+  user's message (recalled once per turn, not on every tool step);
 - agents get a `recall-memory` tool ({query, deep?}; `deep` uses reflect).
 
 Run it (one container with its own embedded Postgres; it needs an LLM key for fact
@@ -1015,6 +1389,18 @@ docker run -d --name hindsight --restart unless-stopped -p 8888:8888 -p 9999:999
 
 HINDSIGHT_URL=http://127.0.0.1:8888 npm run gateway
 ```
+
+Without Docker (a Codespace has none), run the same server through `uv`, here with
+a local Ollama doing the fact extraction:
+
+```bash
+HINDSIGHT_API_LLM_PROVIDER=ollama HINDSIGHT_API_LLM_MODEL=llama3.2:3b \
+HINDSIGHT_API_LLM_BASE_URL=http://localhost:11434/v1 \
+  uvx --from hindsight-api==0.10.1 hindsight-api --port 8888 --idle-timeout 0
+```
+
+It refuses to run as root (its embedded Postgres won't). In a BaseOStest Codespace, set
+the secret `HINDSIGHT_ENABLED=1` and `.devcontainer/hindsight.sh` does this for you.
 
 Optional: `HINDSIGHT_API_KEY` (Bearer token), `HINDSIGHT_BANK_PREFIX`,
 `HINDSIGHT_RECALL_TOKENS` (default 600). The Hindsight UI is on port 9999.
@@ -1044,7 +1430,8 @@ src/
     worker.ts                          # execution-environment interface (local-shell, stub, sandboxed wrapper)
     cli-agent-worker.ts                  # OPTIONAL cross-harness Worker: shells out to claude/codex/opencode CLI
     model.ts             # swappable LLM adapter interface (stub adapter shipped)
-    models/real.ts        # real Anthropic / OpenAI / Ollama adapters + per-agent defaultModel preference wiring
+    models/real.ts        # real Anthropic / OpenAI / Ollama adapters, provider router + per-agent defaultModel wiring
+    models/claude-cli.ts  # Claude through the official Claude Code CLI (your subscription), Agent-OS keeps the tools
     agent-loop.ts          # the turn loop binding all of the above together (persona + memory + skills + tools)
   cli.ts                    # runnable end-to-end demo of every primitive above
   test-live-model.ts         # calls a real model adapter (not the stub) — see below

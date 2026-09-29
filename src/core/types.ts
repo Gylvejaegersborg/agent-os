@@ -151,6 +151,14 @@ export type SessionStatus = "active" | "paused" | "cancelled" | "completed" | "e
  *  it's currently driving). Projected the same way everything else here
  *  is — from a `sessions` event stream (session.ts) — so listing/
  *  resuming/cancelling a session needs no separate mutable store. */
+/** What a session's work serves: a BaseSpace goal or project (see
+ *  basespace.ts's focusContext). Each turn gets the chain from it up to
+ *  the top goal, plus its linked notes and open todos. */
+export interface SessionFocus {
+  kind: "goal" | "project";
+  id: string;
+}
+
 export interface Session {
   id: string;
   agentId: string;
@@ -161,6 +169,7 @@ export interface Session {
   parentSessionId?: string;
   taskId?: string;
   flowId?: string;
+  focus?: SessionFocus;
   metadata: Record<string, unknown>;
 }
 

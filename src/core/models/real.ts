@@ -10,16 +10,12 @@
 // carry multiple tool calls — that's a deliberate scaffold limitation, not
 // an oversight.
 
-import { listToolDefinitions } from "../tool-registry.js";
-import type { ModelAdapter, ModelMessage, ModelResponse } from "../model.js";
+import { listToolDefinitions, toToolSpec } from "../tool-registry.js";
+import type { ModelAdapter, ModelCallOptions, ModelMessage, ModelResponse, ToolSpec } from "../model.js";
 import { appendEvent, project } from "../eventlog.js";
+import { claudeCliAvailable, createClaudeCliModel } from "./claude-cli.js";
 
-export interface ToolSpec {
-  name: string;
-  description: string;
-  /** JSON Schema for the tool's arguments. */
-  parameters: Record<string, unknown>;
-}
+export type { ToolSpec } from "../model.js";
 
 /** Every tool in the registry (tool-registry.ts), as the JSON-Schema specs
  *  the provider APIs take. Used whenever an adapter isn't given an explicit
@@ -28,19 +24,7 @@ export interface ToolSpec {
  *  call path only ran against the stub model. Read at call time, so tools
  *  registered after the adapter was created are included. */
 export function registryToolSpecs(): ToolSpec[] {
-  return listToolDefinitions().map((d) => ({
-    name: d.name,
-    description: d.description,
-    parameters: {
-      type: "object",
-      properties: Object.fromEntries(
-        Object.entries(d.inputSchema).map(([k, v]) => [k, { type: v.type, ...(v.description ? { description: v.description } : {}) }]),
-      ),
-      required: Object.entries(d.inputSchema)
-        .filter(([, v]) => v.required)
-        .map(([k]) => k),
-    },
-  }));
+  return listToolDefinitions().map(toToolSpec);
 }
 
 interface AnthropicOptions {
@@ -91,7 +75,7 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
 
   return {
     id: `anthropic:${model}`,
-    async complete(messages: ModelMessage[]): Promise<ModelResponse> {
+    async complete(messages: ModelMessage[], callOpts?: ModelCallOptions): Promise<ModelResponse> {
       const { system, messages: anthropicMessages } = toAnthropicMessages(messages);
 
       const headers: Record<string, string> = {
@@ -113,7 +97,7 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
         messages: anthropicMessages,
         ...(system ? { system } : {}),
       };
-      const tools = opts.tools ?? registryToolSpecs();
+      const tools = callOpts?.tools ?? opts.tools ?? registryToolSpecs();
       if (tools.length) {
         body.tools = tools.map((t) => ({
           name: t.name,
@@ -152,7 +136,7 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
     // and parsed once complete — Anthropic streams a tool call's JSON
     // input incrementally too, but there's no meaningful "delta" to show
     // a user for that, so only text deltas go to onDelta).
-    async completeStream(messages: ModelMessage[], onDelta: (deltaText: string) => void): Promise<ModelResponse> {
+    async completeStream(messages: ModelMessage[], onDelta: (deltaText: string) => void, callOpts?: ModelCallOptions): Promise<ModelResponse> {
       const { system, messages: anthropicMessages } = toAnthropicMessages(messages);
 
       const headers: Record<string, string> = {
@@ -173,7 +157,7 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
         stream: true,
         ...(system ? { system } : {}),
       };
-      const tools = opts.tools ?? registryToolSpecs();
+      const tools = callOpts?.tools ?? opts.tools ?? registryToolSpecs();
       if (tools.length) {
         body.tools = tools.map((t) => ({
           name: t.name,
@@ -264,14 +248,14 @@ export function createOpenAiModel(opts: OpenAiOptions): ModelAdapter {
 
   return {
     id: `openai:${model}`,
-    async complete(messages: ModelMessage[]): Promise<ModelResponse> {
+    async complete(messages: ModelMessage[], callOpts?: ModelCallOptions): Promise<ModelResponse> {
       const openAiMessages = messages.map((m) => ({
         role: m.role === "tool" ? "user" : m.role, // scaffold-level simplification
         content: m.content,
       }));
 
       const body: Record<string, unknown> = { model, messages: openAiMessages };
-      const tools = opts.tools ?? registryToolSpecs();
+      const tools = callOpts?.tools ?? opts.tools ?? registryToolSpecs();
       if (tools.length) {
         body.tools = tools.map((t) => ({
           type: "function",
@@ -320,9 +304,18 @@ export function createModelFromEnv(preferredModel?: string): ModelAdapter | unde
   if (anthropicKey) return createAnthropicModel({ apiKey: anthropicKey, ...(preferredModel ? { model: preferredModel } : {}) });
 
   const openAiKey = process.env.OPENAI_API_KEY;
-  if (openAiKey) return createOpenAiModel({ apiKey: openAiKey, ...(preferredModel ? { model: preferredModel } : {}) });
+  if (openAiKey) return createOpenAiModel({ apiKey: openAiKey, baseUrl: openAiBaseUrl(), ...(preferredModel ? { model: preferredModel } : {}) });
 
   return undefined;
+}
+
+/** OPENAI_BASE_URL points the OpenAI adapter at any OpenAI-compatible
+ *  server (LM Studio, vLLM, llama.cpp's server, OpenRouter, ...). Accepts
+ *  either the conventional ".../v1" form or the full chat-completions URL. */
+function openAiBaseUrl(): string | undefined {
+  const raw = process.env.OPENAI_BASE_URL?.trim().replace(/\/$/, "");
+  if (!raw) return undefined;
+  return raw.endsWith("/chat/completions") ? raw : `${raw}/chat/completions`;
 }
 
 interface OllamaOptions {
@@ -373,14 +366,14 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
 
   return {
     id: `ollama:${model}`,
-    async complete(messages: ModelMessage[]): Promise<ModelResponse> {
+    async complete(messages: ModelMessage[], callOpts?: ModelCallOptions): Promise<ModelResponse> {
       const ollamaMessages = messages.map((m) => ({
         role: m.role === "tool" ? "user" : m.role,
         content: m.content,
       }));
 
       const body: Record<string, unknown> = { model, messages: ollamaMessages, stream: false };
-      const tools = opts.tools ?? registryToolSpecs();
+      const tools = callOpts?.tools ?? opts.tools ?? registryToolSpecs();
       if (tools.length) {
         body.tools = tools.map((t) => ({
           type: "function",
@@ -422,14 +415,14 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
     // this scaffold only ever surfaces ONE tool call per turn (same
     // assumption the non-streaming path above makes via `tool_calls?.[0]`),
     // so only index 0 is tracked.
-    async completeStream(messages: ModelMessage[], onDelta: (deltaText: string) => void): Promise<ModelResponse> {
+    async completeStream(messages: ModelMessage[], onDelta: (deltaText: string) => void, callOpts?: ModelCallOptions): Promise<ModelResponse> {
       const ollamaMessages = messages.map((m) => ({
         role: m.role === "tool" ? "user" : m.role,
         content: m.content,
       }));
 
       const body: Record<string, unknown> = { model, messages: ollamaMessages, stream: true };
-      const tools = opts.tools ?? registryToolSpecs();
+      const tools = callOpts?.tools ?? opts.tools ?? registryToolSpecs();
       if (tools.length) {
         body.tools = tools.map((t) => ({
           type: "function",
@@ -558,7 +551,8 @@ async function projectAgentModelPreferences(): Promise<Map<string, string>> {
   return project<Map<string, string>>(AGENT_MODEL_PREF_STREAM, new Map(), (state, event) => {
     if (event.type === "agent.defaultModel.set") {
       const p = event.payload as any;
-      state.set(p.agentId, p.model);
+      if (p.model) state.set(p.agentId, p.model);
+      else state.delete(p.agentId); // "" = back to the gateway default
     }
     return state;
   });
@@ -570,34 +564,148 @@ export async function getAgentDefaultModel(agentId: string): Promise<string | un
   return (await projectAgentModelPreferences()).get(agentId);
 }
 
-/** The actual wiring point: resolves a ModelAdapter for a given agent by
- *  consulting its own registered default-model preference FIRST, then
- *  falling through to the exact same env/Ollama selection every other
- *  caller uses.
+// ---- Provider router ----
+//
+// An agent's model preference may name its provider: "claude-cli:sonnet",
+// "ollama:llama3.2:3b", "anthropic:claude-sonnet-5", "openai:gpt-4o-mini".
+// That lets agents on the same gateway run on different providers — e.g.
+// Hemera on your Claude subscription through the Claude Code CLI while
+// Nyx stays on a local Ollama model. A preference without a known prefix
+// is a bare model NAME, handled exactly as before (Ollama names contain
+// colons too, so only these four prefixes are treated as providers).
+//
+// The rule from before still holds: a stored preference can never make a
+// provider available. Each provider is used only when the gateway process
+// already has access to it (a key in its env, a reachable Ollama, an
+// installed Claude CLI); otherwise the agent falls back to the default
+// provider, with a one-time warning.
+
+export const PROVIDERS = ["anthropic", "openai", "ollama", "claude-cli"] as const;
+export type ProviderName = (typeof PROVIDERS)[number];
+
+export interface ModelRef {
+  provider?: ProviderName;
+  model?: string;
+}
+
+export function parseModelRef(ref: string | undefined): ModelRef {
+  const trimmed = ref?.trim();
+  if (!trimmed) return {};
+  for (const provider of PROVIDERS) {
+    if (trimmed === provider) return { provider };
+    if (trimmed.startsWith(`${provider}:`)) {
+      const model = trimmed.slice(provider.length + 1).trim();
+      return { provider, ...(model ? { model } : {}) };
+    }
+  }
+  return { model: trimmed };
+}
+
+async function ollamaReachable(baseUrl: string): Promise<boolean> {
+  const probeUrl = baseUrl.replace(/\/v1\/chat\/completions$/, "/api/tags");
+  try {
+    return (await fetch(probeUrl, { signal: AbortSignal.timeout(1500) })).ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Which providers this gateway process can actually use right now. */
+export async function listProviders(ollamaOpts: OllamaOptions = {}): Promise<{ name: ProviderName; available: boolean; detail: string }[]> {
+  const ollamaUrl = ollamaOpts.baseUrl ?? "http://localhost:11434/v1/chat/completions";
+  return [
+    {
+      name: "anthropic",
+      available: Boolean(process.env.ANTHROPIC_API_KEY ?? process.env.ANTHROPIC_TOKEN),
+      detail: "Anthropic API — needs ANTHROPIC_API_KEY on the gateway",
+    },
+    {
+      name: "openai",
+      available: Boolean(process.env.OPENAI_API_KEY ?? process.env.OPENAI_BASE_URL),
+      detail: process.env.OPENAI_BASE_URL ? `OpenAI-compatible server at ${process.env.OPENAI_BASE_URL}` : "OpenAI API — needs OPENAI_API_KEY (or OPENAI_BASE_URL for a compatible server)",
+    },
+    { name: "ollama", available: await ollamaReachable(ollamaUrl), detail: `Local Ollama at ${ollamaUrl.replace(/\/v1\/chat\/completions$/, "")}` },
+    { name: "claude-cli", available: claudeCliAvailable(), detail: "Your Claude subscription through the installed Claude Code CLI (run `claude` once on the gateway machine and log in)" },
+  ];
+}
+
+/** Builds the adapter for one explicit provider, or undefined when this
+ *  gateway has no access to it. */
+async function createModelForProvider(provider: ProviderName, model: string | undefined, ollamaOpts: OllamaOptions): Promise<ModelAdapter | undefined> {
+  switch (provider) {
+    case "anthropic": {
+      const key = process.env.ANTHROPIC_API_KEY ?? process.env.ANTHROPIC_TOKEN;
+      return key ? createAnthropicModel({ apiKey: key, ...(model ? { model } : {}) }) : undefined;
+    }
+    case "openai": {
+      const baseUrl = openAiBaseUrl();
+      const key = process.env.OPENAI_API_KEY ?? (baseUrl ? "not-needed" : undefined);
+      return key ? createOpenAiModel({ apiKey: key, ...(baseUrl ? { baseUrl } : {}), ...(model ? { model } : {}) }) : undefined;
+    }
+    case "ollama": {
+      const baseUrl = ollamaOpts.baseUrl ?? "http://localhost:11434/v1/chat/completions";
+      return (await ollamaReachable(baseUrl)) ? createOllamaModel({ ...ollamaOpts, ...(model ? { model } : {}) }) : undefined;
+    }
+    case "claude-cli":
+      return claudeCliAvailable() ? createClaudeCliModel(model ? { model } : {}) : undefined;
+  }
+}
+
+const warnedUnavailable = new Set<string>();
+
+/** Resolves a model reference (see parseModelRef) to an adapter:
+ *   - "provider:model" → that provider, if this gateway can use it;
+ *   - a bare "claude-…" name → the Anthropic API when a key is set,
+ *     otherwise the Claude CLI when it's installed — so a Claude model
+ *     picked in BaseSpace's agent editor no longer gets sent to Ollama;
+ *   - anything else → the default provider order (Anthropic, OpenAI,
+ *     Ollama), with the name as the model, exactly as before.
+ *  An unavailable explicit provider falls back to the default order
+ *  WITHOUT the model name (it belongs to the other provider). */
+export async function createModelFromRef(ref: string | undefined, ollamaOpts: OllamaOptions = {}): Promise<ModelAdapter | undefined> {
+  const { provider, model } = parseModelRef(ref);
+  if (provider) {
+    const adapter = await createModelForProvider(provider, model, ollamaOpts);
+    if (adapter) return adapter;
+    if (!warnedUnavailable.has(provider)) {
+      warnedUnavailable.add(provider);
+      console.warn(`[models] "${ref}" asks for provider "${provider}", which this gateway can't use — falling back to the default provider.`);
+    }
+    return createModelFromEnvOrOllama(ollamaOpts);
+  }
+  if (model && /^claude-/.test(model) && !process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_TOKEN && claudeCliAvailable()) {
+    return createClaudeCliModel({ model });
+  }
+  return createModelFromEnvOrOllama(ollamaOpts, model);
+}
+
+/** The gateway-wide default: AGENT_OS_DEFAULT_MODEL (same syntax as an
+ *  agent's preference, e.g. "claude-cli:sonnet") when set, otherwise the
+ *  original Anthropic → OpenAI → Ollama order. */
+export async function createDefaultModel(ollamaOpts: OllamaOptions = {}): Promise<ModelAdapter | undefined> {
+  const ref = process.env.AGENT_OS_DEFAULT_MODEL?.trim();
+  return ref ? createModelFromRef(ref, ollamaOpts) : createModelFromEnvOrOllama(ollamaOpts);
+}
+
+/** The actual wiring point: resolves a ModelAdapter for a given agent from
+ *  its own registered preference, else AGENT_OS_DEFAULT_MODEL, through the
+ *  provider router above.
  *
- *  Precedence (documented explicitly since this is the crux of the
- *  wiring):
- *   1. WHICH PROVIDER (Anthropic vs OpenAI vs Ollama vs none) is decided
- *      purely by which env vars/local services are available — an
- *      agent's stored preference can never make a provider "available"
- *      that isn't already credentialed. This is intentional: a stored
- *      preference is data an agent (or whoever registered it) wrote:
- *      it must not be able to conjure API access that wasn't already
- *      granted via environment configuration.
- *   2. WHICH MODEL within that provider is requested DOES defer to the
- *      agent's registered default when one exists — it overrides the
- *      provider adapter's own hardcoded default model name (see
- *      createModelFromEnv's preferredModel param). This is the part
- *      that's genuinely new: previously an agent's defaultModel field
- *      was pure documentation with zero code consulting it; now it's
- *      read and threaded through on every call.
- *   3. If no preference is registered for this agentId, behavior is
- *      byte-for-byte identical to calling createModelFromEnvOrOllama()
- *      directly (regression-safe, same as the persona wiring above). */
+ *  Precedence:
+ *   1. A preference may pick WHICH PROVIDER, but only among providers this
+ *      gateway process can already use (env keys, a reachable Ollama, an
+ *      installed Claude CLI). A stored preference is data an agent (or
+ *      whoever registered it) wrote; it must not be able to conjure access
+ *      that wasn't granted via the environment.
+ *   2. WHICH MODEL within that provider follows the preference, overriding
+ *      the adapter's own default model name.
+ *   3. With no preference and no AGENT_OS_DEFAULT_MODEL, behavior is
+ *      byte-for-byte identical to createModelFromEnvOrOllama(). */
 export async function createModelForAgent(
   agentId: string,
   ollamaOpts: OllamaOptions = {},
 ): Promise<ModelAdapter | undefined> {
-  const preferredModel = await getAgentDefaultModel(agentId);
-  return createModelFromEnvOrOllama(ollamaOpts, preferredModel);
+  // An empty preference (a restore back to "no model set") means the default.
+  const preferred = (await getAgentDefaultModel(agentId)) || process.env.AGENT_OS_DEFAULT_MODEL;
+  return createModelFromRef(preferred, ollamaOpts);
 }

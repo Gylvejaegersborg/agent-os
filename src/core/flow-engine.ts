@@ -49,9 +49,12 @@
 //      checks, not instantly.
 
 import { createFlow, getFlow, updateFlowStep, createTask, transitionTask } from "./tasks.js";
-import { runTurn, newSessionId } from "./agent-loop.js";
+import { runTurn } from "./agent-loop.js";
+import { createSession, linkSessionWork } from "./session.js";
+import type { SessionFocus } from "./types.js";
 import { createModelForAgent } from "./models/real.js";
 import { publishEvent } from "./eventbus.js";
+import { appendEvent, project } from "./eventlog.js";
 import type { ModelAdapter } from "./model.js";
 import type { Worker } from "./worker.js";
 import type { SkillRegistry } from "./skills.js";
@@ -88,6 +91,25 @@ export interface DriveFlowOptions {
   enableMemoryNominations?: boolean;
   enableArtifacts?: boolean;
   sandboxPolicy?: SandboxPolicy;
+  /** Give each step the BaseSpace tools (the gateway turns them on, as for chat). */
+  enableBaseSpace?: boolean;
+  /** What the whole flow serves (a BaseSpace goal or project): every step
+   *  runs in a session focused on it, so it gets the goal chain, linked
+   *  notes and open todos, and what it adds links back. Remembered per
+   *  flow (setFlowFocus), so a resume keeps it. */
+  focus?: SessionFocus;
+}
+
+const FLOW_FOCUS_STREAM = "flow-focus";
+
+export async function setFlowFocus(flowId: string, focus: SessionFocus): Promise<void> {
+  await appendEvent(FLOW_FOCUS_STREAM, "flow.focus.set", { flowId, focus });
+}
+
+export async function getFlowFocus(flowId: string): Promise<SessionFocus | undefined> {
+  return project<SessionFocus | undefined>(FLOW_FOCUS_STREAM, undefined, (state, e) =>
+    (e.payload as { flowId?: string }).flowId === flowId ? ((e.payload as { focus: SessionFocus }).focus) : state,
+  );
 }
 
 export interface FlowStepResult {
@@ -117,6 +139,7 @@ export async function runFlow(steps: FlowStepDefinition[], opts: DriveFlowOption
     "managed",
     steps.map((s) => ({ id: s.id, dependsOn: s.dependsOn ?? [] })),
   );
+  if (opts.focus) await setFlowFocus(flow.id, opts.focus);
   return driveFlow(flow.id, steps, opts);
 }
 
@@ -161,8 +184,13 @@ async function runStepOnce(
     // back to opts.model (the flow's/gateway's default) when the step's
     // agent has no override or nothing resolves.
     const model = (await createModelForAgent(step.agentId)) ?? opts.model;
+    const focus = opts.focus ?? (await getFlowFocus(flowId));
+    // A real session (not just a message stream): it carries the focus, and
+    // is linked to the step's task so stale-work detection sees its activity.
+    const session = await createSession({ agentId: step.agentId, title: `Flow step: ${step.id}`, ...(focus ? { focus } : {}) });
+    await linkSessionWork(session.id, { taskId: task.id, flowId });
     const result = await runTurn({
-      sessionId: newSessionId(),
+      sessionId: session.id,
       agentId: step.agentId,
       userMessage: step.goal,
       model,
@@ -172,9 +200,10 @@ async function runStepOnce(
       enableSubagents: opts.enableSubagents,
       enableMemoryNominations: opts.enableMemoryNominations,
       enableArtifacts: opts.enableArtifacts,
+      enableBaseSpace: opts.enableBaseSpace,
       sandboxPolicy: opts.sandboxPolicy,
     });
-    await transitionTask(task.id, "succeeded", { output: { finalContent: result.finalContent } });
+    await transitionTask(task.id, "succeeded", { output: { finalContent: result.finalContent, sessionId: session.id } });
     await publishEvent("flow.step.completed", { flowId, stepId: step.id, agentId: step.agentId, taskId: task.id, status: "succeeded" });
     return { status: "succeeded", taskId: task.id, finalContent: result.finalContent };
   } catch (err) {

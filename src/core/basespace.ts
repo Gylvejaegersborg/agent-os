@@ -17,6 +17,7 @@
 // The snapshot is the operator's data, so the tool only ever reads it;
 // agents can't rewrite a note or project in place, only add alongside.
 
+import type { SessionFocus } from "./types.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { publishEvent } from "./eventbus.js";
@@ -82,8 +83,8 @@ function matches(obj: unknown, q: string): boolean {
   return JSON.stringify(obj).toLowerCase().includes(q.toLowerCase());
 }
 
-/** What the `basespace` tool returns. Sections: summary, notes, projects,
- *  todos, events, crons, teams. `query` filters by text, `id` returns one
+/** What the `basespace` tool returns. Sections: summary, goals, notes,
+ *  projects, todos, events, crons, teams. `query` filters by text, `id` returns one
  *  item in full (for notes: the whole body). */
 export async function readSnapshotSection(section: string, opts: { query?: string; id?: string } = {}): Promise<ToolResult> {
   const snap = await loadSnapshot();
@@ -91,7 +92,20 @@ export async function readSnapshotSection(section: string, opts: { query?: strin
     return { ok: false, output: "", error: "BaseSpace hasn't sent a snapshot yet — it syncs automatically while BaseSpace is open and connected." };
   }
   const header = `BaseSpace snapshot from ${snap.exportedAt ?? snap.receivedAt}.`;
-  const list = (key: string): any[] => (Array.isArray(snap[key]) ? snap[key] : []);
+  // What agents added (the overlay) shows up in the snapshot only after
+  // BaseSpace syncs again — until then, read it straight from the overlay,
+  // or an agent can't see what a teammate just added (a verifier would
+  // call finished work missing).
+  const overlay = await loadOverlay();
+  const pending = (key: string, have: any[]): any[] => {
+    const src = key === "notes" ? overlay.notes : key === "todos" ? overlay.tasks : [];
+    const ids = new Set(have.map((i) => i.id));
+    return src.filter((i) => !ids.has(i.id));
+  };
+  const list = (key: string): any[] => {
+    const have = Array.isArray(snap[key]) ? snap[key] : [];
+    return [...have, ...pending(key, have)];
+  };
 
   if (section === "summary") {
     const today = new Date().toISOString().slice(0, 10);
@@ -110,23 +124,133 @@ export async function readSnapshotSection(section: string, opts: { query?: strin
       eventsThisWeek: list("events").filter((e) => e.date >= today && e.date <= soon).map((e) => ({ title: e.title, date: e.date, start: e.start })),
       activeProjects: list("projects").filter((p) => p.status === "active").map((p) => ({ id: p.id, name: p.name, progress: p.progress, nextMoves: p.nextMoves })),
       teams: list("teams"),
+      activeGoals: list("goals")
+        .filter((g) => g.status === "active")
+        .map((g) => ({ id: g.id, title: g.title, why: g.why, target: g.target, progress: g.progress, projects: (g.projectIds ?? []).map((id: string) => nameOf(snap, "project", id)) })),
     };
-    return { ok: true, output: cap(`${header}\n${JSON.stringify(out, null, 1)}`) };
+    return { ok: true, output: cap(`${header}\n${JSON.stringify(out)}`) };
   }
 
-  const key = section === "todo" ? "todos" : section;
-  if (!["notes", "projects", "todos", "events", "crons", "teams"].includes(key)) {
-    return { ok: false, output: "", error: `unknown section "${section}" — use summary, notes, projects, todos, events, crons or teams` };
+  const key = section === "todo" ? "todos" : section === "goal" ? "goals" : section;
+  if (!["notes", "projects", "todos", "events", "crons", "teams", "goals"].includes(key)) {
+    return { ok: false, output: "", error: `unknown section "${section}" — use summary, goals, notes, projects, todos, events, crons or teams` };
   }
   let items = list(key);
   if (opts.id) {
     const one = items.find((i) => i.id === opts.id || (typeof i.title === "string" && i.title.toLowerCase() === opts.id!.toLowerCase()));
-    return one ? { ok: true, output: cap(`${header}\n${JSON.stringify(one, null, 1)}`) } : { ok: false, output: "", error: `no ${key} item with id "${opts.id}"` };
+    if (!one) return { ok: false, output: "", error: `no ${key} item with id "${opts.id}"` };
+    // A goal or project read in full comes with what it's connected to.
+    const context = key === "projects" || key === "goals" ? `\n\n${renderFocus(snap, { kind: key === "goals" ? "goal" : "project", id: one.id })}` : "";
+    return { ok: true, output: cap(`${header}\n${JSON.stringify(one)}${context}`) };
   }
   if (opts.query) items = items.filter((i) => matches(i, opts.query!));
   // Notes are listed without bodies — ask for one by id to read it.
   const shown = key === "notes" ? items.map(({ body: _body, ...rest }) => rest) : items;
-  return { ok: true, output: cap(`${header} ${items.length} ${key}${opts.query ? ` matching "${opts.query}"` : ""}.\n${JSON.stringify(shown, null, 1)}`) };
+  return { ok: true, output: cap(`${header} ${items.length} ${key}${opts.query ? ` matching "${opts.query}"` : ""}.\n${JSON.stringify(shown)}`) };
+}
+
+// ---- focus: what a conversation's work serves ---------------------------------
+//
+// BaseSpace links goals → projects → todos and notes (features/goals in
+// BaseOStest); the snapshot carries those links. A session focused on a
+// goal or project gets this rendered into every turn (agent-loop.ts), so
+// the agent always knows why it's doing the work and what's already there —
+// continuity instead of starting from zero each conversation.
+
+const MAX_LISTED = 12;
+
+function nameOf(snap: Record<string, any>, kind: "project" | "goal" | "note", id: string): string {
+  const key = kind === "project" ? "projects" : kind === "goal" ? "goals" : "notes";
+  const item = (Array.isArray(snap[key]) ? snap[key] : []).find((i: any) => i.id === id);
+  return item ? String(item.name ?? item.title) : id;
+}
+
+function goalChainOf(snap: Record<string, any>, goalId: string | undefined): any[] {
+  const goals: any[] = Array.isArray(snap.goals) ? snap.goals : [];
+  const out: any[] = [];
+  const seen = new Set<string>();
+  let cur = goals.find((g) => g.id === goalId);
+  while (cur && !seen.has(cur.id)) {
+    out.push(cur);
+    seen.add(cur.id);
+    cur = cur.parentId ? goals.find((g) => g.id === cur.parentId) : undefined;
+  }
+  return out;
+}
+
+const goalLine = (g: any) =>
+  `"${g.title}"${g.status && g.status !== "active" ? ` (${g.status})` : ""}${g.target ? `, target ${g.target}` : ""}${typeof g.progress === "number" ? `, ${g.progress}% across its projects` : ""}${g.why ? ` — why: ${g.why}` : ""}`;
+
+function renderFocus(snap: Record<string, any>, focus: SessionFocus): string {
+  const list = (k: string): any[] => (Array.isArray(snap[k]) ? snap[k] : []);
+  const lines: string[] = ["# What this work serves"];
+  let projectIds: string[] = [];
+  let goalIds: string[] = [];
+  let noteIds: string[] = [];
+
+  if (focus.kind === "project") {
+    const p = list("projects").find((x) => x.id === focus.id);
+    if (!p) return `# What this work serves\nThis conversation is about project "${focus.id}", which isn't in BaseSpace's latest snapshot.`;
+    const tagline = p.tagline ? ` — ${String(p.tagline).replace(/[.!?]+$/, "")}` : "";
+    lines.push(`This conversation is about the project "${p.name}" (${p.status}, ${p.progress}%)${tagline}.`);
+    if (p.nextMoves?.length) lines.push(`Next moves:\n${p.nextMoves.slice(0, 5).map((m: string) => `- ${m}`).join("\n")}`);
+    if (p.recent?.length) lines.push(`Recently:\n${p.recent.slice(0, 3).map((r: any) => `- ${String(r.date).slice(0, 10)}: ${r.text}`).join("\n")}`);
+    const serves = (p.goalIds ?? []) as string[];
+    for (const gid of serves) {
+      const [first, ...above] = goalChainOf(snap, gid);
+      if (!first) continue;
+      lines.push(`It serves the goal ${goalLine(first)}${above.map((g) => `\n  which serves ${goalLine(g)}`).join("")}`);
+    }
+    if (!serves.length) lines.push("It isn't linked to a goal yet.");
+    projectIds = [p.id];
+    goalIds = serves;
+    noteIds = p.noteIds ?? [];
+  } else {
+    const chain = goalChainOf(snap, focus.id);
+    const g = chain[0];
+    if (!g) return `# What this work serves\nThis conversation is about goal "${focus.id}", which isn't in BaseSpace's latest snapshot.`;
+    lines.push(`This conversation is about the goal ${goalLine(g)}.${chain.slice(1).map((x) => `\n  which serves ${goalLine(x)}`).join("")}`);
+    const projects = list("projects").filter((p) => (g.projectIds ?? []).includes(p.id));
+    if (projects.length) {
+      lines.push(
+        `Its projects:\n${projects.map((p) => `- "${p.name}" (${p.status}, ${p.progress}%, id ${p.id})${p.nextMoves?.length ? ` — next: ${p.nextMoves.slice(0, 3).join("; ")}` : ""}`).join("\n")}`,
+      );
+    } else lines.push("No projects are linked to it yet.");
+    const subGoals = list("goals").filter((x) => x.parentId === g.id);
+    if (subGoals.length) lines.push(`Sub-goals:\n${subGoals.map((x) => `- ${goalLine(x)}`).join("\n")}`);
+    projectIds = projects.map((p) => p.id);
+    goalIds = [g.id];
+    noteIds = g.noteIds ?? [];
+  }
+
+  const notes = noteIds.slice(0, MAX_LISTED).map((id) => `- "${nameOf(snap, "note", id)}" (id ${id})`);
+  if (notes.length) lines.push(`Linked notes (read one with the basespace tool, section notes + id):\n${notes.join("\n")}${noteIds.length > MAX_LISTED ? `\n- …and ${noteIds.length - MAX_LISTED} more` : ""}`);
+  const todos = list("todos").filter((t) => t.status !== "done" && ((t.projectId && projectIds.includes(t.projectId)) || (t.goalId && goalIds.includes(t.goalId))));
+  if (todos.length) {
+    lines.push(
+      `Open todos:\n${todos.slice(0, MAX_LISTED).map((t) => `- "${t.title}" (${t.priority}${t.due ? `, due ${t.due}` : ""}${t.status === "doing" ? ", in progress" : ""})`).join("\n")}`,
+    );
+  }
+  lines.push("Notes and todos you add to BaseSpace in this conversation are linked to it automatically. Say so if a request doesn't serve it.");
+  return lines.join("\n");
+}
+
+/** The "what this work serves" block for a focused session, or "" when
+ *  there's no snapshot yet. */
+export async function focusContext(focus: SessionFocus | undefined): Promise<string> {
+  if (!focus) return "";
+  const snap = await loadSnapshot();
+  return snap ? renderFocus(snap, focus) : "";
+}
+
+/** How an item added in a focused session links back to the focus. */
+async function focusLinks(focus: SessionFocus | undefined): Promise<{ wikiName?: string; projectId?: string; goalId?: string }> {
+  if (!focus) return {};
+  const snap = (await loadSnapshot()) ?? {};
+  // Only link by a name BaseSpace knows: an id in [[…]] would be a dead link.
+  const found = nameOf(snap, focus.kind, focus.id);
+  const wikiName = found === focus.id ? undefined : found;
+  return focus.kind === "project" ? { wikiName, projectId: focus.id } : { wikiName, goalId: focus.id };
 }
 
 // ---- overlay (agents → BaseSpace) -------------------------------------------
@@ -150,8 +274,11 @@ function hours(time: unknown): number | undefined {
 const cap1 = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
 /** What the `basespace-add` tool does. */
-export async function addOverlayItem(kind: OverlayKind, args: Record<string, unknown>, agentId: string): Promise<ToolResult> {
+export async function addOverlayItem(kind: OverlayKind, args: Record<string, unknown>, agentId: string, focus?: SessionFocus): Promise<ToolResult> {
   const str = (k: string) => (typeof args[k] === "string" ? (args[k] as string).trim() : "");
+  // Items added while working on a goal/project link back to it — notes with
+  // a [[wikilink]] (so they show under it in BaseSpace), todos by id.
+  const links = await focusLinks(focus);
   const now = new Date().toISOString();
   const id = `agent-${agentId}-${Date.now().toString(36)}`;
   const o = await loadOverlay();
@@ -160,9 +287,23 @@ export async function addOverlayItem(kind: OverlayKind, args: Record<string, unk
     const title = str("title");
     if (!title) return { ok: false, output: "", error: "a note needs a title" };
     const folder = str("folder") || `Agents/${cap1(agentId)}`;
-    o.notes.push({ id, title, folder, tags: [agentId], updated: now, created: now, body: str("body") });
+    let body = str("body");
+    // The same agent adding a note with the same title again (a retry, a
+    // re-run after being sent back) updates it instead of piling up copies.
+    const recent = o.notes.find(
+      (n) => n.title === title && Array.isArray(n.tags) && (n.tags as string[]).includes(agentId) && Date.now() - Date.parse(String(n.created ?? "")) < 24 * 3_600_000,
+    );
+    if (links.wikiName && !body.toLowerCase().includes(`[[${links.wikiName.toLowerCase()}`)) {
+      body = `${body}${body ? "\n\n" : ""}Serves: [[${links.wikiName}]]`;
+    }
+    if (recent) {
+      Object.assign(recent, { body, folder, updated: now });
+      await saveOverlay(o);
+      return { ok: true, output: `Updated your note "${title}" (${folder}), id ${recent.id} — same title as one you added earlier, so it was replaced, not duplicated.` };
+    }
+    o.notes.push({ id, title, folder, tags: [agentId], updated: now, created: now, body });
     await saveOverlay(o);
-    return { ok: true, output: `Added note "${title}" to BaseSpace (${folder}), id ${id}.` };
+    return { ok: true, output: `Added note "${title}" to BaseSpace (${folder}), id ${id}${links.wikiName ? `, linked to "${links.wikiName}"` : ""}.` };
   }
   if (kind === "todo") {
     const title = str("title");
@@ -178,12 +319,14 @@ export async function addOverlayItem(kind: OverlayKind, args: Record<string, unk
       ...(due ? { due } : {}),
       ...(hours(args.time) != null ? { dueTime: hours(args.time), notify: true } : {}),
       notes: `${str("notes")}${str("notes") ? " " : ""}(added by ${cap1(agentId)})`,
+      ...((str("projectId") || links.projectId) ? { projectId: str("projectId") || links.projectId } : {}),
+      ...((str("goalId") || links.goalId) ? { goalId: str("goalId") || links.goalId } : {}),
     });
     await saveOverlay(o);
-    return { ok: true, output: `Added todo "${title}"${due ? ` due ${due}` : ""} to BaseSpace, id ${id}.` };
+    return { ok: true, output: `Added todo "${title}"${due ? ` due ${due}` : ""} to BaseSpace, id ${id}${links.wikiName ? `, linked to "${links.wikiName}"` : ""}.` };
   }
   if (kind === "project-update") {
-    const projectId = str("projectId");
+    const projectId = str("projectId") || links.projectId || "";
     const text = str("text");
     if (!projectId || !text) return { ok: false, output: "", error: "project-update needs projectId and text" };
     const snap = await loadSnapshot();

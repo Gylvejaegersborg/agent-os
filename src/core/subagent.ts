@@ -24,6 +24,8 @@
 // listTasks({ parentTaskId }) query as any other Task relationship, not a
 // bespoke subagent-tracking structure.
 
+import { createSession } from "./session.js";
+import type { SessionFocus } from "./types.js";
 import { createTask, transitionTask } from "./tasks.js";
 import { runTurn, newSessionId } from "./agent-loop.js";
 import { fireHook } from "./hooks.js";
@@ -43,6 +45,10 @@ export interface SpawnSubagentOptions {
    *  since maxToolHops bounds it, effectively only meaningfully "seeded")
    *  user message. */
   goal: string;
+  /** What the parent's work serves (its session focus) — the subagent's
+   *  session and Task carry it too, so delegated work stays tied to the
+   *  same goal or project and gets the same context. */
+  focus?: SessionFocus;
   model: ModelAdapter;
   worker: Worker;
   skills?: SkillRegistry;
@@ -79,12 +85,13 @@ export async function spawnSubagentTask(opts: SpawnSubagentOptions): Promise<Sub
     type: "subagent",
     agentId: opts.agentId,
     parentTaskId: opts.parentTaskId,
-    input: { goal: opts.goal },
+    input: { goal: opts.goal, ...(opts.focus ? { focus: opts.focus } : {}) },
   });
   await fireHook("task.created", { agentId: opts.agentId, sessionId: task.id, payload: { task } });
   await transitionTask(task.id, "running");
 
   const sessionId = newSessionId(); // isolated context — the defining property, see file header
+  if (opts.focus) await createSession({ id: sessionId, agentId: opts.agentId, title: `Subagent: ${opts.goal.slice(0, 60)}`, focus: opts.focus });
   try {
     const result = await runTurn({
       sessionId,

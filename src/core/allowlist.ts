@@ -12,6 +12,7 @@
 // Event-sourced like everything else here (an `allowlist` stream reduced
 // by project()), so it survives restarts and every change is auditable.
 
+import { GATED_TOOL_NAMES } from "./tool-registry.js";
 import { project, appendEvent } from "./eventlog.js";
 import { publishEvent } from "./eventbus.js";
 import { generateId } from "./id.js";
@@ -63,6 +64,9 @@ export async function listAllowRules(agentId?: string): Promise<AllowRule[]> {
 /** Throws with a readable reason when a rule would be unsafe. */
 export function validateAllowRule(input: { toolName: string; args?: Record<string, unknown> }): void {
   if (!input.toolName) throw new Error("a rule needs a tool name");
+  if (GATED_TOOL_NAMES.includes(input.toolName)) {
+    throw new Error(`"${input.toolName}" always needs your approval — hiring and goal plans can't be always-allowed`);
+  }
   if (!input.args && EXACT_ONLY_TOOLS.includes(input.toolName)) {
     throw new Error(`"${input.toolName}" can only be always-allowed for one exact call, not every call`);
   }

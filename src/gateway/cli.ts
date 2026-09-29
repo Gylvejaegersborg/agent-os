@@ -8,7 +8,7 @@
 
 import * as path from "node:path";
 import {
-  createModelFromEnvOrOllama,
+  createDefaultModel,
   createStubModel,
   createLocalShellWorker,
   createSandboxedWorker,
@@ -18,6 +18,10 @@ import {
   startTaskLivenessRenewer,
   startMemoryDreamingSweeper,
   registerHook,
+  setToolVisibility,
+  subscribeToAllEvents,
+  checkWatches,
+  verifierId,
   installPermissionPolicy,
   DEFAULT_HARD_BLOCKLIST,
   SkillRegistry,
@@ -27,6 +31,8 @@ import {
 } from "../core/index.js";
 import { startGateway } from "./server.js";
 import { startBaseSpaceCronRunner } from "./basespace-crons.js";
+import { startWorkRunner } from "./work-runner.js";
+import { startReviewLoop } from "./review-loop.js";
 
 // The one agent allowed to touch a real shell at all. Deliberately a
 // single, well-known id rather than a config knob: this whole feature
@@ -135,10 +141,13 @@ async function main(): Promise<void> {
   const configuredHooks = await loadConfiguredHooks(hooksFile);
   console.log(`[gateway] configured hooks: ${configuredHooks.length} loaded from ${hooksFile}`);
 
-  const model = (await createModelFromEnvOrOllama()) ?? createStubModel();
+  // AGENT_OS_DEFAULT_MODEL (e.g. "claude-cli:sonnet") picks the default
+  // provider/model; unset, it's Anthropic → OpenAI → Ollama as before.
+  // Agents can still name their own (models/real.ts's provider router).
+  const model = (await createDefaultModel()) ?? createStubModel();
   if (model.id === "stub-model") {
     console.log(
-      "[gateway] no ANTHROPIC_TOKEN/ANTHROPIC_API_KEY/OPENAI_API_KEY set and Ollama not reachable — " +
+      "[gateway] no ANTHROPIC_API_KEY/OPENAI_API_KEY set, AGENT_OS_DEFAULT_MODEL unset or unusable, and Ollama not reachable — " +
         "running with the deterministic stub model. Set a provider env var for real model calls.",
     );
   } else {
@@ -177,6 +186,10 @@ async function main(): Promise<void> {
       reason: `"${toolName}" is restricted to the "${ENGINEER_AGENT_ID}" agent — ask it directly if you need something inspected or fixed.`,
     };
   });
+  // …and the other agents aren't shown those tools at all: describing four
+  // tools an agent can only be refused costs tokens on every one of its
+  // model calls. The hook above stays the enforcement.
+  setToolVisibility((agentId, toolName) => !FILESYSTEM_TOOLS.includes(toolName) || agentId === ENGINEER_AGENT_ID);
   // Layer A, part 2: ENGINEER_AGENT_ID's own rules (see buildEngineerPolicy
   // above) — safe reads pre-approved, everything else durably queued for
   // approval in the Workbench's Approvals tab.
@@ -217,6 +230,24 @@ async function main(): Promise<void> {
 
   // Team meetings scheduled in BaseSpace (see basespace-crons.ts).
   const baseSpaceCrons = startBaseSpaceCronRunner({ model, worker, skills });
+  // Work handed between agents (core/work.ts), run one at a time.
+  const workRunner =
+    process.env.AGENT_OS_WORK_RUNNER === "off"
+      ? undefined
+      : startWorkRunner({ model, worker, skills, sandboxPolicy, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true, enableBaseSpace: true, maxToolHops: 8 });
+  console.log(`[gateway] work runner ${workRunner ? "on" : "off (AGENT_OS_WORK_RUNNER=off)"}`);
+  // The watchdog (watchdog.ts): when everything under a watch has stopped,
+  // the verifier gets a verification item; its verdict settles the watch.
+  const unwatch =
+    process.env.AGENT_OS_WATCHDOG === "off"
+      ? undefined
+      : subscribeToAllEvents((type) => {
+          if (type.startsWith("work.") || type === "watch.created") void checkWatches().catch((err) => console.error("[watchdog]", err instanceof Error ? err.message : err));
+        });
+  console.log(`[gateway] watchdog ${unwatch ? `on (verifier: ${verifierId()})` : "off (AGENT_OS_WATCHDOG=off)"}`);
+  // Leads review their team's work when something needs them (review.ts).
+  const reviewLoop = process.env.AGENT_OS_REVIEW === "off" ? undefined : startReviewLoop({ model, worker, skills, sandboxPolicy });
+  console.log(`[gateway] team reviews ${reviewLoop ? "on" : "off (AGENT_OS_REVIEW=off)"}`);
   console.log(
     `[gateway] BaseSpace team crons ${process.env.AGENT_OS_BASESPACE_CRONS === "off" ? "disabled" : "enabled"}; ` +
       `Hindsight memory ${process.env.HINDSIGHT_URL ? `on (${process.env.HINDSIGHT_URL})` : "off (set HINDSIGHT_URL to enable)"}`,
@@ -225,6 +256,9 @@ async function main(): Promise<void> {
   const shutdown = async (): Promise<void> => {
     console.log("\n[gateway] shutting down...");
     baseSpaceCrons.stop();
+    workRunner?.stop();
+    reviewLoop?.stop();
+    unwatch?.();
     await handle.stop();
     process.exit(0);
   };

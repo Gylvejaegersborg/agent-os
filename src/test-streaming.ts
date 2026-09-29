@@ -73,6 +73,10 @@ async function testRunTurnPublishesDeltasNotDurable(): Promise<void> {
     worker: createStubWorker(),
   });
 
+  // Deltas are published fire-and-forget (the adapter never waits on a
+  // subscriber), so the last one can still be in flight when the turn
+  // returns — let it land before counting.
+  await new Promise((r) => setTimeout(r, 100));
   unsubscribe();
 
   assert(deltasReceived.length > 1, `multiple agent.turn.delta events were published (got ${deltasReceived.length})`);

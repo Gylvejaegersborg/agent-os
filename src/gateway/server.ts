@@ -40,12 +40,46 @@ import type { Worker } from "../core/worker.js";
 import type { SkillRegistry } from "../core/skills.js";
 import {
   createSession,
+  setSessionFocus,
   getSession,
   listSessions,
   cancelSession,
   renameSession,
   runTurn,
   createModelForAgent,
+  listProviders,
+  OPERATOR,
+  WorkError,
+  cancelWork,
+  createWork,
+  getWork,
+  listWork,
+  noteWork,
+  reassignWork,
+  reopenWork,
+  listLeads,
+  setFlowFocus,
+  exportTeam,
+  bundleTeam,
+  unbundleTeam,
+  planTeamImport,
+  applyTeamImport,
+  listStaleWork,
+  staleRunMs,
+  listWatches,
+  verifierId,
+  watchWork,
+  listAgentRevisions,
+  restoreAgentRevision,
+  getAgentIdentity,
+  listReviews,
+  reviewDigest,
+  type WorkStatus,
+  AgentBlockedError,
+  getAgentControlState,
+  pauseAgent,
+  resumeAgent,
+  setAgentBudget,
   getSessionHistory,
   getSessionUsage,
   newSessionId,
@@ -94,9 +128,13 @@ import {
   consumeApproval,
 } from "../core/index.js";
 import { checkPathSandbox } from "../core/permissions.js";
+import { runReview } from "./review-loop.js";
 import type { SessionStatus, ApprovalStatus, ApprovalRequest, TaskStatus, NominationStatus } from "../core/types.js";
 import type { SandboxPolicy } from "../core/permissions.js";
 import type { ConfiguredHook } from "../core/configured-hooks.js";
+import { handleMcp, type McpDeps } from "./mcp.js";
+import type { SessionFocus } from "../core/types.js";
+import { closeAllTerminals, closeTerminal, setTerminalGatewayUrl, createTerminal, listTerminals, ptyBackend, resizeTerminal, streamTerminal, terminalsEnabled, writeTerminal } from "./terminal.js";
 import type { ArtifactType } from "../core/artifacts.js";
 import type { FlowStepDefinition } from "../core/flow-engine.js";
 
@@ -218,6 +256,11 @@ export function startGateway(deps: GatewayDeps, port = 0): Promise<GatewayHandle
       try {
         await route(req, res, deps);
       } catch (err) {
+        // A paused or over-budget agent (controls.ts) is a refusal, not a crash.
+        if (err instanceof AgentBlockedError) {
+          sendJson(res, 409, { error: err.message, blocked: err.blocked, agentId: err.agentId });
+          return;
+        }
         sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
       }
     });
@@ -225,13 +268,57 @@ export function startGateway(deps: GatewayDeps, port = 0): Promise<GatewayHandle
     server.listen(port, "127.0.0.1", () => {
       const address = server.address();
       const actualPort = typeof address === "object" && address ? address.port : port;
+      setTerminalGatewayUrl(`http://127.0.0.1:${actualPort}`);
       resolve({
         server,
         port: actualPort,
-        stop: () => new Promise<void>((res, rej) => server.close((err) => (err ? rej(err) : res()))),
+        stop: () => {
+          closeAllTerminals();
+          return new Promise<void>((res, rej) => server.close((err) => (err ? rej(err) : res())));
+        },
       });
     });
   });
+}
+
+/** A request body's `focus`: undefined when absent, "invalid" when malformed. */
+function parseFocus(raw: unknown): SessionFocus | undefined | "invalid" {
+  if (raw === undefined || raw === null) return undefined;
+  const f = raw as { kind?: unknown; id?: unknown };
+  if ((f.kind === "goal" || f.kind === "project") && typeof f.id === "string" && f.id) return { kind: f.kind, id: f.id };
+  return "invalid";
+}
+
+/** What mcp.ts needs from the gateway: an agent turn run exactly the way
+ *  POST /sessions/:id/turns runs one (same model routing, tools, sandbox
+ *  and approvals), in a new session unless one is given. */
+function mcpDeps(deps: GatewayDeps): McpDeps {
+  return {
+    async askAgent(agentId, message, sessionId, focus) {
+      let session = sessionId ? await getSession(sessionId) : undefined;
+      if (sessionId && (!session || session.agentId !== agentId)) {
+        throw new Error(`no session ${sessionId} for agent ${agentId}`);
+      }
+      if (!(await getAgentRecord(agentId))) throw new Error(`no agent "${agentId}" — see list_agents`);
+      session ??= await createSession({ agentId, title: "From Claude Code", ...(focus ? { focus } : {}) });
+      const model = (await createModelForAgent(agentId)) ?? deps.model;
+      const result = await runTurn({
+        sessionId: session.id,
+        agentId,
+        userMessage: message,
+        model,
+        worker: deps.worker,
+        skills: deps.skills,
+        enableSubagents: deps.enableSubagents,
+        enableMemoryNominations: deps.enableMemoryNominations,
+        enableArtifacts: deps.enableArtifacts,
+        enableBaseSpace: deps.enableBaseSpace,
+        sandboxPolicy: deps.sandboxPolicy,
+        maxToolHops: deps.maxToolHops,
+      });
+      return { sessionId: session.id, reply: result.finalContent, toolCalled: result.toolCalled };
+    },
+  };
 }
 
 /** Runs one follow-up turn in the session whose tool call was waiting on
@@ -299,6 +386,185 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
 
   if (method === "GET" && segments.length === 1 && segments[0] === "events") {
     handleEventStream(req, res, url);
+    return;
+  }
+
+  // ---- Work handed between agents (core/work.ts). The operator assigns,
+  // cancels, reopens and reassigns; agents do the rest through their tools. ----
+  if (segments[0] === "work") {
+    const send = async (fn: () => Promise<unknown>, ok = 200) => {
+      try {
+        sendJson(res, ok, await fn());
+      } catch (err) {
+        sendJson(res, err instanceof WorkError ? 409 : 500, { error: err instanceof Error ? err.message : String(err) });
+      }
+    };
+    if (method === "GET" && segments.length === 1) {
+      const q = (k: string) => url.searchParams.get(k) ?? undefined;
+      await send(async () => ({ work: await listWork({ assignee: q("assignee"), requestedBy: q("requestedBy"), involving: q("involving"), team: q("team"), status: q("status") as WorkStatus | undefined }) }));
+      return;
+    }
+    if (method === "GET" && segments.length === 2) {
+      const item = await getWork(segments[1]!);
+      if (item) sendJson(res, 200, item);
+      else sendJson(res, 404, { error: `no work item ${segments[1]}` });
+      return;
+    }
+    const body = method === "POST" ? await readRequestBody(req) : {};
+    const text = (k: string) => (typeof body[k] === "string" ? (body[k] as string) : "");
+    if (method === "POST" && segments.length === 1) {
+      const focus = parseFocus(body.focus);
+      if (focus === "invalid") {
+        sendJson(res, 400, { error: 'focus must be {kind: "goal" | "project", id}' });
+        return;
+      }
+      await send(async () => {
+        const item = await createWork({ title: text("title"), detail: text("detail") || undefined, assignee: text("assignee"), requestedBy: OPERATOR, ...(focus ? { focus } : {}) });
+        // {verify: true}: the watchdog checks it once it's finished.
+        if (body.verify === true) await watchWork({ rootIds: [item.id], createdBy: OPERATOR });
+        return item;
+      }, 201);
+      return;
+    }
+    if (method === "POST" && segments.length === 3) {
+      const id = segments[1]!;
+      const action = segments[2];
+      if (action === "cancel") await send(() => cancelWork(id, OPERATOR, text("reason")));
+      else if (action === "reopen") await send(() => reopenWork(id, OPERATOR, text("reason") || "reopened by the operator"));
+      else if (action === "reassign") await send(() => reassignWork(id, OPERATOR, text("to"), text("reason") || "reassigned by the operator"));
+      else if (action === "note") await send(() => noteWork(id, OPERATOR, text("text")));
+      else if (action === "verify") await send(() => watchWork({ rootIds: [id], createdBy: OPERATOR, label: text("label") || undefined }));
+      else sendJson(res, 404, { error: `unknown work action ${action}` });
+      return;
+    }
+  }
+
+  // ---- Team templates (core/team-template.ts): the team as markdown files.
+  // Operator-only, like everything that changes agent config. ----
+  if (segments[0] === "team") {
+    if (method === "GET" && segments.length === 2 && segments[1] === "export") {
+      const files = await exportTeam({ skills: deps.skills });
+      sendJson(res, 200, { files, bundle: bundleTeam(files) });
+      return;
+    }
+    if (method === "POST" && segments.length === 2 && segments[1] === "import") {
+      const body = await readRequestBody(req);
+      const files =
+        typeof body.bundle === "string" ? unbundleTeam(body.bundle)
+        : body.files && typeof body.files === "object" ? (body.files as Record<string, string>)
+        : undefined;
+      if (!files) {
+        sendJson(res, 400, { error: "send {bundle: string} or {files: {path: text}}, and apply: true to apply" });
+        return;
+      }
+      const plan = body.apply === true
+        ? await applyTeamImport(files, { skills: deps.skills, skillsDir: deps.skillsDir })
+        : await planTeamImport(files, { skills: deps.skills });
+      sendJson(res, plan.problems.length && body.apply === true && !plan.applied ? 409 : 200, plan);
+      return;
+    }
+  }
+
+  // ---- Stale work (core/stale.ts): stuck runs and runs that ended badly,
+  // for the operator to look at — nothing is reassigned automatically. ----
+  if (segments[0] === "stale" && method === "GET" && segments.length === 1) {
+    sendJson(res, 200, { stale: await listStaleWork(), quietMinutes: staleRunMs() / 60_000 });
+    return;
+  }
+
+  // ---- Watchdog (core/watchdog.ts): watches and their verdicts. ----
+  if (segments[0] === "watches" && method === "GET" && segments.length === 1) {
+    sendJson(res, 200, { watches: await listWatches(), verifier: verifierId() });
+    return;
+  }
+
+  // ---- Team reviews (core/review.ts, review-loop.ts): what each lead's
+  // review would look at (free — no model call), past reviews, and the
+  // operator's "review now". ----
+  if (segments[0] === "reviews") {
+    if (method === "GET" && segments.length === 1) {
+      const agentId = url.searchParams.get("agentId") ?? undefined;
+      const leads = await listLeads();
+      sendJson(res, 200, { leads: leads.map((l) => l.id), reviews: await listReviews(agentId) });
+      return;
+    }
+    if (method === "GET" && segments.length === 3 && segments[2] === "digest") {
+      sendJson(res, 200, await reviewDigest(segments[1]!));
+      return;
+    }
+    if (method === "POST" && segments.length === 2) {
+      const agentId = segments[1]!;
+      if (!(await getAgentIdentity(agentId))) {
+        sendJson(res, 404, { error: `no agent "${agentId}"` });
+        return;
+      }
+      try {
+        sendJson(res, 200, await runReview(agentId, deps, { trigger: "operator", force: true }));
+      } catch (err) {
+        sendJson(res, err instanceof AgentBlockedError ? 409 : 500, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+  }
+
+  // ---- MCP (mcp.ts) — the OS as tools for Claude Code (the Terminal
+  // panel wires it in) or any other MCP client. ----
+  if (segments.length === 1 && segments[0] === "mcp") {
+    const body = method === "POST" ? await readRequestBody(req) : undefined;
+    await handleMcp(req, res, body, mcpDeps(deps));
+    return;
+  }
+
+  // ---- Terminals (terminal.ts) — interactive Claude Code / shell sessions
+  // BaseSpace shows in its Workbench. Off unless AGENT_OS_TERMINAL=1. ----
+  if (segments[0] === "terminals") {
+    if (method === "GET" && segments.length === 1) {
+      sendJson(res, 200, { enabled: terminalsEnabled(), backend: await ptyBackend(), terminals: terminalsEnabled() ? listTerminals() : [] });
+      return;
+    }
+    if (!terminalsEnabled()) {
+      sendJson(res, 403, { error: "terminals are off — start the gateway with AGENT_OS_TERMINAL=1 to enable them" });
+      return;
+    }
+    const id = segments[1];
+    if (method === "POST" && segments.length === 1) {
+      const body = await readRequestBody(req);
+      try {
+        sendJson(res, 201, await createTerminal(body));
+      } catch (err) {
+        sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+    if (method === "GET" && segments.length === 3 && segments[2] === "stream") {
+      if (!streamTerminal(id, req, res)) sendJson(res, 404, { error: `no terminal ${id}` });
+      return;
+    }
+    if (method === "POST" && segments.length === 3 && segments[2] === "input") {
+      const body = await readRequestBody(req, 64 * 1024);
+      const data = typeof body.data === "string" ? body.data : "";
+      if (writeTerminal(id, data)) sendJson(res, 200, { ok: true });
+      else sendJson(res, 404, { error: `no running terminal ${id}` });
+      return;
+    }
+    if (method === "POST" && segments.length === 3 && segments[2] === "resize") {
+      const body = await readRequestBody(req);
+      if (resizeTerminal(id, body.cols, body.rows)) sendJson(res, 200, { ok: true });
+      else sendJson(res, 404, { error: `no running terminal ${id}` });
+      return;
+    }
+    if (method === "DELETE" && segments.length === 2) {
+      if (closeTerminal(id)) sendJson(res, 200, { ok: true });
+      else sendJson(res, 404, { error: `no terminal ${id}` });
+      return;
+    }
+  }
+
+  // Which model providers this gateway can use, for BaseSpace's agent
+  // editor. An agent's defaultModel can name any of them ("claude-cli:sonnet",
+  // "ollama:llama3.2:3b", ...); see models/real.ts's provider router.
+  if (method === "GET" && segments.length === 1 && segments[0] === "providers") {
+    sendJson(res, 200, { providers: await listProviders(), defaultModel: deps.model.id });
     return;
   }
 
@@ -370,6 +636,48 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
   // worker/metrics from Agent-OS instead of maintaining its own mock
   // roster (see Phase 4 of the architecture plan). ----
   if (segments[0] === "agents") {
+    // ---- Board controls (controls.ts): pause/resume and token budgets.
+    // Operator-only by design — agents get no tool for these. ----
+    if (segments.length === 3 && ["pause", "resume", "budget"].includes(segments[2]!) && (method === "POST" || method === "PUT")) {
+      const agentId = segments[1]!;
+      if (!(await getAgentRecord(agentId))) {
+        sendJson(res, 404, { error: `no such agent: ${agentId}` });
+        return;
+      }
+      const body = await readRequestBody(req);
+      try {
+        if (segments[2] === "pause") await pauseAgent(agentId, { reason: typeof body.reason === "string" ? body.reason : undefined, by: "operator" });
+        else if (segments[2] === "resume") await resumeAgent(agentId, { by: "operator" });
+        else await setAgentBudget(agentId, body);
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+        return;
+      }
+      sendJson(res, 200, await getAgentControlState(agentId));
+      return;
+    }
+    // ---- Config revisions (governance.ts): an agent's name, role,
+    // persona, reporting line, model and budget over time, and "restore
+    // this version". Operator-only, like the budgets it covers. ----
+    if (segments.length >= 3 && segments[2] === "revisions") {
+      const agentId = segments[1]!;
+      if (!(await getAgentRecord(agentId))) {
+        sendJson(res, 404, { error: `no such agent: ${agentId}` });
+        return;
+      }
+      if (method === "GET" && segments.length === 3) {
+        sendJson(res, 200, { revisions: await listAgentRevisions(agentId) });
+        return;
+      }
+      if (method === "POST" && segments.length === 5 && segments[4] === "restore") {
+        try {
+          sendJson(res, 200, { revisions: await restoreAgentRevision(agentId, Number(segments[3])) });
+        } catch (err) {
+          sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
+        }
+        return;
+      }
+    }
     if (method === "GET" && segments.length === 1) {
       sendJson(res, 200, { agents: await listAgentRecords() });
       return;
@@ -401,6 +709,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         role: typeof body.role === "string" ? body.role : undefined,
         capabilities: Array.isArray(body.capabilities) ? body.capabilities.filter((c: unknown) => typeof c === "string") : undefined,
         defaultModel: typeof body.defaultModel === "string" ? body.defaultModel : undefined,
+        reportsTo: typeof body.reportsTo === "string" && body.reportsTo ? body.reportsTo : undefined,
       });
       sendJson(res, 201, agent);
       return;
@@ -413,7 +722,13 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         role: typeof body.role === "string" ? body.role : undefined,
         capabilities: Array.isArray(body.capabilities) ? body.capabilities.filter((c: unknown) => typeof c === "string") : undefined,
         defaultModel: typeof body.defaultModel === "string" ? body.defaultModel : undefined,
-      });
+        // "" or null: reports to the operator directly.
+        reportsTo: body.reportsTo === null || body.reportsTo === "" ? null : typeof body.reportsTo === "string" ? body.reportsTo : undefined,
+      }).catch((err: unknown) => err as Error);
+      if (updated instanceof Error) {
+        sendJson(res, 400, { error: updated.message });
+        return;
+      }
       if (!updated) {
         sendJson(res, 404, { error: `no such agent: ${segments[1]}` });
         return;
@@ -637,10 +952,16 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         sendJson(res, 400, { error: "agentId (string) is required" });
         return;
       }
+      const focus = parseFocus(body.focus);
+      if (focus === "invalid") {
+        sendJson(res, 400, { error: 'focus must be {kind: "goal" | "project", id}' });
+        return;
+      }
       const session = await createSession({
         agentId: body.agentId,
         title: typeof body.title === "string" ? body.title : undefined,
         parentSessionId: typeof body.parentSessionId === "string" ? body.parentSessionId : undefined,
+        ...(focus ? { focus } : {}),
       });
       sendJson(res, 201, session);
       return;
@@ -689,6 +1010,23 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         sendJson(res, 200, session);
       } catch (err) {
         sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+    // What this conversation's work serves — a BaseSpace goal or project;
+    // `{focus: null}` clears it. Each turn then gets the goal chain, linked
+    // notes and open todos (basespace.ts's focusContext).
+    if (method === "PUT" && segments.length === 3 && segments[2] === "focus") {
+      const body = await readRequestBody(req);
+      const focus = body.focus === null ? null : parseFocus(body.focus);
+      if (focus === "invalid" || focus === undefined) {
+        sendJson(res, 400, { error: 'body must be {focus: {kind: "goal" | "project", id}} or {focus: null}' });
+        return;
+      }
+      try {
+        sendJson(res, 200, await setSessionFocus(segments[1]!, focus));
+      } catch (err) {
+        sendJson(res, 404, { error: err instanceof Error ? err.message : String(err) });
       }
       return;
     }
@@ -791,10 +1129,17 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         sendJson(res, 400, { error: "steps (array of {id, agentId, goal, dependsOn?, retries?}) is required" });
         return;
       }
+      const focus = parseFocus(body.focus);
+      if (focus === "invalid") {
+        sendJson(res, 400, { error: 'focus must be {kind: "goal" | "project", id}' });
+        return;
+      }
       const flow = await createFlow(
         "managed",
         steps.map((s) => ({ id: s.id, dependsOn: s.dependsOn ?? [] })),
       );
+      // What the flow serves: every step's session is focused on it.
+      if (focus) await setFlowFocus(flow.id, focus);
       // Fire-and-forget: a Flow can run many real model turns across many
       // steps, potentially minutes — the HTTP response returns the
       // CREATED Flow immediately (201) rather than blocking on the whole
@@ -810,6 +1155,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         enableSubagents: deps.enableSubagents,
         enableMemoryNominations: deps.enableMemoryNominations,
         enableArtifacts: deps.enableArtifacts,
+        enableBaseSpace: deps.enableBaseSpace,
         sandboxPolicy: deps.sandboxPolicy,
       }).catch((err) => {
         console.error(`[gateway] flow ${flow.id} driving failed:`, err instanceof Error ? err.message : err);
@@ -837,6 +1183,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         enableSubagents: deps.enableSubagents,
         enableMemoryNominations: deps.enableMemoryNominations,
         enableArtifacts: deps.enableArtifacts,
+        enableBaseSpace: deps.enableBaseSpace,
         sandboxPolicy: deps.sandboxPolicy,
       }).catch((err) => {
         console.error(`[gateway] flow ${flow.id} resume failed:`, err instanceof Error ? err.message : err);

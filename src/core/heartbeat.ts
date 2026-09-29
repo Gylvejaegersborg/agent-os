@@ -20,6 +20,7 @@
 // where the agent needs to remember what it saw last time (hence full
 // session context) but doesn't need split-second timing.
 
+import { agentIsBlocked } from "./controls.js";
 import { appendEvent } from "./eventlog.js";
 import { runTurn, newSessionId } from "./agent-loop.js";
 import type { ModelAdapter } from "./model.js";
@@ -120,6 +121,13 @@ export function startHeartbeat(config: Omit<HeartbeatConfig, "sessionId"> & { se
     timer = setTimeout(async () => {
       if (stopped) return;
       try {
+        // Paused or over budget (controls.ts): skip this tick rather than
+        // fill the main session with refusals; keep ticking so it picks up
+        // again once resumed or the budget period rolls over.
+        if (await agentIsBlocked(config.agentId)) {
+          scheduleNext();
+          return;
+        }
         const result = await runHeartbeatTick({ ...config, sessionId });
         console.log(`[heartbeat] ticked session ${sessionId}: "${result.finalContent.slice(0, 80)}"`);
       } catch (err) {

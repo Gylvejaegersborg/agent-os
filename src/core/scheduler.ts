@@ -24,6 +24,7 @@
 // mechanism since there's no natural "minute" to key on for an arbitrary
 // external trigger — each matching event/webhook call fires again.
 
+import { agentIsBlocked } from "./controls.js";
 import { project, appendEvent } from "./eventlog.js";
 import { createTask, transitionTask } from "./tasks.js";
 import { runTurn, newSessionId } from "./agent-loop.js";
@@ -192,6 +193,9 @@ export async function runSchedulerTick(deps: SchedulerDeps, now: Date = new Date
     if (!cronMatches(automation.trigger.expr, now)) continue;
     if (firedMinutes.get(automation.id) === minuteKey(now)) continue; // already fired this minute
 
+    // A paused or over-budget agent's automations are skipped (controls.ts).
+    if (await agentIsBlocked(automation.agentId)) continue;
+
     results.push(await fireAutomation(automation, deps, now));
   }
 
@@ -219,6 +223,9 @@ export async function fireEventAutomations(
     if (automation.trigger.eventType !== eventType) continue;
     const filter = automation.trigger.filter;
     if (filter && !Object.entries(filter).every(([k, v]) => payload[k] === v)) continue;
+
+    // A paused or over-budget agent's automations are skipped (controls.ts).
+    if (await agentIsBlocked(automation.agentId)) continue;
 
     results.push(await fireAutomation(automation, deps, now));
   }
@@ -262,6 +269,9 @@ export async function fireWebhookAutomations(
     if (!automation.enabled) continue;
     if (automation.trigger.kind !== "webhook") continue;
     if (automation.trigger.path !== requestPath) continue;
+
+    // A paused or over-budget agent's automations are skipped (controls.ts).
+    if (await agentIsBlocked(automation.agentId)) continue;
 
     results.push(await fireAutomation(automation, deps, now));
   }

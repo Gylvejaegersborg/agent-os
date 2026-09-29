@@ -25,6 +25,10 @@ export interface AgentIdentity {
    *  so a client can show "what is this agent for" without guessing from
    *  its persona text. */
   capabilities?: string[];
+  /** Who this agent reports to (an agent id); absent = the operator. Where
+   *  hand-backs go (work.ts) and what `orgContext()` tells the agent.
+   *  Organizational, like Paperclip's org chart — not access control. */
+  reportsTo?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -37,6 +41,7 @@ export async function registerAgentIdentity(input: {
   persona: string;
   role?: string;
   capabilities?: string[];
+  reportsTo?: string;
 }): Promise<AgentIdentity> {
   await appendEvent(IDENTITY_STREAM, "agent.identity.registered", input);
   const identity = await getAgentIdentity(input.id);
@@ -53,8 +58,16 @@ export async function registerAgentIdentity(input: {
  *  refuses to conjure a record that was never created. */
 export async function updateAgentIdentity(
   id: string,
-  patch: Partial<Pick<AgentIdentity, "name" | "persona" | "role" | "capabilities">>,
+  patch: Partial<Pick<AgentIdentity, "name" | "persona" | "role" | "capabilities">> & { reportsTo?: string | null },
 ): Promise<AgentIdentity | undefined> {
+  if (patch.reportsTo !== undefined && patch.reportsTo !== null) {
+    // No self-reporting and no cycles (A → B → A).
+    const all = await projectIdentities();
+    if (!all.has(patch.reportsTo)) throw new Error(`no agent "${patch.reportsTo}" to report to`);
+    for (let cur: string | undefined = patch.reportsTo, hops = 0; cur; cur = all.get(cur)?.reportsTo, hops++) {
+      if (cur === id || hops > all.size) throw new Error(`${id} can't report to ${patch.reportsTo} — that makes a loop`);
+    }
+  }
   await appendEvent(IDENTITY_STREAM, "agent.identity.updated", { id, ...patch });
   return getAgentIdentity(id);
 }
@@ -69,6 +82,7 @@ async function projectIdentities(): Promise<Map<string, AgentIdentity>> {
         persona: p.persona,
         role: p.role,
         capabilities: p.capabilities,
+        ...(p.reportsTo ? { reportsTo: p.reportsTo } : {}),
         createdAt: event.timestamp,
         updatedAt: event.timestamp,
       });
@@ -76,7 +90,10 @@ async function projectIdentities(): Promise<Map<string, AgentIdentity>> {
       const p = event.payload as any;
       const existing = state.get(p.id);
       if (existing) {
-        state.set(p.id, { ...existing, ...p, updatedAt: event.timestamp });
+        const next: AgentIdentity = { ...existing, ...p, updatedAt: event.timestamp };
+        // reportsTo: null means "the operator" — drop the field.
+        if (p.reportsTo === null) delete next.reportsTo;
+        state.set(p.id, next);
       }
     }
     return state;
