@@ -143,7 +143,9 @@ async function testTurnsAndContinuity(): Promise<void> {
   await addOverlayItem("todo", { title: "Book the photographer" }, "nyx", focus);
   await addOverlayItem("todo", { title: "Plan the rollout" }, "hemera", { kind: "goal", id: "g-switch" });
   await addOverlayItem("project-update", { text: "Master booked" }, "hemera", focus);
+  await addOverlayItem("note", { title: "Orphan focus", body: "x" }, "nyx", { kind: "goal", id: "g-gone" });
   const o = await loadOverlay();
+  assert(!(o.notes.find((n: any) => n.title === "Orphan focus") as any).body.includes("[["), "a focus BaseSpace doesn't know isn't written as a dead [[id]] link");
   const note = o.notes.find((n: any) => n.title === "Cover brief") as any;
   assert(note?.body.endsWith("Serves: [[Switch release]]"), "a note added in a focused session links the project by name");
   assert(((o.notes.find((n: any) => n.title === "Already linked") as any).body.match(/\[\[Switch release\]\]/g) ?? []).length === 1, "a note that already links it isn't linked twice");

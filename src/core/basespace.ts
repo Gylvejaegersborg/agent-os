@@ -234,7 +234,9 @@ export async function focusContext(focus: SessionFocus | undefined): Promise<str
 async function focusLinks(focus: SessionFocus | undefined): Promise<{ wikiName?: string; projectId?: string; goalId?: string }> {
   if (!focus) return {};
   const snap = (await loadSnapshot()) ?? {};
-  const wikiName = nameOf(snap, focus.kind, focus.id);
+  // Only link by a name BaseSpace knows: an id in [[…]] would be a dead link.
+  const found = nameOf(snap, focus.kind, focus.id);
+  const wikiName = found === focus.id ? undefined : found;
   return focus.kind === "project" ? { wikiName, projectId: focus.id } : { wikiName, goalId: focus.id };
 }
 
