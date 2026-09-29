@@ -388,7 +388,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
     };
     if (method === "GET" && segments.length === 1) {
       const q = (k: string) => url.searchParams.get(k) ?? undefined;
-      await send(async () => ({ work: await listWork({ assignee: q("assignee"), requestedBy: q("requestedBy"), involving: q("involving"), status: q("status") as WorkStatus | undefined }) }));
+      await send(async () => ({ work: await listWork({ assignee: q("assignee"), requestedBy: q("requestedBy"), involving: q("involving"), team: q("team"), status: q("status") as WorkStatus | undefined }) }));
       return;
     }
     if (method === "GET" && segments.length === 2) {

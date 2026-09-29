@@ -34,6 +34,10 @@ export interface ReviewItem {
   /** Why it's listed: the blocked reason, the hand-back reason, or how long it's been quiet. */
   why: string;
   goal?: string;
+  /** Who asked, and what they asked for (trimmed) — so the lead can decide
+   *  without looking it up. */
+  requestedBy: string;
+  detail?: string;
 }
 
 export interface ReviewDigest {
@@ -122,7 +126,16 @@ export async function reviewDigest(agentId: string, now = Date.now()): Promise<R
   };
   const item = (w: WorkView, why: string): ReviewItem => {
     const goal = goalOf(w);
-    return { id: w.id, title: w.title, assignee: w.assignee, status: w.status, why, ...(goal ? { goal } : {}) };
+    return {
+      id: w.id,
+      title: w.title,
+      assignee: w.assignee,
+      status: w.status,
+      why,
+      requestedBy: w.requestedBy,
+      ...(goal ? { goal } : {}),
+      ...(w.detail ? { detail: w.detail.length > 280 ? `${w.detail.slice(0, 280)}…` : w.detail } : {}),
+    };
   };
 
   // The lead's team work: what its reports are doing, and what it asked for.
@@ -178,7 +191,10 @@ export async function reviewDigest(agentId: string, now = Date.now()): Promise<R
 
 /** The review turn's message: the digest, compact, plus what to do with it. */
 export function renderReviewPrompt(d: ReviewDigest): string {
-  const line = (i: ReviewItem, who = true) => `- ${i.id} "${i.title}"${who ? ` (${i.assignee})` : ""}${i.goal ? ` for ${i.goal}` : ""}: ${i.why}`;
+  const asker = (id: string) => (id === "operator" ? "the operator" : id);
+  const line = (i: ReviewItem, who = true) =>
+    `- ${i.id} "${i.title}"${who ? ` (${i.assignee})` : ""}, asked by ${asker(i.requestedBy)}${i.goal ? `, for ${i.goal}` : ""}: ${i.why}` +
+    (i.detail ? `\n  The ask: ${i.detail}` : "");
   const parts = [
     d.attention
       ? `[Review] Team review: ${d.attention} item${d.attention === 1 ? "" : "s"} need${d.attention === 1 ? "s" : ""} you.`
@@ -191,7 +207,8 @@ export function renderReviewPrompt(d: ReviewDigest): string {
   if (d.doneSinceLastReview.length) parts.push(`Finished since your last review: ${d.doneSinceLastReview.map((i) => `"${i.title}" (${i.assignee})`).join(", ")}`);
   if (d.idleGoals.length) parts.push(`Active goals with no work on them: ${d.idleGoals.map((g) => `"${g}"`).join(", ")}`);
   parts.push(
-    "For each item that needs you, pick one: reopen it with guidance (`work` reopen {id, text}); give it to a better-placed teammate " +
+    "Decide from what's above — it's everything the item says. Look something up only if an item names a specific thing you must check, " +
+      "and then once. For each item that needs you, pick one: reopen it with guidance (`work` reopen {id, text}); give it to a better-placed teammate " +
       "(`work` reassign {id, to, text}); split or redo it (`delegate`); or, when only the operator can decide (money, publishing, " +
       "a missing asset, a change of plan), escalate it (`work` escalate {id, text}). Don't cancel work unless it's truly moot. " +
       "Then answer with a two-line summary for the operator: what you did, and what needs them.",

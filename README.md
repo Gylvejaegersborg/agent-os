@@ -470,12 +470,47 @@ not chat messages — Paperclip's model:
   tool steps (`AgentTurnResult.stopReason`) — leaves it blocked with why. The
   outcome is posted into the requester's thread as a `[Work]` note; no turn
   runs on the requester's side, so agents can't ping-pong.
-- **HTTP**: `GET /work?assignee=&requestedBy=&involving=&status=`, `GET
-  /work/:id`, `POST /work {assignee, title, detail?, focus?}` (as the
-  operator), `POST /work/:id/cancel|reopen|reassign|note`. **MCP**:
-  `assign_work`, `list_work`.
+- **HTTP**: `GET /work?assignee=&requestedBy=&involving=&team=&status=`
+  (`team`: a lead's own work plus its reports'), `GET /work/:id`, `POST /work
+  {assignee, title, detail?, focus?}` (as the operator), `POST
+  /work/:id/cancel|reopen|reassign|note`. **MCP**: `assign_work`, `list_work`.
 
 `npm run test-work` covers it; it was also run live on the Claude CLI.
+
+### Team review — leads manage their team's work
+
+A lead (any agent with reports; Hemera by default) reviews its team's work
+(`core/review.ts`, run by `gateway/review-loop.ts`), after Paperclip's
+heartbeat.
+
+- **The digest is plain code, with no model call**: its reports' blocked
+  work, work handed back to it, and work with no movement for
+  `AGENT_OS_STALE_HOURS` (default 24). Each item carries who asked and what for,
+  so the lead decides from the digest instead of searching for context.
+- **A model turn only when needed**: something needs attention *and* it
+  differs from what the lead saw at its last review. An unchanged team costs
+  nothing.
+- **The lead acts through `work`**: `reopen {id, text}` with guidance,
+  `reassign {id, to, text}`, `escalate {id, text}` to the operator (the item
+  shows as "needs you" until it moves), or `delegate`. Only the requester,
+  the assignee's manager or the operator may do these; an assignee still
+  can't cancel. A review turn offers only `work`, `delegate` and `basespace`,
+  with two tool steps per item.
+- **When**: every `AGENT_OS_REVIEW_INTERVAL_MIN` (240), and
+  `AGENT_OS_REVIEW_DEBOUNCE_MIN` (10) after work is blocked or handed back.
+  At most `AGENT_OS_REVIEW_MAX_PER_DAY` (6) automatic reviews per lead;
+  paused or over-budget leads are skipped. Each lead reviews in one
+  long-lived "Team review" thread. Off with `AGENT_OS_REVIEW=off`.
+- **HTTP**: `GET /reviews?agentId=` (leads, past reviews with tokens and
+  summary), `GET /reviews/:id/digest` (free), `POST /reviews/:id` (review
+  now, even if nothing changed).
+
+Live on `claude-cli:haiku`: Nyx blocked on a cover-photo pick (no access to
+the shoot files). Hemera's first review browsed BaseSpace for all 8 steps
+and never acted (64k tokens). With the digest carrying the ask, the focused
+tool set and step limit, the next review escalated it to the operator in one
+call (12k tokens), naming exactly what was missing. `npm run test-review`
+covers the rules.
 
 ## Board controls — pause, resume, budgets
 

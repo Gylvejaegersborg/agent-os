@@ -18,7 +18,7 @@ import { fireHook } from "./hooks.js";
 import { generateId } from "./id.js";
 import { SkillRegistry, renderSkillCatalog } from "./skills.js";
 import { retrieveMemoryContext } from "./memory.js";
-import { getAgentIdentity } from "./identity.js";
+import { getAgentIdentity, listAgentIdentities } from "./identity.js";
 import { ensureSession, isSessionCancelled, getSession } from "./session.js";
 import { getToolDefinition, listToolDefinitions, toToolSpec, toolVisibleTo, withTimeout } from "./tool-registry.js";
 import type { ArtifactType } from "./artifacts.js";
@@ -103,6 +103,10 @@ export interface RunTurnOptions {
    *  message — on for the live gateway, off by default so a bare runTurn()
    *  keeps producing exactly the system message it always did. */
   enableBaseSpace?: boolean;
+  /** Offer only these tools this turn (still subject to what's enabled and
+   *  visible) — for turns with one job, like a lead's team review, where
+   *  every other tool is prompt weight and a detour. */
+  onlyTools?: string[];
   /** When provided, read_file/edit_file/write_file (and, independently,
    *  createSandboxedWorker-wrapped shell calls — see worker.ts) are
    *  confined to this policy's workspace roots via permissions.ts's
@@ -568,8 +572,12 @@ async function dispatchTool(
         const active = (w: { status: string }) => w.status === "open" || w.status === "in_progress" || w.status === "blocked";
         const mine = (await listWork({ assignee: ctx.agentId })).filter(active);
         const asked = (await listWork({ requestedBy: ctx.agentId })).filter((w) => active(w) || w.status === "done").slice(0, 10);
+        // A lead also sees what its reports are doing, whoever asked for it.
+        const reports = (await listAgentIdentities()).filter((a) => a.reportsTo === ctx.agentId).map((a) => a.id);
+        const team = (await listWork()).filter((w) => active(w) && reports.includes(w.assignee) && w.requestedBy !== ctx.agentId);
         const line = (w: WorkView) => `- ${w.id}: "${w.title}" — ${w.status}${w.assignee !== ctx.agentId ? ` (${w.assignee})` : ` (from ${w.requestedBy})`}${w.result ? ` → ${w.result.slice(0, 160)}` : ""}${w.blockedReason ? ` — ${w.blockedReason}` : ""}`;
-        return { ok: true, output: `Assigned to you:\n${mine.map(line).join("\n") || "- nothing"}\n\nYou asked for:\n${asked.map(line).join("\n") || "- nothing"}` };
+        const teamText = reports.length ? `\n\nYour reports' other work:\n${team.map(line).join("\n") || "- nothing"}` : "";
+        return { ok: true, output: `Assigned to you:\n${mine.map(line).join("\n") || "- nothing"}\n\nYou asked for:\n${asked.map(line).join("\n") || "- nothing"}${teamText}` };
       }
       const id = typeof toolCall.args.id === "string" && toolCall.args.id ? toolCall.args.id : (await workForSession(ctx.sessionId))?.id;
       if (!id) return { ok: false, output: "", error: "which work item? pass id (see action list)" };
@@ -702,7 +710,9 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // Reporting lines and open work (work.ts) — only for agents on the
   // operator's team (the same flag that turns on BaseSpace).
   const orgText = enableBaseSpace ? await orgContext(agentId) : "";
-  const tools = offeredTools(agentId, { skills, enableSubagents, enableMemoryNominations, enableArtifacts, enableBaseSpace });
+  const tools = offeredTools(agentId, { skills, enableSubagents, enableMemoryNominations, enableArtifacts, enableBaseSpace }).filter(
+    (t) => !opts.onlyTools || opts.onlyTools.includes(t.name),
+  );
   const offered = new Set(tools.map((t) => t.name));
 
   // Checked once per turn, BEFORE the hop loop builds its first set of
@@ -741,14 +751,14 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
         "will be blocked outright by the harness regardless of anything else — this is not a suggestion you can reason your way around. Investigate, " +
         "then describe the concrete plan (what you'd read/change/run and why) for the operator to review; they'll turn plan mode off to actually execute it."
       : "";
-    const catalogText = skills ? renderSkillCatalog(skills.listMetadata()) : "";
-    const subagentText = enableSubagents
+    const catalogText = skills && offered.has("skill") ? renderSkillCatalog(skills.listMetadata()) : "";
+    const subagentText = enableSubagents && offered.has("subagent")
       ? "You can delegate a focused sub-task to an isolated subagent by calling the `subagent` tool with {goal}. The subagent runs independently and only its final result returns to you — its own reasoning and tool calls stay isolated."
       : "";
-    const nominationText = enableMemoryNominations
+    const nominationText = enableMemoryNominations && offered.has("nominate-memory")
       ? "You can propose something worth remembering long-term by calling the `nominate-memory` tool with {content, kind}. This does NOT write to memory directly — it creates a pending nomination that a human must explicitly approve before it can ever influence curated memory."
       : "";
-    const artifactText = enableArtifacts
+    const artifactText = enableArtifacts && offered.has("record-artifact")
       ? "When you produce a real output worth attaching to this task (a file you wrote, a report, a plan), call the `record-artifact` tool with {type, location, description?} to register it. This does not create the content itself — produce it first (e.g. via the shell tool), then record where it lives."
       : "";
     const baseSpaceText = !enableBaseSpace

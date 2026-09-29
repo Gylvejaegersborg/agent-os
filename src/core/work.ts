@@ -137,11 +137,17 @@ export async function getWork(id: string): Promise<WorkView | undefined> {
   return toViews(await projectWork()).find((w) => w.id === id);
 }
 
-export async function listWork(filter: { assignee?: string; requestedBy?: string; status?: WorkStatus; involving?: string } = {}): Promise<WorkView[]> {
+export async function listWork(filter: { assignee?: string; requestedBy?: string; status?: WorkStatus; involving?: string; team?: string } = {}): Promise<WorkView[]> {
   let list = toViews(await projectWork());
   if (filter.assignee) list = list.filter((w) => w.assignee === filter.assignee);
   if (filter.requestedBy) list = list.filter((w) => w.requestedBy === filter.requestedBy);
   if (filter.involving) list = list.filter((w) => w.assignee === filter.involving || w.requestedBy === filter.involving);
+  if (filter.team) {
+    // What a lead oversees: its own work plus its reports', whoever asked.
+    const lead = filter.team;
+    const reports = new Set((await listAgentIdentities()).filter((a) => a.reportsTo === lead).map((a) => a.id));
+    list = list.filter((w) => w.assignee === lead || w.requestedBy === lead || reports.has(w.assignee));
+  }
   if (filter.status) list = list.filter((w) => w.status === filter.status);
   return list.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }

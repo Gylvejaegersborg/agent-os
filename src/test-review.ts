@@ -36,6 +36,7 @@ import {
   reviewDigest,
   seedDefaultAgents,
   type ModelAdapter,
+  type ModelCallOptions,
   type ModelMessage,
   type ModelResponse,
 } from "./core/index.js";
@@ -61,13 +62,15 @@ async function throwsWith(p: Promise<unknown>, re: RegExp): Promise<boolean> {
 }
 
 const prompts: string[] = [];
+const reviewTools: string[][] = [];
 let act = true;
 /** A review prompt: reopen the first blocked item with guidance, then sum
  *  up. With `act` off it only answers. */
 const scripted: ModelAdapter = {
   id: "scripted",
-  async complete(messages: ModelMessage[]): Promise<ModelResponse> {
+  async complete(messages: ModelMessage[], callOpts?: ModelCallOptions): Promise<ModelResponse> {
     const usage = { inputTokens: 10, outputTokens: 5 };
+    if (messages.some((m) => m.role === "user" && m.content.startsWith("[Review]"))) reviewTools.push((callOpts?.tools ?? []).map((t) => t.name));
     const last = messages[messages.length - 1]!;
     if (last.role === "tool") return { content: "Reopened the caption job with a brief. Nothing needs you.", usage };
     if (last.content.startsWith("[Review]")) {
@@ -86,7 +89,7 @@ async function testDigestAndRules(): Promise<void> {
   const empty = await reviewDigest("hemera");
   assert(empty.reports.includes("nyx") && empty.attention === 0 && empty.fingerprint === "", "a quiet team needs no attention");
 
-  const captions = await createWork({ title: "Captions", assignee: "nyx", requestedBy: "hemera" });
+  const captions = await createWork({ title: "Captions", detail: "Three options for the teaser, lowercase.", assignee: "nyx", requestedBy: "hemera" });
   await claimWork(captions.id, "nyx", "s-1");
   await blockWork(captions.id, "nyx", "no brief");
   const mix = await createWork({ title: "Mix notes", assignee: "aether", requestedBy: OPERATOR });
@@ -122,7 +125,8 @@ async function testRunner(): Promise<void> {
   // Only the blocked caption job is left needing attention.
   const first = await runReview("hemera", deps);
   assert(first.ran === true, "a review runs when something needs attention");
-  assert(prompts.length === 1 && /Blocked:\n- \S+ "Captions" \(nyx\): no brief/.test(prompts[0]!), "the lead's prompt is the digest");
+  assert(prompts.length === 1 && /Blocked:\n- \S+ "Captions" \(nyx\), asked by hemera: no brief\n  The ask: Three options/.test(prompts[0]!), "the lead's prompt is the digest, with who asked and what for");
+  assert(reviewTools.length > 0 && reviewTools.every((t) => t.sort().join() === "basespace,delegate,work"), "a review turn is offered only work, delegate and basespace");
   const captions = (await listReviews("hemera"))[0]!;
   const reopened = (await listWork({ assignee: "nyx" })).find((w) => w.title === "Captions")!;
   assert(reopened.status === "open" && reopened.notes.at(-1)?.text === "reopened: Use the Switch brief in Notes.", "the lead reopened it with guidance through the work tool");
@@ -165,6 +169,28 @@ async function testRunner(): Promise<void> {
   }
 }
 
+async function testLeadWorkList(): Promise<void> {
+  const { runTurn, createSession } = await import("./core/index.js");
+  let output = "";
+  const lister: ModelAdapter = {
+    id: "lister",
+    async complete(messages: ModelMessage[]): Promise<ModelResponse> {
+      const last = messages[messages.length - 1]!;
+      if (last.role === "tool") {
+        output = last.content;
+        return { content: "done" };
+      }
+      return { content: "", toolCall: { name: "work", args: { action: "list" } } };
+    },
+  };
+  const s = await createSession({ agentId: "hemera" });
+  await createWork({ title: "Operator's own ask of Theia", assignee: "theia", requestedBy: OPERATOR });
+  await runTurn({ sessionId: s.id, agentId: "hemera", userMessage: "what's my team doing?", model: lister, worker: createStubWorker(), enableBaseSpace: true });
+  assert(/Your reports' other work:[\s\S]*Operator's own ask of Theia/.test(output), "a lead's `work list` includes its reports' work, whoever asked");
+  const team = await listWork({ team: "hemera" });
+  assert(team.some((w) => w.title === "Operator's own ask of Theia") && !(await listWork({ team: "nyx" })).some((w) => w.title === "Operator's own ask of Theia"), "listWork({team}) is a lead's own work plus its reports'");
+}
+
 async function testRoutes(): Promise<void> {
   const gateway = await startGateway({ model: scripted, worker: createStubWorker(), enableBaseSpace: true });
   const base = `http://127.0.0.1:${gateway.port}`;
@@ -185,6 +211,7 @@ async function testRoutes(): Promise<void> {
 async function main(): Promise<void> {
   await testDigestAndRules();
   await testRunner();
+  await testLeadWorkList();
   await testRoutes();
   if (process.exitCode === 1) console.error("\nSome review tests FAILED.");
   else console.log("\nAll review tests passed.");

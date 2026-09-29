@@ -394,10 +394,13 @@ Ordered so each step is safe before the next adds autonomy:
       routes, MCP `assign_work`/`list_work`; **[UI]** Work in the Tasks
       panel (assign, retry, reassign, cancel), Reports-to in the agent
       editor, reporting lines in Teams.
-- [ ] **Heartbeat work loop.** On each heartbeat a lead (Hemera) reviews
-      open and blocked work for her reports and the goals they serve, and
-      re-plans or escalates — the runner already works items as they
-      arrive, so this is the management layer on top. **[core]**
+- [x] **Heartbeat work loop → team review.** A lead reviews its reports'
+      blocked, handed-back and quiet work, and reopens with guidance,
+      reassigns, escalates to the operator, or delegates. The digest is code
+      (no model call); a turn only runs when something needs attention and
+      changed since the last review, with a per-day cap. Escalated items
+      show as "needs you" in BaseSpace. **[core]** **[gateway]** **[UI]**
+      `review.ts`, `review-loop.ts`.
 - [ ] **Governance gates.** Agent-proposed hires (a new agent) and a lead's
       plan for a goal go to the approval queue before anything runs.
       Agent config changes (persona, model, budget) are revisioned with
@@ -408,9 +411,10 @@ Ordered so each step is safe before the next adds autonomy:
       the claims against the evidence and either accepts or re-opens with a
       reason. Paperclip's rule: report problems, don't silently fix them.
       **[core]**
-- [ ] **Stale-work visibility.** Surface tasks running with no recent
-      activity on a dashboard instead of auto-reassigning them (tasks.ts's
-      `reconcileLostTasks()` already detects some). **[UI]**
+- [ ] **Stale-work visibility.** Work items with no movement for a day
+      now show as "quiet" on the Team review card (and go to the lead's
+      review). Still to do: runtime tasks (tasks.ts's
+      `reconcileLostTasks()`) on the same dashboard. **[UI]**
 - [ ] **Team templates.** Export/import a team (agents, personas, skills,
       budgets, reporting lines) as markdown files, like Paperclip's
       `COMPANY.md`/`TEAM.md`/`AGENTS.md` package, with secrets stripped.

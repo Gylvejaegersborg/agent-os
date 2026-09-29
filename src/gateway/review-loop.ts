@@ -88,8 +88,10 @@ export async function runReview(agentId: string, deps: ReviewDeps, opts: { trigg
       skills: deps.skills,
       sandboxPolicy: deps.sandboxPolicy,
       enableBaseSpace: true,
-      // Room to act on several items in one review.
-      maxToolHops: 8,
+      // A review has one job: act on the items. Only the tools for that,
+      // and two steps per item (plus one look) — enough to act, not browse.
+      onlyTools: ["work", "delegate", "basespace"],
+      maxToolHops: Math.min(8, Math.max(digest.attention, 1) * 2 + 1),
     });
     const record: Omit<ReviewRecord, "at"> = {
       agentId,
