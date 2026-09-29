@@ -23,6 +23,43 @@ export type { ToolSpec } from "../model.js";
  *  one, so real models were never told any tool existed and every tool
  *  call path only ran against the stub model. Read at call time, so tools
  *  registered after the adapter was created are included. */
+/** A tool call's arguments as the model sent them. Local models sometimes
+ *  send valid JSON followed by more (the object twice, a stray word), or
+ *  nothing usable; a bare JSON.parse on that threw and killed the whole turn
+ *  with a 500 (seen live with llama3.2 on Ollama). The first complete object
+ *  is used instead, and anything unusable becomes {} — the tool then answers
+ *  "needs a 'query'" and the model can fix it, which a crashed turn can't. */
+export function parseToolArgs(text: string | undefined): Record<string, unknown> {
+  const raw = (text ?? "").trim() || "{}";
+  const asObject = (v: unknown): Record<string, unknown> => (v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {});
+  try {
+    return asObject(JSON.parse(raw));
+  } catch {
+    /* fall through to the first balanced object */
+  }
+  const start = raw.indexOf("{");
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; start !== -1 && i < raw.length; i++) {
+    const c = raw[i]!;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === "\\") escaped = true;
+      else if (c === '"') inString = false;
+    } else if (c === '"') inString = true;
+    else if (c === "{") depth++;
+    else if (c === "}" && --depth === 0) {
+      try {
+        return asObject(JSON.parse(raw.slice(start, i + 1)));
+      } catch {
+        return {};
+      }
+    }
+  }
+  return {};
+}
+
 export function registryToolSpecs(): ToolSpec[] {
   return listToolDefinitions().map(toToolSpec);
 }
@@ -217,11 +254,7 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
               toolJson += parsed.delta.partial_json ?? "";
             }
           } else if (parsed.type === "content_block_stop" && toolName) {
-            try {
-              toolCall = { name: toolName, args: JSON.parse(toolJson || "{}") };
-            } catch {
-              toolCall = { name: toolName, args: {} };
-            }
+            toolCall = { name: toolName, args: parseToolArgs(toolJson) };
             toolName = undefined;
           } else if (parsed.type === "message_delta") {
             if (typeof parsed.usage?.output_tokens === "number") outputTokens = parsed.usage.output_tokens;
@@ -282,7 +315,7 @@ export function createOpenAiModel(opts: OpenAiOptions): ModelAdapter {
       return {
         content: choice?.content ?? "",
         ...(toolCall
-          ? { toolCall: { name: toolCall.function.name, args: JSON.parse(toolCall.function.arguments || "{}") } }
+          ? { toolCall: { name: toolCall.function.name, args: parseToolArgs(toolCall.function.arguments) } }
           : {}),
         ...(usage ? { usage } : {}),
       };
@@ -400,7 +433,7 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
       return {
         content: choice?.content ?? "",
         ...(toolCall
-          ? { toolCall: { name: toolCall.function.name, args: JSON.parse(toolCall.function.arguments || "{}") } }
+          ? { toolCall: { name: toolCall.function.name, args: parseToolArgs(toolCall.function.arguments) } }
           : {}),
         ...(usage ? { usage } : {}),
       };
@@ -490,7 +523,7 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
         }
       }
 
-      const toolCall = toolName ? { name: toolName, args: JSON.parse(toolArgs || "{}") } : undefined;
+      const toolCall = toolName ? { name: toolName, args: parseToolArgs(toolArgs) } : undefined;
       const usage = inputTokens || outputTokens ? { inputTokens, outputTokens } : undefined;
       return { content: accumulated, ...(toolCall ? { toolCall } : {}), ...(usage ? { usage } : {}) };
     },
