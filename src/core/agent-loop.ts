@@ -7,6 +7,7 @@
 import { blockWork, cancelWork, completeWork, createWork, escalateWork, handBackWork, listWork, noteWork, reassignWork, reopenWork, orgContext, recordWorkUsage, workForSession, type WorkView } from "./work.js";
 import { AgentBlockedError, assertAgentMayRun, getAgentControlState, recordAgentUsage } from "./controls.js";
 import { GATED_TOOLS, adoptPlan, checkProposal, gateToolCall, hireAgent } from "./governance.js";
+import { watchWork } from "./watchdog.js";
 import { hindsightConfigured, hindsightRecall, hindsightReflect, hindsightRetain } from "./hindsight.js";
 import { addOverlayItem, focusContext, readSnapshotSection, type OverlayKind } from "./basespace.js";
 import * as fs from "node:fs/promises";
@@ -566,9 +567,10 @@ async function dispatchTool(
         parentId: current?.id,
         focus: (await getSession(ctx.sessionId))?.focus,
       });
+      const watched = toolCall.args.verify === true ? await watchWork({ rootIds: [item.id], createdBy: ctx.agentId, originSessionId: ctx.sessionId }) : undefined;
       const control = await getAgentControlState(item.assignee);
       const waiting = control.blocked ? ` Note: ${item.assignee} is ${control.blocked === "paused" ? "paused" : "over budget"}, so it waits until that lifts.` : "";
-      return { ok: true, output: `Handed "${item.title}" to ${item.assignee} as work item ${item.id}. It runs in the background; the result will be posted back in this conversation.${waiting}` };
+      return { ok: true, output: `Handed "${item.title}" to ${item.assignee} as work item ${item.id}. It runs in the background; the result will be posted back in this conversation.${watched ? ` ${watched.verifier} verifies it when it's finished.` : ""}${waiting}` };
     } catch (err) {
       return { ok: false, output: "", error: err instanceof Error ? err.message : String(err) };
     }

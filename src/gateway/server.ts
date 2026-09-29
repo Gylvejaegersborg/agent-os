@@ -58,6 +58,9 @@ import {
   reassignWork,
   reopenWork,
   listLeads,
+  listWatches,
+  verifierId,
+  watchWork,
   listAgentRevisions,
   restoreAgentRevision,
   getAgentIdentity,
@@ -407,7 +410,12 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         sendJson(res, 400, { error: 'focus must be {kind: "goal" | "project", id}' });
         return;
       }
-      await send(() => createWork({ title: text("title"), detail: text("detail") || undefined, assignee: text("assignee"), requestedBy: OPERATOR, ...(focus ? { focus } : {}) }), 201);
+      await send(async () => {
+        const item = await createWork({ title: text("title"), detail: text("detail") || undefined, assignee: text("assignee"), requestedBy: OPERATOR, ...(focus ? { focus } : {}) });
+        // {verify: true}: the watchdog checks it once it's finished.
+        if (body.verify === true) await watchWork({ rootIds: [item.id], createdBy: OPERATOR });
+        return item;
+      }, 201);
       return;
     }
     if (method === "POST" && segments.length === 3) {
@@ -417,9 +425,16 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
       else if (action === "reopen") await send(() => reopenWork(id, OPERATOR, text("reason") || "reopened by the operator"));
       else if (action === "reassign") await send(() => reassignWork(id, OPERATOR, text("to"), text("reason") || "reassigned by the operator"));
       else if (action === "note") await send(() => noteWork(id, OPERATOR, text("text")));
+      else if (action === "verify") await send(() => watchWork({ rootIds: [id], createdBy: OPERATOR, label: text("label") || undefined }));
       else sendJson(res, 404, { error: `unknown work action ${action}` });
       return;
     }
+  }
+
+  // ---- Watchdog (core/watchdog.ts): watches and their verdicts. ----
+  if (segments[0] === "watches" && method === "GET" && segments.length === 1) {
+    sendJson(res, 200, { watches: await listWatches(), verifier: verifierId() });
+    return;
   }
 
   // ---- Team reviews (core/review.ts, review-loop.ts): what each lead's

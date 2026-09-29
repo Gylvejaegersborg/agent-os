@@ -19,6 +19,9 @@ import {
   startMemoryDreamingSweeper,
   registerHook,
   setToolVisibility,
+  subscribeToAllEvents,
+  checkWatches,
+  verifierId,
   installPermissionPolicy,
   DEFAULT_HARD_BLOCKLIST,
   SkillRegistry,
@@ -233,6 +236,15 @@ async function main(): Promise<void> {
       ? undefined
       : startWorkRunner({ model, worker, skills, sandboxPolicy, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true, enableBaseSpace: true, maxToolHops: 8 });
   console.log(`[gateway] work runner ${workRunner ? "on" : "off (AGENT_OS_WORK_RUNNER=off)"}`);
+  // The watchdog (watchdog.ts): when everything under a watch has stopped,
+  // the verifier gets a verification item; its verdict settles the watch.
+  const unwatch =
+    process.env.AGENT_OS_WATCHDOG === "off"
+      ? undefined
+      : subscribeToAllEvents((type) => {
+          if (type.startsWith("work.") || type === "watch.created") void checkWatches().catch((err) => console.error("[watchdog]", err instanceof Error ? err.message : err));
+        });
+  console.log(`[gateway] watchdog ${unwatch ? `on (verifier: ${verifierId()})` : "off (AGENT_OS_WATCHDOG=off)"}`);
   // Leads review their team's work when something needs them (review.ts).
   const reviewLoop = process.env.AGENT_OS_REVIEW === "off" ? undefined : startReviewLoop({ model, worker, skills, sandboxPolicy });
   console.log(`[gateway] team reviews ${reviewLoop ? "on" : "off (AGENT_OS_REVIEW=off)"}`);
@@ -246,6 +258,7 @@ async function main(): Promise<void> {
     baseSpaceCrons.stop();
     workRunner?.stop();
     reviewLoop?.stop();
+    unwatch?.();
     await handle.stop();
     process.exit(0);
   };

@@ -26,6 +26,7 @@ import { loadSnapshot } from "./basespace.js";
 import { setAgentBudget, type AgentBudget } from "./controls.js";
 import { createWork, OPERATOR } from "./work.js";
 import { GATED_TOOL_NAMES } from "./tool-registry.js";
+import { watchWork } from "./watchdog.js";
 import type { SessionFocus } from "./types.js";
 
 const GOVERNANCE_STREAM = "governance";
@@ -47,7 +48,8 @@ async function gateReason(toolName: string, args: Record<string, unknown>, agent
       `reporting to ${str(args, "reportsTo") || agentId}. Why: ${str(args, "why") || "not given"}`;
   }
   const steps = Array.isArray(args.steps) ? args.steps.length : 0;
-  return `Plan: ${agentId} proposes ${steps} work item${steps === 1 ? "" : "s"} for a goal — ${str(args, "summary") || "no summary"}`;
+  return `Plan: ${agentId} proposes ${steps} work item${steps === 1 ? "" : "s"} for a goal — ${str(args, "summary") || "no summary"}` +
+    (args.verify === true ? " (verified once they're all finished)" : "");
 }
 
 /** Files (or finds the already-pending) approval for a gated call and says
@@ -195,10 +197,14 @@ export async function adoptPlan(args: Record<string, unknown>, proposedBy: strin
     ids.push(item.id);
   }
   await appendEvent(GOVERNANCE_STREAM, "plan.adopted", { goalId, proposedBy, summary: str(args, "summary"), workIds: ids });
+  const watch =
+    args.verify === true
+      ? await watchWork({ rootIds: ids, label: `Plan: ${goalTitle ?? goalId}`, createdBy: proposedBy, originSessionId: sessionId, focus: { kind: "goal", id: goalId } })
+      : undefined;
   return {
     ok: true,
     output: `Plan adopted for ${goalTitle ? `"${goalTitle}"` : goalId}: ${steps.map((s, i) => `${s.to} — ${s.title} (${ids[i]})`).join("; ")}. ` +
-      "They run in the background; results are posted back here.",
+      `They run in the background; results are posted back here.${watch ? ` When all are finished, ${watch.verifier} verifies them.` : ""}`,
   };
 }
 

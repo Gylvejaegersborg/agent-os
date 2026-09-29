@@ -22,6 +22,7 @@ import { addOverlayItem, readSnapshotSection, type OverlayKind } from "../core/b
 import { listAgentRecords } from "../core/agents.js";
 import { listApprovals } from "../core/approvals.js";
 import { OPERATOR, createWork, listWork, type WorkStatus } from "../core/work.js";
+import { verifierId, watchWork } from "../core/watchdog.js";
 import type { SessionFocus } from "../core/types.js";
 
 /** The one thing the MCP layer needs from the gateway that isn't a plain
@@ -156,6 +157,7 @@ const TOOLS: McpTool[] = [
         detail: { type: "string", description: "Context: constraints, what done looks like." },
         goalId: { type: "string" },
         projectId: { type: "string" },
+        verify: { type: "boolean", description: "Have the verifier agent check the result against what actually happened once it's finished." },
       },
       required: ["agentId", "title"],
     },
@@ -170,7 +172,8 @@ const TOOLS: McpTool[] = [
         requestedBy: OPERATOR,
         ...(focus ? { focus } : {}),
       });
-      return `Assigned "${item.title}" to ${item.assignee} (work item ${item.id}). Check on it with list_work.`;
+      if (args.verify === true) await watchWork({ rootIds: [item.id], createdBy: OPERATOR });
+      return `Assigned "${item.title}" to ${item.assignee} (work item ${item.id})${args.verify === true ? `; ${verifierId()} verifies it when it's finished` : ""}. Check on it with list_work.`;
     },
   },
   {

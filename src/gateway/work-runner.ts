@@ -59,6 +59,8 @@ export interface WorkRunnerHandle {
 }
 
 function workPrompt(item: WorkView, requesterName: string): string {
+  // A verification's detail is the whole brief (watchdog.ts builds it).
+  if (item.kind === "verification") return `[Work] ${requesterName} asked you to verify (work item ${item.id}): ${item.title}\n\n${item.detail ?? ""}`;
   return [
     `[Work] ${requesterName} handed you this (work item ${item.id}): ${item.title}`,
     item.detail ? `\n${item.detail}` : "",
@@ -114,7 +116,10 @@ export function startWorkRunner(deps: WorkRunnerDeps, opts: { intervalMs?: numbe
           enableMemoryNominations: deps.enableMemoryNominations,
           enableArtifacts: deps.enableArtifacts,
           enableBaseSpace: deps.enableBaseSpace,
-          maxToolHops: deps.maxToolHops,
+          // A verifier reads and reports — it can't do the work it checks.
+          ...(item.kind === "verification"
+            ? { onlyTools: ["work", "basespace"], maxToolHops: Math.min(12, (item.verifies?.length ?? 1) + 3) }
+            : { maxToolHops: deps.maxToolHops }),
         });
         const after = await getWork(item.id);
         if (after?.status === "in_progress") {

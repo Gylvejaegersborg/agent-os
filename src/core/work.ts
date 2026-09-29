@@ -65,6 +65,12 @@ export interface WorkItem {
   /** Raised to the operator by a lead (or the requester); cleared when the
    *  item moves again (reopened, reassigned, finished, cancelled). */
   escalation?: { by: string; reason: string; at: string };
+  /** "verification": the watchdog's check of other items (watchdog.ts). */
+  kind?: "verification";
+  /** For a verification: the items it checks. Its assignee (the verifier)
+   *  may reopen or escalate those — and nothing else. */
+  verifies?: string[];
+  watchId?: string;
   notes: WorkNote[];
   /** Tokens spent on this item itself. */
   tokens: number;
@@ -106,7 +112,8 @@ async function projectWork(): Promise<Map<string, WorkItem>> {
         touch({ status: "open", assignee: p.to, sessionId: undefined, blockedReason: undefined, escalation: undefined, notes: note(`handed to ${p.to}: ${p.reason}`) });
         break;
       case "work.reopened":
-        touch({ status: "open", sessionId: undefined, blockedReason: undefined, escalation: undefined, notes: note(`reopened: ${p.reason}`) });
+        // The old result stays in the notes ("done: …"), not as the result.
+        touch({ status: "open", sessionId: undefined, blockedReason: undefined, escalation: undefined, result: undefined, notes: note(`reopened: ${p.reason}`) });
         break;
       case "work.cancelled":
         touch({ status: "cancelled", escalation: undefined, notes: note(`cancelled: ${p.reason}`) });
@@ -179,6 +186,9 @@ export async function createWork(input: {
   requestedFromSessionId?: string;
   parentId?: string;
   focus?: SessionFocus;
+  kind?: "verification";
+  verifies?: string[];
+  watchId?: string;
 }): Promise<WorkView> {
   return serialized(async () => {
     const title = input.title.trim();
@@ -207,6 +217,7 @@ export async function createWork(input: {
       depth,
       ...(input.focus ?? parent?.focus ? { focus: input.focus ?? parent!.focus } : {}),
       status: "open" as const,
+      ...(input.kind ? { kind: input.kind, verifies: input.verifies ?? [], ...(input.watchId ? { watchId: input.watchId } : {}) } : {}),
     };
     await appendEvent(WORK_STREAM, "work.created", { item });
     await publishEvent("work.created", { id: item.id, assignee: item.assignee, requestedBy: item.requestedBy });
@@ -235,13 +246,21 @@ const ACTIVE: WorkStatus[] = ["open", "in_progress", "blocked"];
 
 /** May `by` manage an item someone else is doing? The operator, whoever
  *  asked for it, or the assignee's manager. */
-export async function mayManageWork(item: Pick<WorkItem, "assignee" | "requestedBy">, by: string): Promise<boolean> {
+export async function mayManageWork(item: Pick<WorkItem, "id" | "assignee" | "requestedBy">, by: string, action?: string): Promise<boolean> {
   if (by === OPERATOR || by === item.requestedBy) return true;
-  return (await getAgentIdentity(item.assignee))?.reportsTo === by;
+  if ((await getAgentIdentity(item.assignee))?.reportsTo === by) return true;
+  // The watchdog's verifier may send back (reopen) or flag (escalate) the
+  // items it's verifying right now — report problems, not fix them.
+  if (action === "reopen" || action === "escalate") {
+    return [...(await projectWork()).values()].some(
+      (v) => v.kind === "verification" && v.assignee === by && v.status === "in_progress" && (v.verifies ?? []).includes(item.id),
+    );
+  }
+  return false;
 }
 
 async function mustManage(item: WorkItem, by: string, what: string): Promise<void> {
-  if (!(await mayManageWork(item, by))) {
+  if (!(await mayManageWork(item, by, what))) {
     throw new WorkError(`only ${item.requestedBy === OPERATOR ? "the operator" : item.requestedBy}, ${item.assignee}'s manager or the operator can ${what} ${item.id}`);
   }
 }
@@ -295,13 +314,16 @@ export async function reassignWork(id: string, by: string, to: string, reason: s
   });
 }
 
-/** Back to open for the same assignee — e.g. the operator unblocked it, or
- *  a run failed before the agent could finish. */
+/** Back to open for the same assignee — e.g. the operator unblocked it, a
+ *  run failed before the agent could finish, or a verifier found a done
+ *  item's claim didn't hold up. */
 export async function reopenWork(id: string, by: string, reason: string): Promise<WorkView> {
   return serialized(async () => {
     const item = await mustGet(id);
     await mustManage(item, by, "reopen");
-    if (item.status === "done" || item.status === "cancelled") throw new WorkError(`${id} is ${item.status}`);
+    // A done item can be sent back (its claim didn't hold up — watchdog.ts);
+    // a cancelled one is gone.
+    if (item.status === "cancelled") throw new WorkError(`${id} is cancelled`);
     if (item.status === "open") throw new WorkError(`${id} is already open`);
     await appendEvent(WORK_STREAM, "work.reopened", { id, by, reason: reason.trim() || "reopened" });
     await publishEvent("work.reopened", { id, by });

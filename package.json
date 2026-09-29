@@ -52,6 +52,7 @@
     "test-work": "tsc -b && node dist/test-work.js",
     "test-review": "tsc -b && node dist/test-review.js",
     "test-governance": "tsc -b && node dist/test-governance.js",
+    "test-watchdog": "tsc -b && node dist/test-watchdog.js",
     "typecheck": "tsc -b --noEmit"
   },
   "devDependencies": {

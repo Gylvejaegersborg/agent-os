@@ -157,6 +157,7 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
       to: { type: "string", required: true, description: "The teammate's agent id (see 'Your team' in your instructions)." },
       title: { type: "string", required: true, description: "What to do, as a short imperative (e.g. 'Draft three caption options for the Switch teaser')." },
       detail: { type: "string", description: "Context they need: constraints, what done looks like, where to look." },
+      verify: { type: "boolean", description: "When it's finished, have the verifier check the result against what actually happened." },
     },
   },
   {
@@ -195,6 +196,7 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
     inputSchema: {
       goalId: { type: "string", description: "The goal it serves (defaults to this conversation's goal)." },
       summary: { type: "string", required: true, description: "The plan in one or two sentences: the approach and why." },
+      verify: { type: "boolean", description: "When every step has finished, have the verifier check the results against what actually happened." },
       steps: {
         type: "array",
         required: true,
