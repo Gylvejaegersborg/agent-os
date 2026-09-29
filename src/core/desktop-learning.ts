@@ -18,7 +18,7 @@
 // project names (the wording says so).
 
 import { appendEvent, readStream } from "./eventlog.js";
-import { writeEpisodic } from "./memory.js";
+import { listEpisodic, writeEpisodic } from "./memory.js";
 import { desktopDaySummary, desktopTimeline, localDay, type DesktopDaySummary } from "./desktop.js";
 import { loadSnapshot } from "./basespace.js";
 
@@ -144,6 +144,14 @@ export function weekObservations(w: WeekDigest): string[] {
   return out;
 }
 
+/** Writes one observation with an EXACT repeat count (how many earlier entries have this very sentence).
+ *  The memory's fuzzy similarity would count "desktop time on project X" as a repeat of "desktop time in the
+ *  evening", and one day's observation would look like a habit. */
+async function writeFact(agentId: string, content: string): Promise<void> {
+  const repetitionCount = (await listEpisodic(agentId)).filter((e) => e.content === content).length;
+  await writeEpisodic({ agentId, content, kind: "fact", sourceSessionId: SOURCE, repetitionCount });
+}
+
 export interface LearnResult {
   days: string[];
   written: number;
@@ -165,7 +173,7 @@ export async function learnFromDesktop(opts: { now?: Date; agentId?: string } = 
     if (!summary.activeSec && !summary.idleSec) continue;
     let written = 0;
     for (const content of await dayObservations(summary)) {
-      await writeEpisodic({ agentId, content, kind: "fact", sourceSessionId: SOURCE });
+      await writeFact(agentId, content);
       written++;
     }
     await appendEvent(STREAM, "desktop.day.learned", { day, written });
@@ -181,7 +189,7 @@ export async function learnFromDesktop(opts: { now?: Date; agentId?: string } = 
     if (digest.activeSec) {
       let written = 0;
       for (const content of weekObservations(digest)) {
-        await writeEpisodic({ agentId, content, kind: "fact", sourceSessionId: SOURCE });
+        await writeFact(agentId, content);
         written++;
       }
       await appendEvent(STREAM, "desktop.week.learned", { week, written });
