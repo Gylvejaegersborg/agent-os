@@ -1361,6 +1361,30 @@ without a tool list, so Anthropic/OpenAI/Ollama models were never told any tool 
 (only the stub model ever "called" one). Adapters now fall back to every tool in the
 registry (`registryToolSpecs()` in `models/real.ts`).
 
+## Music library — upload what you've made
+
+BaseSpace's Beat DB has an **Add song** button. It uploads real audio to this server and
+keeps a small catalog (title, beat or song, BPM, key, tags, a note, an optional cover).
+Nothing is invented: BPM and key stay blank unless typed.
+
+- **Storage.** Files stream straight to `data/library/files/<server id>.<ext>` with a size
+  cap (`AGENT_OS_LIBRARY_MAX_MB`, default 300). The filename you upload is only a label; the
+  path is never derived from it. Types are a whitelist (mp3, wav, flac, m4a, aac, ogg/oga,
+  opus, aif/aiff; png, jpg, webp covers). The catalog is an event stream (`library`), like
+  the rest of the state here. Deleting a song, or replacing its audio or cover, removes the
+  files from disk.
+- **Routes** (`gateway/library-routes.ts`): `POST /library/files?name=` (raw body),
+  `GET|HEAD /library/files/:id` (Range, so a player can seek; `nosniff`),
+  `GET|POST /library/songs`, `PUT|DELETE /library/songs/:id`. These are operator routes:
+  agents have no tool that uploads or deletes.
+- **BaseSpace.** `GET /basespace/overlay` appends the songs to `library` in the Beat DB's
+  own shape, so the existing merge shows them. BaseSpace turns the file ids into URLs.
+- **Agents** can read the catalog with the `basespace` tool (`section: "songs"`): title,
+  kind, BPM, key, tags, note. They can't hear audio, and the tool says nothing else is known.
+- Reaching the gateway over Tailscale: a 30-minute `requestTimeout` covers big uploads.
+
+Test: `npm run test-library`.
+
 ## Hindsight — optional long-term memory
 
 [Hindsight](https://github.com/vectorize-io/hindsight) (MIT) is an agent memory service:

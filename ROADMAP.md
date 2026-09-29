@@ -115,6 +115,11 @@ into the LIVE gateway, not just what exists somewhere in the codebase).
       `GET /files/revisions`, `POST /files/revisions/:id/restore`
       (sandbox-checked); **[UI]** a "Files" tab in the Workbench listing
       revisions with a Restore button per entry.
+- [x] Music library: BaseSpace's Beat DB "Add song" uploads real audio (streamed,
+      size-capped, extension-whitelisted, ranged downloads) and keeps a catalog
+      of what the operator typed; agents read it via `basespace` `songs`, and
+      cannot upload or delete. **[core]** `library.ts`; **[gateway]**
+      `library-routes.ts`; **[UI]** Beat DB. See the README section.
 
 ## Open
 
