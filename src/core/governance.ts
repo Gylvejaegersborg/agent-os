@@ -27,6 +27,7 @@ import { setAgentBudget, type AgentBudget } from "./controls.js";
 import { createWork, OPERATOR } from "./work.js";
 import { GATED_TOOL_NAMES } from "./tool-registry.js";
 import { watchWork } from "./watchdog.js";
+import { checkFlowProposal, flowGateReason } from "./flow-proposals.js";
 import type { SessionFocus } from "./types.js";
 
 const GOVERNANCE_STREAM = "governance";
@@ -42,7 +43,8 @@ interface ToolResult {
 const str = (args: Record<string, unknown>, k: string) => (typeof args[k] === "string" ? (args[k] as string).trim() : "");
 
 /** What the operator sees in the Approvals queue for a gated call. */
-async function gateReason(toolName: string, args: Record<string, unknown>, agentId: string): Promise<string> {
+async function gateReason(toolName: string, args: Record<string, unknown>, agentId: string, sessionFocus?: SessionFocus): Promise<string> {
+  if (toolName === "propose-flow") return flowGateReason(args, agentId, sessionFocus);
   if (toolName === "propose-agent") {
     return `Hire: ${agentId} proposes a new agent "${str(args, "name") || str(args, "id")}" (${str(args, "role") || "no role given"}), ` +
       `reporting to ${str(args, "reportsTo") || agentId}. Why: ${str(args, "why") || "not given"}`;
@@ -54,15 +56,15 @@ async function gateReason(toolName: string, args: Record<string, unknown>, agent
 
 /** Files (or finds the already-pending) approval for a gated call and says
  *  why the turn stops here. Never lets the call through. */
-export async function gateToolCall(input: { agentId: string; sessionId: string; toolName: string; args: Record<string, unknown> }): Promise<string> {
+export async function gateToolCall(input: { agentId: string; sessionId: string; toolName: string; args: Record<string, unknown>; sessionFocus?: SessionFocus }): Promise<string> {
   const same = (await listApprovals({ status: "pending", agentId: input.agentId })).find(
     (a) => a.toolName === input.toolName && stableJson(a.args) === stableJson(input.args),
   );
   const request =
     same ??
-    (await requestApproval({ ...input, reason: await gateReason(input.toolName, input.args, input.agentId) }));
+    (await requestApproval({ agentId: input.agentId, sessionId: input.sessionId, toolName: input.toolName, args: input.args, reason: await gateReason(input.toolName, input.args, input.agentId, input.sessionFocus) }));
   return (
-    `waiting for approval: ${input.toolName === "propose-agent" ? "hiring an agent" : "a plan for a goal"} always needs the operator's OK ` +
+    `waiting for approval: ${input.toolName === "propose-agent" ? "hiring an agent" : input.toolName === "propose-flow" ? "a flow" : "a plan for a goal"} always needs the operator's OK ` +
     `(request ${request.id}). Nothing has been created yet; once they approve in the Approvals tab it's carried out and you'll be told.`
   );
 }
@@ -174,6 +176,7 @@ async function readPlan(args: Record<string, unknown>, proposedBy: string, sessi
  *  agent can fix it now instead of the operator approving something that
  *  then fails. Undefined = fine to file. */
 export async function checkProposal(toolName: string, args: Record<string, unknown>, agentId: string, sessionFocus?: SessionFocus): Promise<string | undefined> {
+  if (toolName === "propose-flow") return checkFlowProposal(args, agentId, sessionFocus);
   const r = toolName === "propose-agent" ? await readHire(args, agentId) : await readPlan(args, agentId, sessionFocus);
   return typeof r === "string" ? r : undefined;
 }

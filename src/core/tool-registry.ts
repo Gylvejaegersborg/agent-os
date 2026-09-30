@@ -32,7 +32,7 @@ export interface ToolInputSchemaProperty {
 
 /** Tools that always need the operator's approval and can never be
  *  always-allowed (governance.ts): growing the team and planning a goal. */
-export const GATED_TOOL_NAMES = ["propose-agent", "propose-plan"];
+export const GATED_TOOL_NAMES = ["propose-agent", "propose-plan", "propose-flow"];
 
 export interface ToolDefinition {
   name: string;
@@ -186,6 +186,33 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
       reportsTo: { type: "string", description: "Its manager's agent id (defaults to you)." },
       model: { type: "string", description: "Optional model, e.g. 'claude-cli:haiku'. Defaults to the gateway's." },
       why: { type: "string", required: true, description: "What work it takes on and why no current teammate fits." },
+    },
+  },
+  {
+    name: "propose-flow",
+    description:
+      "Design a flow: a small graph of steps, each for one agent, with dependencies, to get a bigger piece of work done faster than handing items out one by one. " +
+      "Independent steps run in parallel, dependent ones wait and are shown what the steps they depend on produced. Argus checks it first (unknown agents, circular " +
+      "dependencies, vague steps, paused agents) and tells you what to fix; then it always goes to the operator's Approvals. Once approved it runs in the background " +
+      "and the outcome is posted back here. Use `propose-plan` for independent items with no dependencies, `delegate` for a single hand-off.",
+    inputSchema: {
+      summary: { type: "string", required: true, description: "The flow in one or two sentences: the approach and why it is shaped this way." },
+      goalId: { type: "string", description: "The goal it serves (defaults to this conversation's goal)." },
+      steps: {
+        type: "array",
+        required: true,
+        description: "Up to 10 steps: {id, agent, goal, dependsOn?, retries?}. id is a short lowercase name; goal says what the step should produce; dependsOn lists step ids that must finish first.",
+        items: {
+          type: "object",
+          properties: {
+            id: { type: "string" },
+            agent: { type: "string" },
+            goal: { type: "string" },
+            dependsOn: { type: "array", items: { type: "string" } },
+            retries: { type: "number" },
+          },
+        },
+      },
     },
   },
   {

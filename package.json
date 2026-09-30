@@ -63,7 +63,9 @@
     "typecheck": "tsc -b --noEmit",
     "test-desktop": "tsc -b && node dist/test-desktop.js",
     "test-desktop-learning": "tsc -b && node dist/test-desktop-learning.js",
-    "test-cancel-inflight": "tsc -b && node dist/test-cancel-inflight.js"
+    "test-cancel-inflight": "tsc -b && node dist/test-cancel-inflight.js",
+    "test-flow-proposals": "tsc -b && node dist/test-flow-proposals.js",
+    "test-e2e-scenario": "tsc -b && node dist/test-e2e-scenario.js"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

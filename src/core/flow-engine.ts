@@ -48,7 +48,7 @@
 //      mid-runTurn() — it stops at the next checkpoint runTurn() itself
 //      checks, not instantly.
 
-import { createFlow, getFlow, updateFlowStep, createTask, transitionTask } from "./tasks.js";
+import { createFlow, getFlow, getTask, updateFlowStep, createTask, transitionTask } from "./tasks.js";
 import { runTurn } from "./agent-loop.js";
 import { createSession, linkSessionWork } from "./session.js";
 import type { SessionFocus } from "./types.js";
@@ -167,6 +167,21 @@ async function setStepStatus(flowId: string, stepId: string, status: TaskStatus,
   throw new Error(`setStepStatus: too many revision conflicts updating step "${stepId}" on flow ${flowId}`);
 }
 
+/** What the steps this one depends on produced, so a downstream step works from real results
+ *  instead of just running after them. Each result is capped so a long chain stays small. */
+async function upstreamResults(flowId: string, step: FlowStepDefinition): Promise<string> {
+  if (!step.dependsOn?.length) return "";
+  const flow = await getFlow(flowId);
+  const parts: string[] = [];
+  for (const dep of step.dependsOn) {
+    const taskId = flow?.steps.find((s) => s.id === dep)?.taskId;
+    const task = taskId ? await getTask(taskId) : undefined;
+    const text = typeof task?.output?.finalContent === "string" ? task.output.finalContent.trim() : "";
+    if (text) parts.push(`### Result of step "${dep}"\n${text.slice(0, 3000)}${text.length > 3000 ? "\n[…cut]" : ""}`);
+  }
+  return parts.length ? `\n\n---\nWhat the steps you depend on produced:\n\n${parts.join("\n\n")}` : "";
+}
+
 async function runStepOnce(
   flowId: string,
   step: FlowStepDefinition,
@@ -192,7 +207,7 @@ async function runStepOnce(
     const result = await runTurn({
       sessionId: session.id,
       agentId: step.agentId,
-      userMessage: step.goal,
+      userMessage: step.goal + (await upstreamResults(flowId, step)),
       model,
       worker: opts.worker,
       skills: opts.skills,

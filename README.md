@@ -1361,6 +1361,27 @@ without a tool list, so Anthropic/OpenAI/Ollama models were never told any tool 
 (only the stub model ever "called" one). Adapters now fall back to every tool in the
 registry (`registryToolSpecs()` in `models/real.ts`).
 
+## Flows designed by leaders, checked by Argus
+
+A lead (anyone with reports; Hemera) can design a flow with `propose-flow`: up to 10
+steps `{id, agent, goal, dependsOn?, retries?}`. Independent steps run in parallel;
+a step that depends on others is shown what they produced. Before anything reaches
+the operator, Argus (the team's verifier, `AGENT_OS_VERIFIER`) checks it, by code
+(`core/flow-proposals.ts`):
+
+- **Errors** go straight back to the lead, nothing is filed: unknown or paused agents
+  (or over budget), bad or duplicate ids, unknown or circular dependencies, steps that
+  don't say what to produce, too many steps or retries, a goal not in BaseSpace.
+- **Notes** travel with the approval request: a long chain with no parallelism, several
+  endings nobody combines, one agent holding many parallel steps, no review step.
+
+Like `propose-plan` it always goes to Approvals and can't be always-allowed. On approval
+the definition is stored (`flow-definitions`), the flow runs in the background with each
+step on its own agent's model, and the outcome is posted back into the proposing
+session. Tests: `test-flow-proposals`, and `test-e2e-scenario` drives the whole path
+(session, tool call, approval, flow, task graph, artifact, restart, cancel) over HTTP
+and the event stream.
+
 ## Music library — upload what you've made
 
 BaseSpace's Beat DB has an **Add song** button. It uploads real audio to this server and

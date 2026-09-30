@@ -137,12 +137,15 @@ checked — see the correction below.
       image/screenshot attachment support in `useAgentOsChat`/
       `ConversationPane`, and no corresponding support in `model.ts`'s
       `ModelMessage`. **[core]** **[UI]**
-- [ ] **Cancellation genuinely preempts an in-flight step.** Documented,
-      accepted limitation today (cancellation stops scheduling NEW work,
-      never an in-flight model call) — revisit if it keeps being
-      friction in practice, since this is a real architectural change
-      (would need an abortable fetch at the model-adapter level), not a
-      quick fix. **[core]**
+- [x] **Cancellation preempts an in-flight step.** `cancelSession()` fires the
+      running turn's `AbortController` (`session.ts`); the signal reaches the
+      Anthropic/OpenAI/Ollama fetches, kills the Claude CLI child process and
+      the shell command, and the turn stops waiting at once even for an
+      adapter that ignores the signal (`raceAbort` in `agent-loop.ts`). A
+      cancelled turn is reported as cancelled, not as an error. Limit: the
+      abort registry is per process, so a cancel issued from a different
+      process than the one running the turn still only lands at the next
+      step boundary. Tests: `test-cancel-inflight`. **[core]**
 
 ## Where agent-os is already ahead (keep this true, don't regress it)
 
@@ -476,13 +479,15 @@ memory gate as everything else.
       same digest as the MCP tool, allowed in plan mode). Only Hemera and
       Mnemosyne see it (enforced by a `tool.before` hook, not just hidden).
       Focus-block times are now local time. **[core]** `renderDesktopReport`.
-- [ ] Learning loop: an evening automation turns the day's summary into
-      episodic entries/nominations (patterns, not raw logs) — through the
-      existing dreaming gate, so nothing reaches curated memory without
-      approval. **[core]**
-- [ ] Coach: a `review.ts`-style code-built weekly digest (time vs. goals,
-      fragmented days, work that serves no goal); a model turn only when
-      something changed and matters. **[core]** **[UI]**
+- [x] Learning loop, and the coach folded into it: no separate automation.
+      Each finished day (and week) becomes a few fixed-wording observations by
+      code (`desktop-learning.ts`), written with `writeEpisodic` (so Hindsight
+      gets them too). Dreaming promotes one only after it repeats across days;
+      a quiet day writes nothing; the operator's correction
+      (`POST /desktop/correction`) is promoted at once. Weekly numbers:
+      `GET /desktop/week`. No model turn. Tests: `test-desktop-learning`.
+      **[UI]** still open: show the week's time on goal/project pages.
+      **[core]**
 - [ ] HUD shell: a small always-on-top, click-through window (Tauri or
       Electron) loading a `/hud` route of BaseOStest — composer + last reply,
       session focused on the goal matched from `desktop.focus`. **[UI]**

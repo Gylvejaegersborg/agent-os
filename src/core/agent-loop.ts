@@ -29,6 +29,7 @@ import { checkPathSandbox, type SandboxPolicy } from "./permissions.js";
 import { recordFileRevision } from "./file-revisions.js";
 import { dispatchAudio, dispatchLibrary } from "./library-tools.js";
 import { renderDesktopReport } from "./desktop.js";
+import { adoptFlow } from "./flow-proposals.js";
 
 export interface AgentTurnResult {
   sessionId: string;
@@ -500,6 +501,17 @@ async function dispatchTool(
     return { ok: false, output: "", error: problem ? `not filed — fix this and propose again: ${problem}` : `"${toolCall.name}" only runs once the operator approves it` };
   }
   if (toolCall.name === "propose-agent") return hireAgent(toolCall.args, ctx.agentId);
+  if (toolCall.name === "propose-flow") {
+    return adoptFlow(toolCall.args, ctx.agentId, ctx.sessionId, (await getSession(ctx.sessionId))?.focus, {
+      model: ctx.model,
+      worker: ctx.worker,
+      skills: ctx.skills,
+      enableSubagents: ctx.enableSubagents,
+      enableMemoryNominations: ctx.enableMemoryNominations,
+      enableArtifacts: ctx.enableArtifacts,
+      sandboxPolicy: ctx.sandboxPolicy,
+    });
+  }
   if (toolCall.name === "propose-plan") return adoptPlan(toolCall.args, ctx.agentId, ctx.sessionId, (await getSession(ctx.sessionId))?.focus);
   if (toolCall.name === "shell") {
     return ctx.worker.run(String(toolCall.args.command), { signal: ctx.signal });
@@ -678,7 +690,7 @@ const SETTLING_WORK_ACTIONS = new Set(["done", "blocked", "hand-back"]);
  *  notes, approvals), and filing them as long-term memory records the
  *  harness's own bookkeeping as things "the user" said ("User assigned a work
  *  item…", seen live in Hindsight). */
-const HARNESS_MESSAGE = /^\s*(\[(Work|Review|Approvals)\]|It's time for ")/;
+const HARNESS_MESSAGE = /^\s*(\[(Work|Review|Approvals|Flow)\]|It's time for ")/;
 
 /** Is this finished turn worth sending to Hindsight (each one costs an LLM
  *  extraction)? Only a real answer to something the operator wrote — not a
@@ -718,6 +730,7 @@ function offeredTools(
     // go to the operator first — governance.ts).
     "propose-agent": on.enableBaseSpace && on.isLead,
     "propose-plan": on.enableBaseSpace && on.isLead,
+    "propose-flow": on.enableBaseSpace && on.isLead,
   };
   return listToolDefinitions()
     .filter((d) => !(d.name in enabled) || !!enabled[d.name])
@@ -947,7 +960,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       const blockDecision = gated
         ? proposalProblem
           ? { block: false as const }
-          : { block: true, reason: await gateToolCall({ agentId, sessionId, toolName: response.toolCall.name, args: response.toolCall.args ?? {} }) }
+          : { block: true, reason: await gateToolCall({ agentId, sessionId, toolName: response.toolCall.name, args: response.toolCall.args ?? {}, sessionFocus: (await getSession(sessionId))?.focus }) }
         : await fireHook("tool.before", {
             agentId,
             sessionId,
