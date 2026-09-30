@@ -91,6 +91,13 @@ assert(r.ok && r.output.includes("line one\nline two") && r.output.includes("140
 r = await dispatchLibrary({ action: "update", id, lyrics: "" }, "hemera", sandbox);
 assert(r.ok && /no lyrics/.test(r.output), "an empty string clears the lyrics");
 
+r = await dispatchLibrary({ action: "update", id, collaborators: ["Gswish: melody", "  ", { name: "Nyx" }] }, "hemera", sandbox);
+assert(r.ok && /with Gswish \(melody\), Nyx/.test(r.output), "collaborators are credits with an optional role (blank entries dropped)");
+song = await getSong(id);
+assert(song?.collaborators?.length === 2 && song.collaborators[0]!.role === "melody" && song.collaborators[1]!.role === undefined && !("split" in (song.collaborators[0] as object)), "…stored as name and role only: no splits");
+r = await dispatchLibrary({ action: "update", id, collaborators: [] }, "hemera", sandbox);
+assert(r.ok && !/with /.test(r.output), "an empty list clears them");
+
 r = await dispatchLibrary({ action: "update", id, title: "Demo Beat", audioFileId: "other", coverFileId: "x" } as any, "hemera", sandbox);
 song = await getSong(id);
 assert(r.ok && song?.audioFileId !== "other" && song?.coverFileId === undefined, "an agent can't swap the audio or cover through update");

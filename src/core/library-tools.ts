@@ -30,7 +30,7 @@ function checkPath(policy: SandboxPolicy | undefined, p: string, what: string): 
 }
 
 const line = (s: LibrarySong) =>
-  `${s.id} — ${s.title} (${s.category}${s.bpm ? `, ${s.bpm} BPM` : ""}${s.musicalKey ? `, ${s.musicalKey}` : ""}${s.tags.length ? `, tags: ${s.tags.join(", ")}` : ""})${s.lyrics ? " [has lyrics]" : " [no lyrics]"}${s.addedBy ? ` — added by ${s.addedBy}` : ""}`;
+  `${s.id} — ${s.title} (${s.category}${s.bpm ? `, ${s.bpm} BPM` : ""}${s.musicalKey ? `, ${s.musicalKey}` : ""}${s.tags.length ? `, tags: ${s.tags.join(", ")}` : ""})${s.collaborators?.length ? ` with ${s.collaborators.map((c) => (c.role ? `${c.name} (${c.role})` : c.name)).join(", ")}` : ""}${s.lyrics ? " [has lyrics]" : " [no lyrics]"}${s.addedBy ? ` — added by ${s.addedBy}` : ""}`;
 
 export async function dispatchLibrary(args: Record<string, unknown>, agentId: string, sandbox: SandboxPolicy | undefined): Promise<Result> {
   const action = String(args.action ?? "");
@@ -57,7 +57,7 @@ export async function dispatchLibrary(args: Record<string, unknown>, agentId: st
       if (!String(args.title ?? "").trim()) return fail("A song needs a title.");
       const stored = await importAudioFromPath(source);
       const song = await addSongBy(
-        { title: args.title, category: args.kind, bpm: args.bpm, musicalKey: args.key, tags: args.tags, note: args.note, lyrics: args.lyrics, audioFileId: stored.id },
+        { title: args.title, category: args.kind, bpm: args.bpm, musicalKey: args.key, tags: args.tags, note: args.note, lyrics: args.lyrics, collaborators: args.collaborators, audioFileId: stored.id },
         agentId,
       );
       return { ok: true, output: `Added to the library: ${line(song)}. It shows in the Beat DB.` };
@@ -66,7 +66,7 @@ export async function dispatchLibrary(args: Record<string, unknown>, agentId: st
       const id = String(args.id ?? "");
       if (!(await getSong(id))) return fail(`No song "${id}". Use list to see the ids.`);
       // Metadata and lyrics only: never the audio or cover, and never a delete.
-      const song = await updateSong(id, { title: args.title, category: args.kind, bpm: args.bpm, musicalKey: args.key, tags: args.tags, note: args.note, lyrics: args.lyrics });
+      const song = await updateSong(id, { title: args.title, category: args.kind, bpm: args.bpm, musicalKey: args.key, tags: args.tags, note: args.note, lyrics: args.lyrics, collaborators: args.collaborators });
       return { ok: true, output: `Updated: ${line(song)}` };
     }
     return fail(`unknown action "${action}": use list, read, add or update (there is no delete; only the operator removes songs)`);
