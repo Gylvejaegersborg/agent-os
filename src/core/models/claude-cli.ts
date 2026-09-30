@@ -280,6 +280,13 @@ export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter 
         child.kill("SIGKILL");
         reject(new Error(`Claude CLI timed out after ${timeoutMs}ms`));
       }, timeoutMs);
+      const onAbort = () => {
+        clearTimeout(timer);
+        child.kill("SIGKILL");
+        reject(new Error("Claude CLI call cancelled"));
+      };
+      if (callOpts?.signal?.aborted) onAbort();
+      else callOpts?.signal?.addEventListener("abort", onAbort, { once: true });
 
       const handleLine = (line: string) => {
         if (!line.trim()) return;

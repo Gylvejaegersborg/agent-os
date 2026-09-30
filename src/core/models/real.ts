@@ -143,7 +143,7 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
         }));
       }
 
-      const res = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(body) });
+      const res = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(body), signal: callOpts?.signal });
       const json: any = await res.json();
       if (!res.ok) {
         throw new Error(`Anthropic API error ${res.status}: ${JSON.stringify(json).slice(0, 500)}`);
@@ -203,7 +203,7 @@ export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
         }));
       }
 
-      const res = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(body) });
+      const res = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(body), signal: callOpts?.signal });
       if (!res.ok) {
         const errJson = await res.json().catch(() => ({}));
         throw new Error(`Anthropic API error ${res.status}: ${JSON.stringify(errJson).slice(0, 500)}`);
@@ -300,6 +300,7 @@ export function createOpenAiModel(opts: OpenAiOptions): ModelAdapter {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${opts.apiKey}` },
         body: JSON.stringify(body),
+        signal: callOpts?.signal,
       });
       const json: any = await res.json();
       if (!res.ok) {
@@ -378,6 +379,7 @@ export async function fetchWithOllamaRetry(baseUrl: string, init: RequestInit, m
       return await fetch(baseUrl, init);
     } catch (err) {
       lastErr = err;
+      if (init.signal?.aborted) throw err; // cancelled: never retry
       if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
@@ -416,7 +418,7 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
 
       const res = await fetchWithOllamaRetry(
         baseUrl,
-        { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) },
+        { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: callOpts?.signal },
         model,
       );
       const json: any = await res.json();
@@ -465,7 +467,7 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
 
       const res = await fetchWithOllamaRetry(
         baseUrl,
-        { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) },
+        { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: callOpts?.signal },
         model,
       );
       if (!res.ok) {

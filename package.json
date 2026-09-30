@@ -62,7 +62,8 @@
     "team": "tsc -b && node dist/team-cli.js",
     "typecheck": "tsc -b --noEmit",
     "test-desktop": "tsc -b && node dist/test-desktop.js",
-    "test-desktop-learning": "tsc -b && node dist/test-desktop-learning.js"
+    "test-desktop-learning": "tsc -b && node dist/test-desktop-learning.js",
+    "test-cancel-inflight": "tsc -b && node dist/test-cancel-inflight.js"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

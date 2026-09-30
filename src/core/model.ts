@@ -40,6 +40,8 @@ export interface ToolSpec {
  *  default (every registered tool). An empty list offers none. */
 export interface ModelCallOptions {
   tools?: ToolSpec[];
+  /** Aborted when the session is cancelled: adapters stop the in-flight request (fetch, child process) instead of letting it finish. */
+  signal?: AbortSignal;
 }
 
 export interface ModelAdapter {

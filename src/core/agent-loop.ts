@@ -21,7 +21,7 @@ import { generateId } from "./id.js";
 import { SkillRegistry, renderSkillCatalog } from "./skills.js";
 import { retrieveMemoryContext } from "./memory.js";
 import { getAgentIdentity, listAgentIdentities } from "./identity.js";
-import { ensureSession, isSessionCancelled, getSession } from "./session.js";
+import { beginTurnAbort, endTurnAbort, ensureSession, isSessionCancelled, getSession } from "./session.js";
 import { getToolDefinition, listToolDefinitions, toToolSpec, toolVisibleTo, withTimeout } from "./tool-registry.js";
 import type { ArtifactType } from "./artifacts.js";
 import type { EpisodicKind } from "./types.js";
@@ -143,6 +143,29 @@ export interface RunTurnOptions {
 export const PLAN_MODE_BLOCKED_TOOLS = new Set(["shell", "edit_file", "write_file", "subagent"]);
 
 /** `library` add/update and `audio` edit write something; their list/read/info don't, so plan mode allows those. */
+/** Settles when `promise` does, or rejects the moment `signal` aborts (whichever comes first). The
+ *  original promise is left to finish or fail on its own; its late result is ignored. */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    promise.catch(() => {});
+    return Promise.reject(signal.reason ?? new Error("aborted"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? new Error("aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (v) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(v);
+      },
+      (e) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(e);
+      },
+    );
+  });
+}
+
 export function changesLibraryOrAudio(call: { name: string; args: Record<string, unknown> }): boolean {
   const action = String(call.args.action ?? "");
   return (call.name === "library" && (action === "add" || action === "update")) || (call.name === "audio" && action === "edit");
@@ -468,6 +491,8 @@ async function dispatchTool(
     sandboxPolicy?: SandboxPolicy;
     /** Set only by executeApprovedCall — the operator approved this call. */
     approved?: boolean;
+    /** Aborted when the session is cancelled; the shell worker stops its command. */
+    signal?: AbortSignal;
   },
 ): Promise<ToolDispatchResult> {
   if (GATED_TOOLS.has(toolCall.name) && !ctx.approved) {
@@ -477,7 +502,7 @@ async function dispatchTool(
   if (toolCall.name === "propose-agent") return hireAgent(toolCall.args, ctx.agentId);
   if (toolCall.name === "propose-plan") return adoptPlan(toolCall.args, ctx.agentId, ctx.sessionId, (await getSession(ctx.sessionId))?.focus);
   if (toolCall.name === "shell") {
-    return ctx.worker.run(String(toolCall.args.command));
+    return ctx.worker.run(String(toolCall.args.command), { signal: ctx.signal });
   }
   if (toolCall.name === "read_file" || toolCall.name === "edit_file" || toolCall.name === "write_file") {
     return dispatchFileTool(toolCall.name, toolCall.args, ctx.sandboxPolicy);
@@ -739,6 +764,8 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   let hops = 0;
   let finalContent = "";
   let cancelled = false;
+  // Fired by cancelSession(): stops the in-flight model request and shell command now.
+  const turnAbort = beginTurnAbort(sessionId);
   // Summed across every hop in this turn — a tool-calling turn makes
   // several model calls, and the cost/usage that matters is the whole
   // turn's total, not just the last hop's. Only ever reflects what the
@@ -855,17 +882,31 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     // — they're ephemeral live-progress signal; the one final assembled
     // "session.message" event below remains the durable record, same as
     // always, so the event log doesn't balloon with one entry per token.
-    const response = model.completeStream
-      ? await model.completeStream(
-          messages,
-          (delta) => {
-            publishEvent("agent.turn.delta", { sessionId, agentId, delta }).catch((err) => {
-              console.error("[agent-loop] failed to publish turn delta:", err instanceof Error ? err.message : err);
-            });
-          },
-          { tools },
-        )
-      : await model.complete(messages, { tools });
+    // Cancelling aborts this call for real (adapters cancel their fetch / child process via
+    // `signal`), and raceAbort() makes sure the turn stops waiting even for an adapter that ignores it.
+    let response: Awaited<ReturnType<ModelAdapter["complete"]>>;
+    try {
+      response = await raceAbort(
+        model.completeStream
+          ? model.completeStream(
+              messages,
+              (delta) => {
+                publishEvent("agent.turn.delta", { sessionId, agentId, delta }).catch((err) => {
+                  console.error("[agent-loop] failed to publish turn delta:", err instanceof Error ? err.message : err);
+                });
+              },
+              { tools, signal: turnAbort.signal },
+            )
+          : model.complete(messages, { tools, signal: turnAbort.signal }),
+        turnAbort.signal,
+      );
+    } catch (err) {
+      if (turnAbort.signal.aborted) {
+        cancelled = true;
+        break;
+      }
+      throw err;
+    }
 
     if (response.usage) {
       sawUsage = true;
@@ -945,6 +986,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
           agentId,
           sessionId,
           model,
+          signal: turnAbort.signal,
           enableSubagents,
           enableMemoryNominations,
           enableArtifacts,
@@ -1014,6 +1056,8 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled, error: message, usage } });
     await publishEvent("agent.turn.end", { sessionId, agentId, finalContent, toolCalled, cancelled, error: message, usage });
     throw err;
+  } finally {
+    endTurnAbort(sessionId, turnAbort);
   }
 
   // Used up every tool step without a final answer — say so instead of
