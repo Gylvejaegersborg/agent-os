@@ -21,6 +21,11 @@ and restart; to use another extraction model set `HINDSIGHT_LLM_PROVIDER` / `HIN
 as machine environment variables. It needs `PYTHONUTF8=1`, which the supervisor sets (its
 startup banner crashes on Windows' default encoding when output goes to a file).
 
+**Terminals** (Workbench → Terminal: Claude Code or a PowerShell) are off by default. A terminal is a full shell as the
+user the gateway runs as, and the gateway has no login, so anyone who can reach BaseSpace over your tailnet could use it.
+To turn them on, create an empty file `<root>\os-server\terminal.on` and restart the task; delete it to turn them off.
+The shell is PowerShell (`AGENT_OS_SHELL` to use another).
+
 Nothing listens on the LAN or Wi-Fi address. **Fails closed:** with no Tailscale
 address the supervisor waits and starts nothing; it never falls back to a LAN
 address. The Terminal feature (a shell over HTTP) is forced off.

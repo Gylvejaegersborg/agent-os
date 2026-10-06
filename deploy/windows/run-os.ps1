@@ -79,7 +79,9 @@ function Start-Hindsight {
 }
 
 function Start-Gateway {
-  Remove-Item Env:AGENT_OS_TERMINAL -ErrorAction SilentlyContinue   # terminals stay off
+  # Terminals (a full shell as this user, for anyone who can reach BaseSpace, i.e. your tailnet) are OFF unless you create
+  # an empty file os-server\terminal.on. Delete it and restart to turn them off again.
+  if (Test-Path (Join-Path $PSScriptRoot 'terminal.on')) { $env:AGENT_OS_TERMINAL = '1' } else { Remove-Item Env:AGENT_OS_TERMINAL -ErrorAction SilentlyContinue }
   # Agents recall from Hindsight when this is set; a down or still-starting Hindsight just means "no recall".
   if ($hindsightOn) { $env:HINDSIGHT_URL = 'http://127.0.0.1:8888' } else { Remove-Item Env:HINDSIGHT_URL -ErrorAction SilentlyContinue }
   $env:BASEOS_REPO_DIR = $baseSpace

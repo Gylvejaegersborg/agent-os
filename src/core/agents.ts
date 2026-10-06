@@ -118,8 +118,12 @@ export async function updateAgent(
 
 async function deriveLiveState(
   agentId: string,
+  shared?: { sessions: Awaited<ReturnType<typeof listSessions>>; tasks: Awaited<ReturnType<typeof listTasks>> },
 ): Promise<{ status: AgentLiveStatus; currentSessionId?: string; currentTaskId?: string; workerId?: string }> {
-  const [sessions, tasks] = await Promise.all([listSessions({ agentId, status: "active" }), listTasks({ agentId })]);
+  // Listing many agents loads the sessions and tasks once and filters per agent, instead of projecting them again for each.
+  const [sessions, tasks] = shared
+    ? [shared.sessions.filter((s) => s.agentId === agentId && s.status === "active"), shared.tasks.filter((t) => t.agentId === agentId)]
+    : await Promise.all([listSessions({ agentId, status: "active" }), listTasks({ agentId })]);
   const currentSession = sessions[sessions.length - 1]; // listSessions() sorts by createdAt ascending
 
   const linkedTask = currentSession?.taskId ? tasks.find((t) => t.id === currentSession.taskId) : undefined;
@@ -134,11 +138,41 @@ async function deriveLiveState(
   };
 }
 
-async function composeRecord(identity: AgentIdentity): Promise<AgentRecord> {
+/** Per-agent metrics take ~100 ms each to derive from the event log, and /agents asks for every agent on every
+ *  call (BaseSpace polls it, and gives up on the gateway after 3 s). So they are served from a short-lived cache:
+ *  stale ones are returned at once and refreshed in the background, so a poll never waits for the recomputation. */
+const METRICS_TTL_MS = Number(process.env.AGENT_OS_METRICS_TTL_MS ?? 15_000);
+const metricsCache = new Map<string, { at: number; value: Awaited<ReturnType<typeof computeMetricsSnapshot>>; refreshing?: boolean }>();
+
+async function cachedMetrics(agentId: string): Promise<Awaited<ReturnType<typeof computeMetricsSnapshot>>> {
+  const hit = metricsCache.get(agentId);
+  if (!hit) {
+    const value = await computeMetricsSnapshot(agentId);
+    metricsCache.set(agentId, { at: Date.now(), value });
+    return value;
+  }
+  if (Date.now() - hit.at > METRICS_TTL_MS && !hit.refreshing) {
+    hit.refreshing = true;
+    void computeMetricsSnapshot(agentId).then(
+      (value) => metricsCache.set(agentId, { at: Date.now(), value }),
+      () => {
+        hit.refreshing = false;
+      },
+    );
+  }
+  return hit.value;
+}
+
+/** For tests: forget cached metrics. */
+export function clearAgentMetricsCache(): void {
+  metricsCache.clear();
+}
+
+async function composeRecord(identity: AgentIdentity, shared?: Parameters<typeof deriveLiveState>[1]): Promise<AgentRecord> {
   const [defaultModel, live, metrics, control] = await Promise.all([
     getAgentDefaultModel(identity.id),
-    deriveLiveState(identity.id),
-    computeMetricsSnapshot(identity.id),
+    deriveLiveState(identity.id, shared),
+    cachedMetrics(identity.id),
     getAgentControlState(identity.id),
   ]);
   return {
@@ -165,7 +199,8 @@ export async function getAgentRecord(id: string): Promise<AgentRecord | undefine
 
 export async function listAgentRecords(): Promise<AgentRecord[]> {
   const identities = await listAgentIdentities();
-  return Promise.all(identities.map(composeRecord));
+  const [sessions, tasks] = await Promise.all([listSessions({}), listTasks({})]);
+  return Promise.all(identities.map((i) => composeRecord(i, { sessions, tasks })));
 }
 
 /** The one-line personas the roster was first seeded with (before the

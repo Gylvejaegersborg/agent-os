@@ -32,6 +32,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import os from "node:os";
+import { connectorGrants } from "../connectors.js";
 import type { ModelAdapter, ModelCallOptions, ModelMessage, ModelResponse } from "../model.js";
 import { registryToolSpecs, type ToolSpec } from "./real.js";
 
@@ -100,8 +101,10 @@ export function renderToolProtocol(tools: ToolSpec[]): string {
     "# Tools",
     "Agent-OS runs tools for you (your built-in tools are off). To use one, end your reply with exactly one block:",
     `${TOOL_OPEN}{"name": "<tool>", "args": {...}}${TOOL_CLOSE}`,
-    "That format only (not <function_calls> or XML), one call per reply, nothing after it — never guess a result. " +
+    "That format only for the Agent-OS tools below (not <function_calls> or XML), one call per reply, nothing after it — never guess a result. " +
       "The output comes back as a [tool result] message (some calls wait for the operator's approval). No tool needed → just answer.",
+    "You may also be offered native connector tools (names starting mcp__, e.g. a search or docs tool). Those are extras: call them natively, as usual. " +
+      "They never replace the Agent-OS tools below: those are always available to you, and are used ONLY with the block above.",
     "Tools (* = required argument):",
     list,
   ].join("\n");
@@ -238,11 +241,11 @@ function visiblePrefixLength(text: string): number {
   return text.length;
 }
 
-/** How the CLI is launched. Besides turning its own tools off, it must not load ANY MCP server: without
- *  `--strict-mcp-config` it picks up whatever connectors the operator's Claude account has (a model that
- *  sees those lists them as its tools and says it can't use ours, and could call them). Only Agent-OS's own
- *  tools, described in the system prompt, exist for it. */
-export function claudeCliArgs(systemPrompt: string, model?: string): string[] {
+/** How the CLI is launched. Its own built-in tools are off. The operator's MCP connectors stay loaded (they added them
+ *  on purpose), but a connector tool is refused in non-interactive mode unless granted, so the ones the operator
+ *  has enabled are granted here and the rest are withheld (connectors.ts). Agent-OS's own tools are described in
+ *  the system prompt and used with a block, never as native calls. */
+export function claudeCliArgs(systemPrompt: string, model?: string, grants: { allow: string[]; deny: string[] } = { allow: [], deny: [] }): string[] {
   return [
     "-p",
     "--output-format", "stream-json",
@@ -251,7 +254,8 @@ export function claudeCliArgs(systemPrompt: string, model?: string): string[] {
     "--tools", "",
     "--no-session-persistence",
     "--setting-sources", "",
-    "--strict-mcp-config",
+    ...(grants.allow.length ? ["--allowedTools", grants.allow.join(",")] : []),
+    ...(grants.deny.length ? ["--disallowedTools", grants.deny.join(",")] : []),
     "--system-prompt", systemPrompt,
     ...(model ? ["--model", model] : []),
   ];
@@ -268,7 +272,7 @@ export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter 
     const system = messages.find((m) => m.role === "system")?.content ?? "";
     const toolText = renderToolProtocol(callOpts?.tools ?? opts.tools ?? registryToolSpecs());
     const systemPrompt = [system, toolText].filter(Boolean).join("\n\n") || "You are a helpful assistant.";
-    const args = claudeCliArgs(systemPrompt, model);
+    const args = claudeCliArgs(systemPrompt, model, connectorGrants());
     // The CLI authenticates with its own login. ANTHROPIC_TOKEN is Agent-OS's
     // own variable for the direct-API path, not something the CLI reads —
     // dropped so it can't leak into the child's environment.

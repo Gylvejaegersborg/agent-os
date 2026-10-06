@@ -14,6 +14,7 @@
 // Run with: node dist/test-agents.js
 
 import "./test-helpers/isolate.js";
+import { clearAgentMetricsCache } from "./core/index.js";
 import {
   registerAgent,
   updateAgent,
@@ -124,11 +125,23 @@ async function testSeedDefaultAgentsIdempotent(): Promise<void> {
   assert(claudeCount === 1, "listAgentRecords() shows exactly one 'claude' entry after seeding twice");
 }
 
+/** BaseSpace polls /agents and treats a slow answer as "not connected", so listing must not recompute every agent's metrics each time. */
+async function testListIsCheap(): Promise<void> {
+  clearAgentMetricsCache();
+  const first = await listAgentRecords();
+  const second = await listAgentRecords();
+  const sameMetrics = first.every((a) => second.find((b) => b.id === a.id)?.metrics.generatedAt === a.metrics.generatedAt);
+  assert(first.length > 0 && sameMetrics, "a second listing within the cache window reuses each agent's metrics instead of recomputing them");
+  const live = await listAgentRecords();
+  assert(live.length === first.length && live.every((a) => typeof a.status === "string"), "each record still carries its live status (derived from tasks and sessions loaded once for the whole list)");
+}
+
 async function main(): Promise<void> {
   await testRegisterAndCompose();
   await testUpdateAgent();
   await testLiveStateIsDerived();
   await testSeedDefaultAgentsIdempotent();
+  await testListIsCheap();
 
   if (process.exitCode === 1) {
     console.error("\nSome agents tests FAILED.");

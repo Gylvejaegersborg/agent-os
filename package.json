@@ -68,7 +68,9 @@
     "test-e2e-scenario": "tsc -b && node dist/test-e2e-scenario.js",
     "test-soundlab": "tsc -b && node dist/test-soundlab.js",
     "test-soundpack": "tsc -b && node dist/test-soundpack.js",
-    "test-flow-honesty": "tsc -b && node dist/test-flow-honesty.js"
+    "test-flow-honesty": "tsc -b && node dist/test-flow-honesty.js",
+    "test-connectors": "tsc -b && node dist/test-connectors.js",
+    "test-terminal-shell": "tsc -b && node dist/test-terminal-shell.js"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

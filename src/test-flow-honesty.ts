@@ -1,8 +1,8 @@
 // Tests that a flow doesn't claim success it didn't earn, and that model calls through the Claude CLI
 // can only see Agent-OS's own tools.
-//   1. The CLI is launched with its own tools off AND without any MCP server (--strict-mcp-config), so the
-//      connectors on the operator's Claude account can't hide Agent-OS's tools from the model (seen live: a
-//      model listed the account's connectors as "its tools" and said it couldn't write to BaseSpace).
+//   1. The CLI is launched with its own tools off; the operator's connectors stay available but are granted
+//      explicitly, and the prompt says connector tools are extras (seen live: a model listed the account's
+//      connectors as "its tools" and said it couldn't write to BaseSpace, until the prompt said otherwise).
 //   2. A flow step that runs out of tool steps is FAILED, not succeeded; steps that depend on it are
 //      cancelled; steps that don't are unaffected; the reason is recorded.
 //   3. A step that finishes normally still succeeds.
@@ -10,7 +10,7 @@
 
 import "./test-helpers/isolate.js";
 import { createStubWorker, getTask, runFlow, seedDefaultAgents, type ModelAdapter, type ModelResponse } from "./core/index.js";
-import { claudeCliArgs } from "./core/models/claude-cli.js";
+import { claudeCliArgs, renderToolProtocol } from "./core/models/claude-cli.js";
 
 let failed = false;
 function assert(cond: boolean, msg: string): void {
@@ -22,11 +22,14 @@ function assert(cond: boolean, msg: string): void {
 }
 
 // --- 1. the CLI launch ---------------------------------------------------------------------
-const args = claudeCliArgs("SYSTEM PROMPT", "haiku");
-assert(args.includes("--strict-mcp-config"), "the CLI is launched with --strict-mcp-config (no connectors from the operator's account)");
-assert(args[args.indexOf("--tools") + 1] === "" && args.includes("--no-session-persistence") && args[args.indexOf("--setting-sources") + 1] === "", "…its own tools, saved sessions and settings stay off");
-assert(args[args.indexOf("--system-prompt") + 1] === "SYSTEM PROMPT" && args[args.indexOf("--model") + 1] === "haiku", "…the system prompt and model are passed through");
-assert(!claudeCliArgs("x").includes("--model"), "…and no model flag when none is set");
+const args = claudeCliArgs("SYSTEM PROMPT", "haiku", { allow: ["mcp__claude_ai_BeatStars"], deny: ["mcp__discord", "mcp__telegram"] });
+assert(args[args.indexOf("--tools") + 1] === "" && args.includes("--no-session-persistence") && args[args.indexOf("--setting-sources") + 1] === "", "the CLI's own tools, saved sessions and settings stay off");
+assert(args[args.indexOf("--allowedTools") + 1] === "mcp__claude_ai_BeatStars" && args[args.indexOf("--disallowedTools") + 1] === "mcp__discord,mcp__telegram", "enabled connectors are granted and the rest withheld (a connector call is refused in non-interactive mode unless granted)");
+assert(!args.includes("--strict-mcp-config"), "the operator's connectors are NOT cut off: they added them on purpose");
+assert(args[args.indexOf("--system-prompt") + 1] === "SYSTEM PROMPT" && args[args.indexOf("--model") + 1] === "haiku", "the system prompt and model are passed through");
+const bare = claudeCliArgs("x");
+assert(!bare.includes("--model") && !bare.includes("--allowedTools") && !bare.includes("--disallowedTools"), "no model or grant flags when there are none");
+assert(/native connector tools/.test(renderToolProtocol([{ name: "soundlab", description: "d", parameters: { type: "object", properties: {} } }])) && /ONLY with the block/.test(renderToolProtocol([{ name: "soundlab", description: "d", parameters: { type: "object", properties: {} } }])), "the prompt says plainly that connector tools are extras and Agent-OS tools are used with the block (seen live: without this a model said it couldn't use ours)");
 
 // --- 2/3. honest step outcomes ---------------------------------------------------------------
 await seedDefaultAgents();

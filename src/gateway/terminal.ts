@@ -60,6 +60,14 @@ const MAX_SCROLLBACK = 256 * 1024;
 const MAX_TERMINALS = 8;
 const sessions = new Map<string, TerminalSession>();
 
+/** The "Shell" profile's program: PowerShell on Windows (there is usually no `bash` on a service's PATH), else $SHELL or bash.
+ *  AGENT_OS_SHELL overrides it (a path, or a command name). */
+export function terminalShell(env: NodeJS.ProcessEnv = process.env, platform: string = process.platform): { file: string; args: string[] } {
+  if (env.AGENT_OS_SHELL) return { file: env.AGENT_OS_SHELL, args: [] };
+  if (platform === "win32") return { file: "powershell.exe", args: ["-NoLogo"] };
+  return { file: env.SHELL || "bash", args: [] };
+}
+
 export function terminalsEnabled(): boolean {
   return process.env.AGENT_OS_TERMINAL === "1";
 }
@@ -196,7 +204,7 @@ export async function createTerminal(input: { profile?: unknown; cols?: unknown;
   const [file, args, title] =
     profile === "claude"
       ? [claudeCliCommand(), claudeArgs(), "Claude Code"]
-      : [process.env.SHELL || "bash", [] as string[], "Shell"];
+      : [terminalShell().file, terminalShell().args, "Shell"];
 
   const info: TerminalInfo = { id: generateId(), profile, title, cwd, createdAt: new Date().toISOString(), cols, rows };
   const pty = await spawnPty(file, args, cols, rows, cwd, env);

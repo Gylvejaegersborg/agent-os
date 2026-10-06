@@ -135,6 +135,9 @@ import {
   recordDesktopCorrection,
   getFlowDefinition,
   storeFlowDefinition,
+  listConnectors,
+  refreshConnectors,
+  setConnectorEnabled,
   localDay,
 } from "../core/index.js";
 import { checkPathSandbox } from "../core/permissions.js";
@@ -498,6 +501,23 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
 
   // ---- Music library (core/library.ts): the operator's own uploads. ----
   if (segments[0] === "library" && (await handleLibrary(req, res, segments, url, { readJson: readRequestBody, sendJson }))) return;
+  // ---- Connectors (core/connectors.ts): the MCP connectors agents can reach through the Claude CLI. Operator-only. ----
+  if (segments[0] === "connectors") {
+    if (method === "GET" && segments.length === 1) {
+      if (url.searchParams.get("refresh") === "1") await refreshConnectors().catch(() => undefined);
+      sendJson(res, 200, listConnectors());
+      return;
+    }
+    if (method === "PUT" && segments.length === 2) {
+      const body = await readRequestBody(req);
+      try {
+        sendJson(res, 200, await setConnectorEnabled(decodeURIComponent(segments[1]!), body.enabled === true));
+      } catch (err) {
+        sendJson(res, 404, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+  }
   // ---- Sound Lab (core/soundlab.ts): synthesized candidates the operator listens to and judges. ----
   if (segments[0] === "soundlab" && (await handleSoundlab(req, res, segments, url, { readJson: readRequestBody, sendJson }))) return;
 
