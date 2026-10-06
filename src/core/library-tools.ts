@@ -10,6 +10,8 @@
 import { AudioError, audioEdit, audioInfo, renderInfo, type EditParams } from "./audio.js";
 import { LibraryError, addSongBy, getSong, importAudioFromPath, listSongs, updateSong, type LibrarySong } from "./library.js";
 import { checkPathSandbox, type SandboxPolicy } from "./permissions.js";
+import { isKind, listCandidates, stats as soundStats } from "./soundlab.js";
+import { listPacks } from "./soundpack.js";
 import { toolVisibleTo } from "./tool-registry.js";
 
 interface Result {
@@ -72,6 +74,36 @@ export async function dispatchLibrary(args: Record<string, unknown>, agentId: st
     return fail(`unknown action "${action}": use list, read, add or update (there is no delete; only the operator removes songs)`);
   } catch (err) {
     if (err instanceof LibraryError) return fail(err.message);
+    return fail(err instanceof Error ? err.message : String(err));
+  }
+}
+
+/** Read-only: what the operator kept in the Sound Lab and the packs built from it. There is no judging or building here. */
+export async function dispatchSoundlab(args: Record<string, unknown>): Promise<Result> {
+  const action = String(args.action ?? "");
+  try {
+    if (action === "kept") {
+      const kind = isKind(args.kind) ? args.kind : undefined;
+      const kept = await listCandidates({ verdict: "accepted", ...(kind ? { kind } : {}) });
+      const st = await soundStats();
+      const groups = new Map<string, string[]>();
+      for (const c of kept) groups.set(c.kind, [...(groups.get(c.kind) ?? []), c.label]);
+      const lines = [...groups].map(([k, labels]) => `${k} (${labels.length}): ${labels.join(", ")}`);
+      const waiting = Object.entries(st).filter(([k]) => k !== "total" && (!kind || k === kind)).reduce((n, [, v]) => n + v.pending, 0);
+      return { ok: true, output: kept.length ? `${kept.length} kept sound(s):\n${lines.join("\n")}\n${waiting} still waiting to be judged. You can't hear them; go by the names.` : `Nothing kept${kind ? ` for ${kind}` : ""} yet. ${waiting} waiting to be judged.` };
+    }
+    if (action === "packs") {
+      const packs = await listPacks();
+      if (!packs.length) return { ok: true, output: "No pack has been built yet. Only the operator builds one, from kept sounds." };
+      return {
+        ok: true,
+        output: packs
+          .map((p) => `${p.name} (${p.id}), built ${p.createdAt.slice(0, 10)}: ${p.sounds.length} sounds, ${(p.zipBytes / 1048576).toFixed(1)} MB. ${Object.entries(p.counts).map(([k, n]) => `${k} ${n}`).join(", ")}.\n  ${p.sounds.slice(0, 40).map((s) => s.label).join(", ")}${p.sounds.length > 40 ? ", …" : ""}\n  ${p.licenseNote}`)
+          .join("\n"),
+      };
+    }
+    return fail(`unknown action "${action}": use kept or packs (only the operator judges sounds and builds packs)`);
+  } catch (err) {
     return fail(err instanceof Error ? err.message : String(err));
   }
 }

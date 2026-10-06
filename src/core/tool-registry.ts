@@ -300,6 +300,17 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
     inputSchema: { day: { type: "string", description: "YYYY-MM-DD, local time. Default: today." } },
   },
   {
+    name: "soundlab",
+    description:
+      "The operator's Sound Lab: synthesized drums and melodic one-shots they listen to and judge. action = kept | packs. " +
+      "kept {kind?}: the sounds they kept (name and kind) and how many are waiting or in maybe. packs: the sound packs built from kept sounds and what is in them. " +
+      "You can't hear anything, and you can't accept, skip or build: only the operator judges and builds packs. Describe sounds only by their names and the counts; never say how one sounds.",
+    inputSchema: {
+      action: { type: "string", required: true, description: "kept or packs." },
+      kind: { type: "string", description: "kept: only this kind (808, kick, snare, clap, perc, hat-closed, hat-open, bell, pluck, keys, pad, strings, lead)." },
+    },
+  },
+  {
     name: "audio",
     description:
       "Audio editing with ffmpeg, like the practical parts of Audacity. action = info | edit. info {path}: length, format, peak and average level, loudness in LUFS. " +

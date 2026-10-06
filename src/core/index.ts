@@ -47,3 +47,4 @@ export * from "./desktop-learning.js";
 export * from "./flow-proposals.js";
 export * from "./soundgen.js";
 export * from "./soundlab.js";
+export * from "./soundpack.js";

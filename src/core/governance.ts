@@ -109,7 +109,7 @@ export async function hireAgent(args: Record<string, unknown>, proposedBy: strin
   const { registerAgent } = await import("./agents.js");
   await registerAgent({ id, name, role, persona, ...(model ? { defaultModel: model } : {}), ...(reportsTo !== OPERATOR ? { reportsTo } : {}) });
   // Same defaults the roster gets: it may read and write BaseSpace.
-  await seedAllowRules(["basespace", "basespace-add", "library"].map((toolName) => ({ agentId: id, toolName })));
+  await seedAllowRules(["basespace", "basespace-add", "library", "soundlab"].map((toolName) => ({ agentId: id, toolName })));
   await appendEvent(GOVERNANCE_STREAM, "agent.hired", { id, proposedBy, reportsTo });
   await publishEvent("agent.hired", { id, proposedBy });
   return {

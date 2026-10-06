@@ -6,8 +6,12 @@
 //   GET  /soundlab/candidates/:id/audio                    the sound as a 24-bit WAV (Range supported)
 //   POST /soundlab/candidates/:id/judge    {verdict}       accept / maybe / skip (or pending, to undo)
 //   GET  /soundlab/stats                                    counts per kind and verdict
+//   POST /soundlab/packs {name, ids}        build a pack (a zip of 24-bit WAVs, README, license draft, manifest) from KEPT sounds
+//   GET  /soundlab/packs, /soundlab/packs/:id, /soundlab/packs/:id/download
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { createReadStream } from "node:fs";
+import { createPack, getPack, listPacks, packFile } from "../core/soundpack.js";
 import { SoundLabError, generateBatch, isKind, judge, listCandidates, renderCandidateWav, stats, type Verdict } from "../core/soundlab.js";
 import { parseRange } from "./library-routes.js";
 
@@ -32,6 +36,30 @@ export async function handleSoundlab(req: IncomingMessage, res: ServerResponse, 
       const kind = url.searchParams.get("kind");
       h.sendJson(res, 200, { candidates: await listCandidates({ ...(verdict ? { verdict } : {}), ...(isKind(kind) ? { kind } : {}) }) });
       return true;
+    }
+    if (segments[1] === "packs") {
+      if (method === "POST" && segments.length === 2) {
+        const body = await h.readJson(req);
+        h.sendJson(res, 201, await createPack(body.name, body.ids));
+        return true;
+      }
+      if (method === "GET" && segments.length === 2) {
+        h.sendJson(res, 200, { packs: await listPacks() });
+        return true;
+      }
+      if (method === "GET" && segments.length === 3) {
+        const pack = await getPack(segments[2]!);
+        if (!pack) throw new SoundLabError(404, "no such pack");
+        h.sendJson(res, 200, pack);
+        return true;
+      }
+      if (method === "GET" && segments.length === 4 && segments[3] === "download") {
+        const file = await packFile(segments[2]!);
+        if (!file) throw new SoundLabError(404, "no such pack");
+        res.writeHead(200, { "content-type": "application/zip", "content-disposition": `attachment; filename="${file.name}"`, "x-content-type-options": "nosniff" });
+        createReadStream(file.path).on("error", () => res.destroy()).pipe(res);
+        return true;
+      }
     }
     if (method === "GET" && segments[1] === "stats" && segments.length === 2) {
       h.sendJson(res, 200, await stats());

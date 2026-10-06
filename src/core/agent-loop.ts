@@ -27,7 +27,7 @@ import type { ArtifactType } from "./artifacts.js";
 import type { EpisodicKind } from "./types.js";
 import { checkPathSandbox, type SandboxPolicy } from "./permissions.js";
 import { recordFileRevision } from "./file-revisions.js";
-import { dispatchAudio, dispatchLibrary } from "./library-tools.js";
+import { dispatchAudio, dispatchLibrary, dispatchSoundlab } from "./library-tools.js";
 import { renderDesktopReport } from "./desktop.js";
 import { adoptFlow } from "./flow-proposals.js";
 
@@ -669,6 +669,7 @@ async function dispatchTool(
   }
   if (toolCall.name === "desktop") return { ok: true, output: await renderDesktopReport(typeof toolCall.args.day === "string" ? toolCall.args.day : undefined) };
   if (toolCall.name === "library") return dispatchLibrary(toolCall.args, ctx.agentId, ctx.sandboxPolicy);
+  if (toolCall.name === "soundlab") return dispatchSoundlab(toolCall.args);
   if (toolCall.name === "audio") return dispatchAudio(toolCall.args, ctx.sandboxPolicy);
   if (toolCall.name === "basespace-add") {
     const kind = String(toolCall.args.kind ?? "") as OverlayKind;
@@ -723,6 +724,7 @@ function offeredTools(
     basespace: on.enableBaseSpace,
     "basespace-add": on.enableBaseSpace,
     library: on.enableBaseSpace,
+    soundlab: on.enableBaseSpace,
     desktop: on.enableBaseSpace,
     delegate: on.enableBaseSpace,
     work: on.enableBaseSpace,
