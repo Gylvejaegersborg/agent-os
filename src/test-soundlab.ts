@@ -99,7 +99,7 @@ const withDefaults = (kind: SoundKind, over: Record<string, number>) => ({ ...cl
 // --- 1. clean, deterministic, sensible -----------------------------------------------
 const LEN: Record<SoundKind, [number, number]> = {
   kick: [0.1, 0.8], "808": [0.5, 3.6], snare: [0.1, 1.2], clap: [0.1, 1.8], perc: [0.04, 0.9], "hat-closed": [0.02, 0.25], "hat-open": [0.2, 1.7],
-  bell: [1, 6.5], pluck: [0.25, 6], keys: [1, 8], pad: [2.4, 11], strings: [0.4, 7], lead: [1, 3.6],
+  bell: [1, 6.5], pluck: [0.25, 6], keys: [0.4, 14], pad: [2.4, 11], strings: [0.4, 7], lead: [1, 3.6],
 };
 const STEREO = new Set<SoundKind>(["bell", "pluck", "keys", "pad", "strings", "lead"]);
 for (const kind of SOUND_KINDS) {
@@ -280,7 +280,8 @@ for (const kind of SOUND_KINDS) {
 }
 
 // Old sounds are untouched: 66 recorded renders from the previous engine come out byte for byte the same.
-const gold = JSON.parse(await readFile(path.join(process.cwd(), "src", "test-data", "soundlab-v2-golden.json"), "utf8")) as { kind: SoundKind; params: Record<string, number>; seed: number; channels: number; frames: number; sha1: string }[];
+const readGold = async (f: string) => JSON.parse(await readFile(path.join(process.cwd(), "src", "test-data", f), "utf8")) as { kind: SoundKind; params: Record<string, number>; seed: number; channels: number; frames: number; sha1: string }[];
+const gold = [...(await readGold("soundlab-v2-golden.json")), ...(await readGold("soundlab-v3-golden.json"))];
 let changed = 0;
 for (const g of gold) {
   const chs = renderSound(g.kind, g.params, g.seed);
@@ -288,7 +289,7 @@ for (const g of gold) {
   for (const c of chs) h.update(Buffer.from(c.buffer, c.byteOffset, c.byteLength));
   if (h.digest("hex") !== g.sha1 || chs.length !== g.channels || chs[0]!.length !== g.frames) changed++;
 }
-assert(gold.length >= 60 && changed === 0, `old sounds render byte for byte as before (${gold.length} recorded renders, ${changed} changed)`);
+assert(gold.length >= 200 && changed === 0, `sounds already made render byte for byte as before (${gold.length} recorded renders from engine v2 and v3, ${changed} changed)`);
 
 // Kicks: less EDM (lower start pitch), less jumpy.
 const startPitch = (legacy: boolean) => {
@@ -420,10 +421,53 @@ const pitchOk = [3, 4, 5].every((t) => {
   return [1, 2, 0.5].some((m) => Math.abs(ratio / m - 1) < 0.025);
 });
 assert(pitchOk, "piano, Rhodes and Wurlitzer are tuned to C");
-assert(profiles("keys", 18, 2200) >= 4, `keys differ from each other (${profiles("keys", 18, 2200)} profiles)`);
+assert(profiles("keys", 24, 2200) >= 6, `keys differ from each other (${profiles("keys", 24, 2200)} profiles in 24)`);
 let organ = 0;
 for (let i = 0; i < 300; i++) if (randomParams("keys", rng(i))["type"] === 2) organ++;
-assert(organ === 0 && new Set(Array.from({ length: 120 }, (_, i) => randomParams("keys", rng(i))["type"])).size === 4, "no organ is ever generated; keys are grand, Rhodes, Wurlitzer and felt");
+assert(organ === 0 && new Set(Array.from({ length: 300 }, (_, i) => randomParams("keys", rng(i))["type"])).size === 9, "no organ is ever generated; keys are nine builds: grand, Rhodes, Wurlitzer, felt, honky-tonk, upright, lo-fi, mute and ambient");
+
+// The piano family: every build is a different instrument, all in tune.
+const fam = [3, 6, 7, 8, 9, 10, 11];
+const famSig = new Map<number, { cen: number; len: number; hf: number }>();
+const famOff: string[] = [];
+for (const t of fam) {
+  const params = withDefaults("keys", { type: t, octave: 3, wet: 0, decay: 2, tremolo: 0, bright: 0.6, hammer: 0.3, beat: 0.5 });
+  const d = renderSound("keys", params, 6);
+  const mono = d[0]!;
+  const e = bandEnergy(mono, 2500, Math.round(0.12 * SAMPLE_RATE), 4096);
+  famSig.set(t, { cen: centroid(mono, Math.round(0.12 * SAMPLE_RATE), 4096), len: mono.length / SAMPLE_RATE, hf: e.high / (e.low + e.high) });
+  const ratio = pitch(mono, Math.round(0.35 * SAMPLE_RATE)) / C(3);
+  if (![1, 2, 0.5].some((m) => Math.abs(ratio / m - 1) < 0.04)) famOff.push(`${soundLabel("keys", params)} (${(ratio * C(3)).toFixed(1)} Hz)`);
+}
+assert(famOff.length === 0, `every piano build is tuned to C${famOff.length ? ` (off: ${famOff.join("; ")})` : ""}`);
+let distinct = 0;
+let pairs = 0;
+for (let i = 0; i < fam.length; i++) {
+  for (let j = i + 1; j < fam.length; j++) {
+    const a = famSig.get(fam[i]!)!;
+    const b = famSig.get(fam[j]!)!;
+    pairs++;
+    // Different if the brightness differs by 25%, or the length by 25%, or the high-band share by half.
+    if (Math.abs(Math.log(a.cen / b.cen)) > 0.22 || Math.abs(Math.log(a.len / b.len)) > 0.22 || Math.abs(a.hf - b.hf) > 0.5 * Math.max(a.hf, b.hf, 1e-6)) distinct++;
+  }
+}
+assert(distinct >= pairs * 0.85, `the seven piano builds are clearly different from each other (${distinct} of ${pairs} pairs differ in brightness, length or top end)`);
+const honky = renderSound("keys", withDefaults("keys", { type: 7, octave: 3, wet: 0, strike: 0.1 }), 6)[0]!;
+const grand = renderSound("keys", withDefaults("keys", { type: 3, octave: 3, wet: 0, strike: 0.1 }), 6)[0]!;
+assert(centroid(honky, Math.round(0.1 * SAMPLE_RATE), 4096) > centroid(grand, Math.round(0.1 * SAMPLE_RATE), 4096) * 0.95, "honky-tonk is the brighter, thinner piano");
+const strikeA = renderSound("keys", withDefaults("keys", { type: 3, octave: 3, wet: 0, strike: 0.09 }), 6)[0]!;
+const strikeB = renderSound("keys", withDefaults("keys", { type: 3, octave: 3, wet: 0, strike: 0.22 }), 6)[0]!;
+assert(strikeA.some((v, i) => Math.abs(v - strikeB[i]!) > 0.01), "where the hammer strikes changes the grand's tone");
+const muteLen = renderSound("keys", withDefaults("keys", { type: 10, octave: 4, wet: 0 }), 6)[0]!.length / SAMPLE_RATE;
+const ambLen = renderSound("keys", withDefaults("keys", { type: 11, octave: 4 }), 6)[0]!.length / SAMPLE_RATE;
+assert(muteLen < 1.5 && ambLen > 6, `a muted piano is short (${muteLen.toFixed(1)} s) and an ambient one runs long (${ambLen.toFixed(1)} s)`);
+let lofiNoise = 0;
+for (const t of [9, 3]) {
+  const d = renderSound("keys", withDefaults("keys", { type: t, octave: 4, wet: 0, decay: 2 }), 7)[0]!;
+  const e = bandEnergy(d, 4000, Math.round(1.8 * SAMPLE_RATE), 4096);
+  lofiNoise += (t === 9 ? 1 : -1) * (e.high / (e.low + e.high + 1e-12));
+}
+assert(lofiNoise > 0, "the lo-fi piano carries tape hiss in its tail (more top end late in the note than a clean piano)");
 
 // Leads: soft, and nothing piercing.
 let leadTop = 0;

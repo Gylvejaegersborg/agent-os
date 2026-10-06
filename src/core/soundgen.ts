@@ -60,7 +60,7 @@ export const RECIPES: Record<SoundKind, Record<string, Range>> = {
   "hat-open": { scale: r(0.85, 1.35), spread: r(0, 0.12), hp: r(3000, 7000), air: r(9000, 16000), decay: r(0.25, 0.8), swell: r(0.002, 0.014), noise: r(0.35, 0.85), type: T(4, [0, 1, 1, 1, 1]), rough: N(0, 0.6, 0) },
   bell: { type: T(4, [1, 0, 1.4, 1, 1]), octave: r(4, 5, true), ratioIdx: r(0, 3, true), index: r(0.6, 3.2), indexDecay: r(0.12, 0.6), decay: r(1.2, 3.4), tone: r(3200, 7000), chorus: r(0, 0.4), wet: r(0.12, 0.6), echo: N(0, 0.5, 0), echoTime: N(0.16, 0.42, 0.3), echoFb: N(0.25, 0.55, 0.4), shimmer: N(0, 0.5, 0), bswell: N(0, 0.25, 0), autopan: N(0, 0.6, 0) },
   pluck: { type: T(8, [0, 0, 0, 0, 1, 1, 1, 1, 1]), octave: r(3, 5, true), damp: r(0.8, 0.995), spread: r(4, 22), cutoff0: r(2200, 8000), cutoff1: r(250, 1000), filterDecay: r(0.08, 0.5), decay: r(0.4, 1.4), drive: r(1, 2.5), chorus: r(0, 0.5), wet: r(0.05, 0.35), body: N(0.2, 1, 0.5), pick: N(0, 0.8, 0.3), pos: N(0.1, 0.5, 0.25) },
-  keys: { type: T(6, [0, 0, 0, 1, 1, 1, 1]), octave: r(3, 5, true), index: r(0.4, 1.6), indexDecay: r(0.3, 1.1), decay: r(1.2, 2.8), bright: r(0.2, 1), chorus: r(0, 0.6), wet: r(0.05, 0.3), drive: r(1, 2.5), tremolo: N(0, 0.4, 0), hammer: N(0, 0.6, 0.3), beat: N(0.2, 1, 0.5) },
+  keys: { type: T(11, [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1]), octave: r(2, 5, true), index: r(0.4, 1.6), indexDecay: r(0.3, 1.1), decay: r(1.2, 2.8), bright: r(0.2, 1), chorus: r(0, 0.6), wet: r(0.05, 0.3), drive: r(1, 2.5), tremolo: N(0, 0.4, 0), hammer: N(0, 0.6, 0.3), beat: N(0.2, 1, 0.5), strike: N(0.09, 0.25, 0.125) },
   pad: { type: r(0, 2, true), octave: r(3, 4, true), spread: r(6, 24), cutoff: r(700, 3200), attack: r(0.25, 0.9), hold: r(1.2, 5), release: r(1, 2), vowel: r(0, 1), chorus: r(0.2, 0.8), wet: r(0.25, 0.5) },
   strings: { type: T(4), chord: r(0, 3, true, { def: 0 }), octave: r(2, 4, true), attack: r(0.08, 0.7), hold: r(1.2, 2.8), release: r(0.8, 1.6), bright: r(0, 1), vibrato: r(3, 10), voices: r(3, 6, true), chorus: r(0.3, 0.8), wet: r(0.2, 0.5) },
   lead: { type: T(6, [0, 0, 0, 1, 1, 1, 1]), octave: r(4, 5, true), spread: r(5, 22), vibrato: r(0, 22), cutoff: r(2200, 5800), glideSemi: r(0, 2.5), decay: r(0.2, 0.7), wet: r(0.1, 0.35), drive: r(1, 2.6), soft: N(0.01, 0.12, 0.006) },
@@ -79,7 +79,7 @@ const TYPE_NAMES: Partial<Record<SoundKind, string[]>> = {
   "hat-open": ["", "Clean", "Sizzle", "Wash", "Dark"],
   bell: ["Glass", "Music Box", "Chime", "Tubular", "Celesta"],
   pluck: ["String", "Saw", "Marimba", "Glass", "Nylon", "Harp", "Kalimba", "Pizzicato", "Oud"],
-  keys: ["E-Piano", "Piano", "Organ", "Grand", "Rhodes", "Wurly", "Felt"],
+  keys: ["E-Piano", "Piano", "Organ", "Grand", "Rhodes", "Wurly", "Felt", "Honky", "Upright", "Lo-fi", "Mute", "Ambient"],
   pad: ["Strings", "Choir", "Glass"],
   strings: ["Legato", "Staccato", "Swell", "Tremolo", "Pizzicato"],
   lead: ["Super", "PWM", "Flute", "Soft", "Sine", "Hollow", "Dark Super"],
@@ -1172,7 +1172,7 @@ function renderPluckNatural(p: Params, rand: () => number): Float32Array[] {
 
 /** A piano from its physics: stretched partials, two strings per note that beat, a hammer
  *  that skips some partials, upper partials that die first, a thump at the front. */
-function pianoModel(f: number, dur: number, bright: number, hammer: number, beat: number, soft: boolean, rand: () => number): Float32Array[] {
+function pianoModel(f: number, dur: number, bright: number, hammer: number, beat: number, soft: boolean, rand: () => number, strike = 0.125): Float32Array[] {
   const len = samples(dur);
   const L = new Float32Array(len);
   const R = new Float32Array(len);
@@ -1180,7 +1180,7 @@ function pianoModel(f: number, dur: number, bright: number, hammer: number, beat
   const K = Math.min(18, Math.floor(9000 / f));
   for (let k = 1; k <= K; k++) {
     const fk = k * f * Math.sqrt(1 + B * k * k);
-    const amp = Math.abs(Math.sin(Math.PI * k * 0.125)) / k ** (soft ? 1.7 : 1.1 + (1 - bright) * 0.9);
+    const amp = Math.abs(Math.sin(Math.PI * k * strike)) / k ** (soft ? 1.7 : 1.1 + (1 - bright) * 0.9);
     const tau = dur / (1.1 + 0.55 * (k - 1));
     const b = beat * (0.25 + 0.45 * rand());
     const w1 = (2 * Math.PI * (fk - b / 2)) / SAMPLE_RATE;
@@ -1209,12 +1209,102 @@ function pianoModel(f: number, dur: number, bright: number, hammer: number, beat
   return [L, R];
 }
 
+/** The same physics as pianoModel, with the things that make one piano sound unlike another turned into options:
+ *  how many strings and how far apart they sit, where the hammer strikes, how fast the highs die, the felt, the room,
+ *  tape wobble and hiss. (pianoModel itself is left alone so sounds already made don't change.) */
+interface PianoOpts {
+  dur: number;
+  bright: number;
+  exp: number;
+  strike: number;
+  strings: 2 | 3;
+  /** Beat frequency between strings, in Hz. */
+  beat: number;
+  cut: number;
+  attack: number;
+  thump: number;
+  thumpCut: number;
+  /** Tape wobble depth in cents (0 = none). */
+  wow: number;
+  hiss: number;
+  crush: number;
+  decayLift: number;
+  /** Share of the slow second stage of the decay (0 = it just dies away, as a muted string does). */
+  slow: number;
+}
+
+function pianoModel2(f: number, o: PianoOpts, rand: () => number): Float32Array[] {
+  const len = samples(o.dur);
+  const L = new Float32Array(len);
+  const R = new Float32Array(len);
+  const B = 0.00006 * (f / 65) ** 1.3;
+  const K = Math.min(18, Math.floor(9000 / f));
+  const pm = new Float32Array(len).fill(1);
+  if (o.wow > 0) {
+    const r1 = 0.45 + rand() * 0.3;
+    const r2 = 5 + rand() * 2;
+    for (let i = 0; i < len; i++) pm[i] = cents(o.wow * (Math.sin((2 * Math.PI * r1 * i) / SAMPLE_RATE) + 0.25 * Math.sin((2 * Math.PI * r2 * i) / SAMPLE_RATE)));
+  }
+  const pans = o.strings === 3 ? [[0.8, 0.2], [0.5, 0.5], [0.2, 0.8]] : [[0.68, 0.32], [0.32, 0.68]];
+  for (let k = 1; k <= K; k++) {
+    const fk = k * f * Math.sqrt(1 + B * k * k);
+    const amp = Math.abs(Math.sin(Math.PI * k * o.strike)) / k ** o.exp;
+    const tau = o.dur / (1.1 + o.decayLift * (k - 1));
+    for (let s = 0; s < o.strings; s++) {
+      const off = (s - (o.strings - 1) / 2) * o.beat * (0.25 + 0.45 * rand());
+      const w = (2 * Math.PI * (fk + off)) / SAMPLE_RATE;
+      let ph = rand() * 6.28;
+      const [pl, pr] = pans[s]!;
+      for (let i = 0; i < len; i++) {
+        const t = i / SAMPLE_RATE;
+        ph += w * pm[i]!;
+        const e = (amp / o.strings) * ((1 - o.slow) * Math.exp(-t / tau) + o.slow * Math.exp(-t / (tau * 3.2)));
+        const v = Math.sin(ph) * e;
+        L[i]! += v * pl! * 2;
+        R[i]! += v * pr! * 2;
+      }
+    }
+  }
+  const thump = hardClick(rand, 9, o.thumpCut);
+  const hiss = new Float32Array(len);
+  if (o.hiss > 0) {
+    for (let i = 0; i < len; i++) hiss[i] = noise(rand);
+    filterAll("bp", 5200, 0.7, hiss);
+  }
+  for (let i = 0; i < len; i++) {
+    const a = Math.min(1, i / SAMPLE_RATE / o.attack);
+    const th = (thump[i] ?? 0) * o.thump * 0.5;
+    const hs = hiss[i]! * o.hiss * 0.05 * Math.min(1, i / SAMPLE_RATE / 0.05);
+    L[i] = L[i]! * a + th + hs;
+    R[i] = R[i]! * a + th + hs;
+  }
+  filterAll("lp", o.cut, 0.707, L);
+  filterAll("lp", o.cut, 0.707, R);
+  if (o.crush > 0) {
+    crush(L, o.crush);
+    crush(R, o.crush);
+  }
+  return [L, R];
+}
+
 function renderKeys3(p: Params, rand: () => number): Float32Array[] {
   const t = p.type!;
   const f = freqC(p.octave!);
   let ch: Float32Array[];
   if (t === 3 || t === 6) {
-    ch = pianoModel(f, t === 6 ? 1.6 + p.decay! * 0.8 : 2.4 + p.decay! * 1.4, p.bright!, p.hammer!, p.beat!, t === 6, rand);
+    ch = pianoModel(f, t === 6 ? 1.6 + p.decay! * 0.8 : 2.4 + p.decay! * 1.4, p.bright!, p.hammer!, p.beat!, t === 6, rand, p.strike!);
+  } else if (t >= 7) {
+    // The rest of the piano family: each is a different instrument, not the same piano with other numbers.
+    const base: PianoOpts = { dur: 2.4, bright: p.bright!, exp: 1.2, strike: p.strike!, strings: 2, beat: p.beat! * 1.5, cut: 3500 + p.bright! * 4500, attack: 0.002, thump: p.hammer!, thumpCut: 1600, wow: 0, hiss: 0, crush: 0, decayLift: 0.55, slow: 0.3 };
+    const o: PianoOpts =
+      t === 7 ? { ...base, dur: 1.6 + p.decay! * 0.5, exp: 0.9, strings: 3, beat: 2.5 + p.beat! * 3, cut: 6000 + p.bright! * 3000, strike: Math.min(p.strike!, 0.12), decayLift: 0.8 }
+      : t === 8 ? { ...base, dur: 1.4 + p.decay! * 0.7, exp: 1.45, cut: 2800 + p.bright! * 1700, thump: p.hammer! * 1.6 + 0.2, thumpCut: 900, decayLift: 0.7 }
+      : t === 9 ? { ...base, dur: 1.5 + p.decay! * 0.6, exp: 1.6, cut: 1500 + p.bright! * 1100, wow: 7 + p.tremolo! * 25, hiss: 0.5 + p.hammer!, crush: 0.15 + p.tremolo! * 0.4 }
+      : t === 10 ? { ...base, dur: 0.6 + p.decay! * 0.18, slow: 0.03, exp: 2.1, cut: 900 + p.bright! * 700, attack: 0.004, thump: p.hammer! * 1.3 + 0.2, thumpCut: 700, decayLift: 1.4 }
+      : { ...base, dur: 4.5 + p.decay! * 1.8, exp: 1.3, strings: 3, beat: p.beat! * 0.8, cut: 2500 + p.bright! * 2500, attack: 0.09 + p.hammer! * 0.4, thump: 0.05, decayLift: 0.3 };
+    ch = pianoModel2(f, o, rand);
+    const room = t === 11 ? Math.min(0.7, 0.4 + p.wet!) : t === 7 ? p.wet! * 0.4 : t === 10 ? p.wet! * 0.3 : t === 9 ? p.wet! * 0.6 : p.wet! * 0.8;
+    return reverb(ch, room, t === 11 ? 3.0 : t === 8 ? 0.9 : 1.2);
   } else {
     // Rhodes (4) and Wurlitzer (5): a few soft partials, a short tine, a thump, some bark, a tremolo.
     const dur = p.decay! * (t === 5 ? 0.75 : 1.15);
