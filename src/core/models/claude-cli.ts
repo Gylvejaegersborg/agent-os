@@ -238,6 +238,25 @@ function visiblePrefixLength(text: string): number {
   return text.length;
 }
 
+/** How the CLI is launched. Besides turning its own tools off, it must not load ANY MCP server: without
+ *  `--strict-mcp-config` it picks up whatever connectors the operator's Claude account has (a model that
+ *  sees those lists them as its tools and says it can't use ours, and could call them). Only Agent-OS's own
+ *  tools, described in the system prompt, exist for it. */
+export function claudeCliArgs(systemPrompt: string, model?: string): string[] {
+  return [
+    "-p",
+    "--output-format", "stream-json",
+    "--verbose",
+    "--include-partial-messages",
+    "--tools", "",
+    "--no-session-persistence",
+    "--setting-sources", "",
+    "--strict-mcp-config",
+    "--system-prompt", systemPrompt,
+    ...(model ? ["--model", model] : []),
+  ];
+}
+
 export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter {
   const command = opts.command ?? claudeCliCommand();
   const thinkSuffix = /\+think$/.test(opts.model ?? "");
@@ -249,17 +268,7 @@ export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter 
     const system = messages.find((m) => m.role === "system")?.content ?? "";
     const toolText = renderToolProtocol(callOpts?.tools ?? opts.tools ?? registryToolSpecs());
     const systemPrompt = [system, toolText].filter(Boolean).join("\n\n") || "You are a helpful assistant.";
-    const args = [
-      "-p",
-      "--output-format", "stream-json",
-      "--verbose",
-      "--include-partial-messages",
-      "--tools", "",
-      "--no-session-persistence",
-      "--setting-sources", "",
-      "--system-prompt", systemPrompt,
-      ...(model ? ["--model", model] : []),
-    ];
+    const args = claudeCliArgs(systemPrompt, model);
     // The CLI authenticates with its own login. ANTHROPIC_TOKEN is Agent-OS's
     // own variable for the direct-API path, not something the CLI reads —
     // dropped so it can't leak into the child's environment.

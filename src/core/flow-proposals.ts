@@ -240,7 +240,9 @@ export async function adoptFlow(
   await appendEvent(GOVERNANCE_STREAM, "flow.adopted", { flowId: flow.id, proposedBy, validator: verifierId(), steps: check.steps.length });
   await publishEvent("flow.adopted", { flowId: flow.id, proposedBy });
 
-  void resumeFlow(flow.id, check.steps, { ...drive, enableBaseSpace: true, ...(focus ? { focus } : {}) }).then(
+  // A flow step does real work (read notes, write notes), so it gets more tool steps than a chat message does.
+  const stepHops = Number(process.env.AGENT_OS_FLOW_STEP_HOPS ?? 10);
+  void resumeFlow(flow.id, check.steps, { ...drive, enableBaseSpace: true, maxToolHopsPerStep: Number.isFinite(stepHops) && stepHops > 0 ? stepHops : 10, ...(focus ? { focus } : {}) }).then(
     async (result) => {
       const lines = result.steps.map((s) => `${s.stepId}: ${s.status}`).join(", ");
       await appendSessionNote(sessionId, "Flow", `The flow "${summary || flow.id}" finished as ${result.status}. Steps: ${lines}.`).catch(() => {});

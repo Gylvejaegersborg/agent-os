@@ -218,6 +218,13 @@ async function runStepOnce(
       enableBaseSpace: opts.enableBaseSpace,
       sandboxPolicy: opts.sandboxPolicy,
     });
+    // A step that ran out of tool steps didn't finish its work: say so instead of reporting success.
+    if (result.stopReason === "max-hops") {
+      const error = "the agent ran out of tool steps before finishing (raise AGENT_OS_FLOW_STEP_HOPS, or split the step)";
+      await transitionTask(task.id, "failed", { output: { error, finalContent: result.finalContent, sessionId: session.id } });
+      await publishEvent("flow.step.completed", { flowId, stepId: step.id, agentId: step.agentId, taskId: task.id, status: "failed", error });
+      return { status: "failed", taskId: task.id, finalContent: result.finalContent };
+    }
     await transitionTask(task.id, "succeeded", { output: { finalContent: result.finalContent, sessionId: session.id } });
     await publishEvent("flow.step.completed", { flowId, stepId: step.id, agentId: step.agentId, taskId: task.id, status: "succeeded" });
     return { status: "succeeded", taskId: task.id, finalContent: result.finalContent };
