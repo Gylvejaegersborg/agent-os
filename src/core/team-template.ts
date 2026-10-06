@@ -281,7 +281,7 @@ export async function applyTeamImport(files: TeamFiles, opts: { skills?: SkillRe
   for (const id of p.create) {
     const s = specs.get(id)!;
     await registerAgent({ id, name: s.name, persona: s.persona, ...(s.role ? { role: s.role } : {}), ...(s.capabilities ? { capabilities: s.capabilities } : {}), ...(s.model ? { defaultModel: s.model } : {}) });
-    await seedAllowRules(["basespace", "basespace-add", "library", "soundlab"].map((toolName) => ({ agentId: id, toolName })));
+    await seedAllowRules(["basespace", "basespace-add", "library", "soundlab", "connector"].map((toolName) => ({ agentId: id, toolName })));
   }
   for (const u of [...p.update, ...p.create.map((id) => ({ id, fields: ["reportsTo", "budget"] }))]) {
     const s = specs.get(u.id)!;

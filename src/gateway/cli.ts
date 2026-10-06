@@ -229,7 +229,7 @@ async function main(): Promise<void> {
   // policy asks by default — may also use the other harness tools that
   // can't touch files or a shell. Editable per agent from the Workbench.
   const seededRules = await seedAllowRules([
-    ...roster.flatMap((a) => ["basespace", "basespace-add", "library", "soundlab"].map((toolName) => ({ agentId: a.id, toolName }))),
+    ...roster.flatMap((a) => ["basespace", "basespace-add", "library", "soundlab", "connector"].map((toolName) => ({ agentId: a.id, toolName }))),
     ...DESKTOP_READERS.map((agentId) => ({ agentId, toolName: "desktop" })),
     ...["recall-memory", "skill", "nominate-memory", "record-artifact"].map((toolName) => ({ agentId: ENGINEER_AGENT_ID, toolName })),
   ]);

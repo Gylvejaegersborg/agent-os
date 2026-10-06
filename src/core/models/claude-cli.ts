@@ -46,6 +46,10 @@ export interface ClaudeCliOptions {
   command?: string;
   tools?: ToolSpec[];
   timeoutMs?: number;
+  /** Connector grants for this adapter's calls (default: connectors.ts's grants for the model). */
+  grants?: { allow: string[]; deny: string[] };
+  /** Leave the Agent-OS tool protocol out of the system prompt (a plain one-shot call). */
+  noToolProtocol?: boolean;
   /** Working directory for the child process. Defaults to the OS temp dir
    *  so the CLI doesn't pick up whatever project it happens to start in. */
   cwd?: string;
@@ -297,8 +301,8 @@ export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter 
 
   async function run(messages: ModelMessage[], onDelta?: (delta: string) => void, callOpts?: ModelCallOptions): Promise<ModelResponse> {
     const system = messages.find((m) => m.role === "system")?.content ?? "";
-    const grants = connectorGrantsFor(model);
-    const toolText = renderToolProtocol(callOpts?.tools ?? opts.tools ?? registryToolSpecs(), grants.allow.length > 0);
+    const grants = opts.grants ?? connectorGrantsFor(model);
+    const toolText = opts.noToolProtocol ? "" : renderToolProtocol(callOpts?.tools ?? opts.tools ?? registryToolSpecs(), grants.allow.length > 0);
     // The tool protocol goes FIRST: it is the biggest block and identical on every call an agent makes, so the provider's prompt
     // cache can reuse the whole prefix (tools + persona + the other stable parts). What changes per turn (the conversation focus,
     // recalled memory) is last in `system`, so it only breaks the cache at the very end.

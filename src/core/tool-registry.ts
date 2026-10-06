@@ -280,6 +280,18 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
   {
+    name: "connector",
+    description:
+      "Ask one of the operator's connected services (for example BeatStars or Claude Docs). action = list | ask. list: the connectors you can use. " +
+      "ask {connector, request}: one separate request to that service; say exactly what you want back, and the answer comes back as text. " +
+      "Read first. Anything that publishes, sends, buys or deletes outside the OS needs the operator's OK through approvals, not this tool.",
+    inputSchema: {
+      action: { type: "string", required: true, description: "list or ask." },
+      connector: { type: "string", description: "ask: the connector's name, as listed." },
+      request: { type: "string", description: "ask: what to do or look up, in plain words." },
+    },
+  },
+  {
     name: "library",
     description:
       "The operator's music library (songs uploaded through BaseSpace's Beat DB): action = list | read | add | update. " +

@@ -50,3 +50,4 @@ export * from "./soundgen.js";
 export * from "./soundlab.js";
 export * from "./soundpack.js";
 export * from "./connectors.js";
+export * from "./connector-tool.js";

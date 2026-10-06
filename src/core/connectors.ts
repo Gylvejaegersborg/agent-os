@@ -139,9 +139,12 @@ export function connectorGrants(): { allow: string[]; deny: string[] } {
  *  So an agent on a small model gets no connectors (AGENT_OS_CONNECTORS_SMALL=1 to grant them anyway). */
 export function connectorGrantsFor(model?: string): { allow: string[]; deny: string[] } {
   const grants = connectorGrants();
-  if (model && /haiku/i.test(model) && process.env.AGENT_OS_CONNECTORS_SMALL !== "1") {
-    return { allow: [], deny: [...new Set([...grants.allow, ...grants.deny])] };
-  }
+  // By default NO connector is loaded into an agent's own calls: their tool definitions cost ~10k tokens on every call.
+  // Agents reach connectors through the `connector` tool (connector-tool.ts), which pays that only when one is used.
+  // AGENT_OS_CONNECTORS_NATIVE=1 brings the old behaviour back (granted natively; still not to Haiku).
+  const native = process.env.AGENT_OS_CONNECTORS_NATIVE === "1";
+  const small = !!model && /haiku/i.test(model) && process.env.AGENT_OS_CONNECTORS_SMALL !== "1";
+  if (!native || small) return { allow: [], deny: [...new Set([...grants.allow, ...grants.deny])] };
   return grants;
 }
 

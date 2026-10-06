@@ -10,7 +10,7 @@
 // Run with: node dist/test-connectors.js
 
 import "./test-helpers/isolate.js";
-import { connectorGrants, connectorGrantsFor, listConnectors, parseMcpList, refreshConnectors, setConnectorDiscovery, setConnectorEnabled, toolPrefix, createStubModel, createStubWorker } from "./core/index.js";
+import { dispatchConnector, setConnectorRelay, usableConnectors, connectorGrants, connectorGrantsFor, listConnectors, parseMcpList, refreshConnectors, setConnectorDiscovery, setConnectorEnabled, toolPrefix, createStubModel, createStubWorker } from "./core/index.js";
 import { startGateway } from "./gateway/server.js";
 
 let failed = false;
@@ -63,15 +63,50 @@ await refreshConnectors();
 assert(listConnectors().connectors.find((c) => c.name === "discord")!.enabled === true && listConnectors().connectors.find((c) => c.name === "claude.ai Claude Docs")!.enabled === false, "…and survive a refresh (they're remembered)");
 assert(await setConnectorEnabled("nope", true).then(() => false, () => true), "an unknown connector can't be toggled");
 
-// --- 3b. small models --------------------------------------------------------------------------------
+// --- 3b. what a model's own calls carry ----------------------------------------------------------------
+// Connector tool definitions cost ~10k tokens on every call, so by default an agent's own calls carry none of them: it
+// reaches connectors through the `connector` tool (connector-tool.ts), which pays that only when one is used.
 const sonnet = connectorGrantsFor("sonnet");
 const haiku = connectorGrantsFor("haiku");
-assert(sonnet.allow.includes("mcp__claude_ai_BeatStars") === connectorGrants().allow.includes("mcp__claude_ai_BeatStars") && sonnet.allow.length === connectorGrants().allow.length, "an agent on Sonnet gets the enabled connectors");
-assert(haiku.allow.length === 0 && haiku.deny.includes("mcp__claude_ai_BeatStars") && haiku.deny.includes("mcp__discord"), "an agent on Haiku gets none (measured: it can't reliably use two kinds of tools at once), and every one is withheld");
-assert(connectorGrantsFor(undefined).allow.length === connectorGrants().allow.length, "no model named: the normal grants");
+assert(sonnet.allow.length === 0 && sonnet.deny.includes("mcp__claude_ai_BeatStars") && sonnet.deny.includes("mcp__discord"), "by default no connector is loaded into an agent's own calls, on Sonnet or Haiku (every one is withheld)");
+assert(haiku.allow.length === 0 && connectorGrantsFor(undefined).allow.length === 0, "…and with no model named either");
+process.env.AGENT_OS_CONNECTORS_NATIVE = "1";
+assert(connectorGrantsFor("sonnet").allow.length === connectorGrants().allow.length && connectorGrantsFor("haiku").allow.length === 0, "AGENT_OS_CONNECTORS_NATIVE=1 brings the old behaviour back: granted natively to Sonnet, still not to Haiku");
 process.env.AGENT_OS_CONNECTORS_SMALL = "1";
-assert(connectorGrantsFor("haiku").allow.length === connectorGrants().allow.length, "AGENT_OS_CONNECTORS_SMALL=1 grants them to Haiku anyway");
+assert(connectorGrantsFor("haiku").allow.length === connectorGrants().allow.length, "…and AGENT_OS_CONNECTORS_SMALL=1 grants them to Haiku too");
 delete process.env.AGENT_OS_CONNECTORS_SMALL;
+delete process.env.AGENT_OS_CONNECTORS_NATIVE;
+
+// --- 3c. the connector tool ------------------------------------------------------------------------------
+const relayed: { system: string; request: string; grants: { allow: string[]; deny: string[] } }[] = [];
+setConnectorRelay(async (system, request, grants) => {
+  relayed.push({ system, request, grants });
+  return request.includes("boom") ? Promise.reject(new Error("service down")) : request.includes("nothing") ? "  " : `result for: ${request}`;
+});
+await setConnectorEnabled("claude.ai Claude Docs", true);
+await setConnectorEnabled("discord", false);
+await setConnectorEnabled("claude.ai Anthropic Economic Index", false);
+const listed = await dispatchConnector({ action: "list" });
+assert(listed.ok && /BeatStars/.test(listed.output) && /Claude Docs/.test(listed.output) && !/discord|Gmail|broken/i.test(listed.output), "list shows the usable connectors by short name (not the off, unauthenticated or failed ones)");
+const asked = await dispatchConnector({ action: "ask", connector: "BeatStars", request: "search beats: trap" });
+assert(asked.ok && asked.output === "result for: search beats: trap", "ask relays the request and returns the answer");
+const g0 = relayed[0]!.grants;
+assert(g0.allow.length === 1 && g0.allow[0] === "mcp__claude_ai_BeatStars" && g0.deny.includes("mcp__claude_ai_Claude_Docs") && g0.deny.includes("mcp__discord") && !g0.deny.includes("mcp__claude_ai_BeatStars"), "…with ONLY that connector granted and every other one withheld");
+assert(/BeatStars/.test(relayed[0]!.system) && /nothing invented/.test(relayed[0]!.system), "…and a relay prompt that says to report only what the service returned");
+assert((await dispatchConnector({ action: "ask", connector: "claude.ai Claude Docs", request: "x" })).ok, "the full name works too");
+const unknown = await dispatchConnector({ action: "ask", connector: "Gmail", request: "x" });
+assert(!unknown.ok && /Available: (BeatStars, Claude Docs|Claude Docs, BeatStars)/.test(unknown.error ?? "") && relayed.length === 2, "an unknown or unusable connector is refused (nothing is run) and the usable ones are named");
+assert(!(await dispatchConnector({ action: "ask", connector: "discord", request: "x" })).ok && relayed.length === 2, "a connector that is switched off can not be asked");
+assert(!(await dispatchConnector({ action: "ask", connector: "BeatStars", request: " " })).ok && !(await dispatchConnector({ action: "x" })).ok, "an empty request or an unknown action is refused");
+const down = await dispatchConnector({ action: "ask", connector: "BeatStars", request: "boom" });
+assert(!down.ok && /BeatStars: service down/.test(down.error ?? ""), "a failing service is reported with its name, not swallowed");
+assert(!(await dispatchConnector({ action: "ask", connector: "BeatStars", request: "nothing" })).ok, "an empty answer is an error, not a success");
+assert((await dispatchConnector({ action: "ask", connector: "BeatStars", request: "z".repeat(10) })).ok && usableConnectors().length === 2, "usableConnectors is the enabled, connected ones");
+setConnectorRelay(async () => "y".repeat(9000));
+const long = await dispatchConnector({ action: "ask", connector: "BeatStars", request: "big" });
+assert(long.ok && long.output.length < 8200 && /\[cut: 1000 more characters\]/.test(long.output), "a very long answer is cut, and says how much");
+setConnectorRelay(undefined);
+await setConnectorEnabled("claude.ai Claude Docs", false);
 
 // --- 4. following the account --------------------------------------------------------------------
 current = SAMPLE + "claude.ai Notion: https://mcp.notion.com/mcp - ✔ Connected\n";

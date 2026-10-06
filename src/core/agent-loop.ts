@@ -9,6 +9,7 @@ import { AgentBlockedError, assertAgentMayRun, getAgentControlState, recordAgent
 import { GATED_TOOLS, adoptPlan, checkProposal, gateToolCall, hireAgent } from "./governance.js";
 import { watchWork } from "./watchdog.js";
 import { hindsightConfigured, hindsightRecall, hindsightReflect, hindsightRetain } from "./hindsight.js";
+import { dispatchConnector, usableConnectors } from "./connector-tool.js";
 import { addOverlayItem, focusContext, readSnapshotSection, type OverlayKind } from "./basespace.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -702,6 +703,7 @@ async function dispatchTool(
   if (toolCall.name === "desktop") return { ok: true, output: await renderDesktopReport(typeof toolCall.args.day === "string" ? toolCall.args.day : undefined) };
   if (toolCall.name === "library") return dispatchLibrary(toolCall.args, ctx.agentId, ctx.sandboxPolicy);
   if (toolCall.name === "soundlab") return dispatchSoundlab(toolCall.args);
+  if (toolCall.name === "connector") return dispatchConnector(toolCall.args, ctx.signal);
   if (toolCall.name === "audio") return dispatchAudio(toolCall.args, ctx.sandboxPolicy);
   if (toolCall.name === "basespace-add") {
     const kind = String(toolCall.args.kind ?? "") as OverlayKind;
@@ -757,6 +759,8 @@ function offeredTools(
     "basespace-add": on.enableBaseSpace,
     library: on.enableBaseSpace,
     soundlab: on.enableBaseSpace,
+    // Only when there is a connector an agent could actually use (enabled and connected).
+    connector: on.enableBaseSpace && usableConnectors().length > 0,
     desktop: on.enableBaseSpace,
     delegate: on.enableBaseSpace,
     work: on.enableBaseSpace,
