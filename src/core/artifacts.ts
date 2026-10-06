@@ -19,6 +19,7 @@
 // codebase.
 
 import { project, appendEvent } from "./eventlog.js";
+import { publishEvent } from "./eventbus.js";
 import { generateId } from "./id.js";
 
 export type ArtifactType = "code" | "file" | "report" | "image" | "dataset" | "plan" | "draft" | "other";
@@ -55,6 +56,8 @@ export async function createArtifact(input: CreateArtifactInput): Promise<Artifa
   await appendEvent(ARTIFACTS_STREAM, "artifact.created", { artifactId: id, ...input, metadata: input.metadata ?? {} });
   const artifact = await getArtifact(id);
   if (!artifact) throw new Error("artifact.created event did not project to an artifact");
+  // Tell open panels (the Artifacts tab) so they refresh without being asked.
+  await publishEvent("artifact.created", { artifactId: id, producer: input.producer, flowId: input.flowId, taskId: input.taskId, sessionId: input.sessionId });
   return artifact;
 }
 

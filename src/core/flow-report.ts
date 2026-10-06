@@ -6,6 +6,7 @@ import { getFlow, listTasks } from "./tasks.js";
 import { getFlowDefinition } from "./flow-proposals.js";
 import { getSessionUsage } from "./agent-loop.js";
 import { readStream } from "./eventlog.js";
+import { verifierId } from "./watchdog.js";
 import type { Task } from "./types.js";
 
 export interface FlowReportAttempt {
@@ -33,7 +34,17 @@ export interface FlowReportStep {
   attempts: FlowReportAttempt[];
 }
 
+/** The verifier's (Argus) say on this flow: the result of the step(s) he ran, or that he has not been asked yet. */
+export interface FlowVerdict {
+  agentId: string;
+  stepId?: string;
+  status: "not-run" | "waiting" | "running" | "done" | "failed";
+  text?: string;
+  error?: string;
+}
+
 export interface FlowReport {
+  verdict: FlowVerdict;
   flowId: string;
   title?: string;
   status: string;
@@ -102,8 +113,21 @@ export async function buildFlowReport(flowId: string): Promise<FlowReport | unde
       totals.added += a.added.length;
       totals.seconds += a.seconds ?? 0;
     }
+  const verifier = verifierId();
+  const vStep = [...steps].reverse().find((st) => st.agentId === verifier);
+  const vAttempt = vStep?.attempts.at(-1);
+  const verdict: FlowVerdict = !vStep
+    ? { agentId: verifier, status: "not-run" }
+    : vStep.status === "succeeded" && vAttempt
+      ? { agentId: verifier, stepId: vStep.id, status: "done", ...(vAttempt.result ? { text: vAttempt.result } : {}) }
+      : vStep.status === "running"
+        ? { agentId: verifier, stepId: vStep.id, status: "running" }
+        : vStep.status === "queued" || vStep.status === "cancelled"
+          ? { agentId: verifier, stepId: vStep.id, status: "waiting" }
+          : { agentId: verifier, stepId: vStep.id, status: "failed", ...(vAttempt?.error ? { error: vAttempt.error } : {}), ...(vAttempt?.result ? { text: vAttempt.result } : {}) };
   return {
     flowId,
+    verdict,
     ...(flow.title ? { title: flow.title } : {}),
     status: flow.status,
     ...(definition?.summary ? { summary: definition.summary } : {}),

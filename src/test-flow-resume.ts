@@ -8,7 +8,7 @@
 // Run with: node dist/test-flow-resume.js
 
 import "./test-helpers/isolate.js";
-import { buildFlowReport, cancelFlow, createFlow, createStubWorker, getFlow, reopenFlow, resumeFlow, runFlow, seedDefaultAgents, type ModelAdapter, type ModelResponse } from "./core/index.js";
+import { storeFlowDefinition, buildFlowReport, createArtifact, recordFileRevision, subscribeToEvent, cancelFlow, createFlow, createStubWorker, getFlow, reopenFlow, resumeFlow, runFlow, seedDefaultAgents, type ModelAdapter, type ModelResponse } from "./core/index.js";
 
 let failed = false;
 function assert(cond: boolean, msg: string): void {
@@ -74,6 +74,30 @@ const rb = report.steps.find((x) => x.id === "b")!;
 assert(report.status === "succeeded" && report.steps.length === 3 && rb.attempts.length === 2, "the report lists every step, with both attempts of the one that was retried");
 assert(rb.attempts[0]!.status === "failed" && /tool steps/.test(rb.attempts[0]!.error ?? "") && rb.attempts[0]!.toolCalls.length >= 1 && rb.attempts[1]!.status === "succeeded" && /done/.test(rb.attempts[1]!.result ?? ""), "the failed attempt keeps its reason and tool calls; the retry keeps its result");
 assert(rb.agentId === "nyx" && report.totals.toolCalls >= 1 && (await buildFlowReport("nope")) === undefined, "agent and totals are filled in; an unknown flow has no report");
+
+// Argus' verdict: no verifier step yet, then waiting (an earlier step failed), then his words once he has run
+assert(report.verdict.agentId === "argus" && report.verdict.status === "not-run", "a flow with no Argus step says he has not been asked");
+busy = true;
+const vsteps = [
+  { id: "work", agentId: "nyx", goal: "BUSY: work" },
+  { id: "check", agentId: "argus", goal: "V: verify the work", dependsOn: ["work"] },
+];
+const vf = await runFlow(vsteps, opts);
+await storeFlowDefinition({ flowId: vf.flowId, proposedBy: "hemera", summary: "verify", steps: vsteps });
+const waiting = (await buildFlowReport(vf.flowId))!.verdict;
+assert(waiting.status === "waiting" && waiting.stepId === "check", "when the step before him failed, his check is waiting, not done");
+busy = false;
+await resumeFlow(vf.flowId, vsteps, opts);
+const done = (await buildFlowReport(vf.flowId))!.verdict;
+assert(done.status === "done" && /done: V:/.test(done.text ?? ""), "after Resume his check runs and the report carries what he said");
+
+// live updates: artifacts and file revisions announce themselves so open panels refresh
+const seen: string[] = [];
+const off = [subscribeToEvent("artifact.created", () => { seen.push("artifact"); }), subscribeToEvent("file.revision.recorded", () => { seen.push("file"); })];
+await createArtifact({ type: "report", location: "x", producer: "nyx" } as any);
+await recordFileRevision({ path: "a.txt", previousContent: "", existedBefore: false, tool: "write_file" } as any);
+off.forEach((d) => d());
+assert(seen.includes("artifact") && seen.includes("file"), "creating an artifact and recording a file revision each publish an event");
 
 console.log(failed ? "\nSome flow-resume tests FAILED." : "\nAll flow-resume tests passed.");
 process.exit(failed ? 1 : 0);
