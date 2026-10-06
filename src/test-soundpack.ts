@@ -117,6 +117,8 @@ assert(seen.ok && /kept sound\(s\)/.test(seen.output) && /808 \(\d\)/.test(seen.
 assert((await dispatchSoundlab({ action: "kept", kind: "bell" })).output.includes("bell (2)"), "…filtered by kind");
 const packsSeen = await dispatchSoundlab({ action: "packs" });
 assert(packsSeen.ok && /ISΛRK|ISRK|Test_Kit|Test Kit/i.test(packsSeen.output) && /DRAFT|Draft license/.test(packsSeen.output), "agents can see the packs and are reminded the license is a draft");
+const lic = await dispatchSoundlab({ action: "license" });
+assert(lic.ok && /Sound Kit License/.test(lic.output) && /3\. You may not/.test(lic.output) && /Open \[brackets\]/.test(lic.output) && /\[your legal name or company\]/.test(lic.output) && /DRAFT/.test(lic.output) && /not legal advice/.test(lic.output), "agents can read the draft license and the list of open [brackets], flagged as a draft and not legal advice");
 for (const action of ["accept", "judge", "build", "create", "skip"]) {
   const r = await dispatchSoundlab({ action, id: kept[0]!.id });
   assert(!r.ok && /only the operator/.test(r.error ?? ""), `"${action}" is refused: judging and building are the operator's`);

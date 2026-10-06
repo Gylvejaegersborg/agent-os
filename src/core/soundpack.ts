@@ -151,6 +151,12 @@ Licensor: [your legal name or company], "Licensor". This license applies to the 
 7. Law. [governing law and country]. Contact: [email].
 `;
 
+/** The draft license a pack ships with, and the [brackets] still open in it. Read-only for agents (so they can explain it, not change it). */
+export function licenseDraft(packName = "[Pack Name]"): { text: string; brackets: string[] } {
+  const text = LICENSE_DRAFT.replace("[Pack Name]", packName);
+  return { text, brackets: [...new Set(text.match(/\[[^\]]+\]/g) ?? [])] };
+}
+
 async function packs(): Promise<Map<string, PackManifest>> {
   return project<Map<string, PackManifest>>(STREAM, new Map(), (state, e) => {
     if (e.type === "pack.built") state.set((e.payload as any).id, e.payload as unknown as PackManifest);

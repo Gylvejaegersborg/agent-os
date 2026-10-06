@@ -11,7 +11,7 @@ import { AudioError, audioEdit, audioInfo, renderInfo, type EditParams } from ".
 import { LibraryError, addSongBy, getSong, importAudioFromPath, listSongs, updateSong, type LibrarySong } from "./library.js";
 import { checkPathSandbox, type SandboxPolicy } from "./permissions.js";
 import { isKind, listCandidates, stats as soundStats } from "./soundlab.js";
-import { listPacks } from "./soundpack.js";
+import { licenseDraft, listPacks } from "./soundpack.js";
 import { toolVisibleTo } from "./tool-registry.js";
 
 interface Result {
@@ -102,7 +102,13 @@ export async function dispatchSoundlab(args: Record<string, unknown>): Promise<R
           .join("\n"),
       };
     }
-    return fail(`unknown action "${action}": use kept or packs (only the operator judges sounds and builds packs)`);
+    if (action === "license") {
+      const { text, brackets } = licenseDraft((await listPacks())[0]?.name);
+      return { ok: true, output: `${text}
+Open [brackets] the operator still has to fill in: ${brackets.join(" | ")}.
+This is a DRAFT: it is not final and not legal advice; the operator must have it reviewed before selling.` };
+    }
+    return fail(`unknown action "${action}": use kept, packs or license (only the operator judges sounds and builds packs)`);
   } catch (err) {
     return fail(err instanceof Error ? err.message : String(err));
   }

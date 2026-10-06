@@ -302,11 +302,11 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: "soundlab",
     description:
-      "The operator's Sound Lab: synthesized drums and melodic one-shots they listen to and judge. action = kept | packs. " +
-      "kept {kind?}: the sounds they kept (name and kind) and how many are waiting or in maybe. packs: the sound packs built from kept sounds and what is in them. " +
+      "The operator's Sound Lab: synthesized drums and melodic one-shots they listen to and judge. action = kept | packs | license. " +
+      "kept {kind?}: the sounds they kept (name and kind) and how many are waiting or in maybe. packs: the sound packs built from kept sounds and what is in them. license: the full text of the DRAFT license that ships with a pack, and the [brackets] still open in it (read it to explain it; you can't change it). " +
       "You can't hear anything, and you can't accept, skip or build: only the operator judges and builds packs. Describe sounds only by their names and the counts; never say how one sounds.",
     inputSchema: {
-      action: { type: "string", required: true, description: "kept or packs." },
+      action: { type: "string", required: true, description: "kept, packs or license." },
       kind: { type: "string", description: "kept: only this kind (808, kick, snare, clap, perc, hat-closed, hat-open, bell, pluck, keys, pad, strings, lead)." },
     },
   },
