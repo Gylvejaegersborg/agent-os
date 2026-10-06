@@ -52,6 +52,8 @@ export interface Task {
  *  instead of silently clobbering state. */
 export interface Flow {
   id: string;
+  /** What the person who made it called it, for the flow panel (older flows have none). */
+  title?: string;
   kind: "managed" | "mirrored";
   status: "running" | "succeeded" | "failed" | "cancelled";
   steps: FlowStep[];

@@ -134,10 +134,11 @@ const STEP_TERMINAL: TaskStatus[] = ["succeeded", "failed", "timed_out", "cancel
  *  to completion (or cancellation) in one call — the common case. Returns
  *  once every step has reached a terminal status, or the Flow was
  *  cancelled mid-run. */
-export async function runFlow(steps: FlowStepDefinition[], opts: DriveFlowOptions): Promise<DriveFlowResult> {
+export async function runFlow(steps: FlowStepDefinition[], opts: DriveFlowOptions & { title?: string }): Promise<DriveFlowResult> {
   const flow = await createFlow(
     "managed",
     steps.map((s) => ({ id: s.id, dependsOn: s.dependsOn ?? [] })),
+    opts.title,
   );
   if (opts.focus) await setFlowFocus(flow.id, opts.focus);
   return driveFlow(flow.id, steps, opts);

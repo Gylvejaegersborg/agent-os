@@ -133,6 +133,8 @@ import {
   renderDesktopDigest,
   weekDigest,
   recordDesktopCorrection,
+  getFlowDefinition,
+  storeFlowDefinition,
   localDay,
 } from "../core/index.js";
 import { checkPathSandbox } from "../core/permissions.js";
@@ -1190,7 +1192,8 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         sendJson(res, 404, { error: `no such flow: ${segments[1]}` });
         return;
       }
-      sendJson(res, 200, flow);
+      // With what it was made of, when known, so the flow panel can label every step.
+      sendJson(res, 200, { ...flow, definition: (await getFlowDefinition(flow.id)) ?? null });
       return;
     }
     if (method === "POST" && segments.length === 1) {
@@ -1205,10 +1208,13 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         sendJson(res, 400, { error: 'focus must be {kind: "goal" | "project", id}' });
         return;
       }
+      const title = typeof body.title === "string" ? body.title.trim().slice(0, 60) : "";
       const flow = await createFlow(
         "managed",
         steps.map((s) => ({ id: s.id, dependsOn: s.dependsOn ?? [] })),
+        title || undefined,
       );
+      await storeFlowDefinition({ flowId: flow.id, ...(title ? { title } : {}), proposedBy: "operator", summary: title, steps });
       // What the flow serves: every step's session is focused on it.
       if (focus) await setFlowFocus(flow.id, focus);
       // Fire-and-forget: a Flow can run many real model turns across many

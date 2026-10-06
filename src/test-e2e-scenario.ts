@@ -122,6 +122,7 @@ try {
 
   // 4. the lead designs a flow; Argus checks it; approval requested
   const flowArgs = {
+    title: "Release research and plan",
     summary: "Research both sides at once, then write, then review.",
     goalId: "g-release",
     steps: [
@@ -152,6 +153,8 @@ try {
   // 7. task graph
   const flow = (await api("GET", `/flows/${flowId}`)).json;
   assert(flow.steps.length === 4 && flow.steps.every((s: any) => s.status === "succeeded" && s.taskId), "7. the flow's graph has four succeeded steps, each with a task");
+  assert(flow.title === "Release research and plan" && flow.definition?.steps?.length === 4 && flow.definition.steps[0].agentId, "7. the flow has its name, and its definition (agents and goals) for the flow panel");
+  assert((await api("GET", "/flows")).json.flows.some((f: any) => f.id === flowId && f.title === "Release research and plan"), "7. the flow list shows the name");
   const tasks = (await api("GET", "/tasks")).json.tasks.filter((t: any) => t.flowId === flowId);
   assert(tasks.length === 4 && new Set(tasks.map((t: any) => t.agentId)).size === 4, "7. four flow-step tasks, each on a different agent");
   const writeTask = tasks.find((t: any) => t.input?.stepId === "write");

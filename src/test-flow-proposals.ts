@@ -66,6 +66,7 @@ await saveSnapshot({ schema: 1, goals: [{ id: "g-switch", title: "Release Switch
 
 const GOAL = "Research the release window and write down what you find for the team.";
 const good = {
+  title: "Switch release prep",
   summary: "Research in parallel, then write, then review.",
   goalId: "g-switch",
   steps: [
@@ -77,10 +78,11 @@ const good = {
 };
 
 // --- 1. Argus's check -------------------------------------------------------
-const errs = async (args: Record<string, unknown>) => (await validateFlow(args, "hemera")).issues.filter((i) => i.level === "error").map((i) => i.message);
-const notes = async (args: Record<string, unknown>) => (await validateFlow(args, "hemera")).issues.filter((i) => i.level === "note").map((i) => i.message);
+const errs = async (args: Record<string, unknown>) => (await validateFlow({ title: "Test flow", ...args }, "hemera")).issues.filter((i) => i.level === "error").map((i) => i.message);
+const notes = async (args: Record<string, unknown>) => (await validateFlow({ title: "Test flow", ...args }, "hemera")).issues.filter((i) => i.level === "note").map((i) => i.message);
 
 assert((await errs(good)).length === 0, "a sound flow has no errors");
+assert((await errs({ ...good, title: "" })).some((e) => /short name/.test(e)) && (await errs({ ...good, title: "x".repeat(61) })).some((e) => /short name/.test(e)) && (await errs({ ...good, title: undefined })).some((e) => /short name/.test(e)), "a flow must be given a short, understandable name (3 to 60 characters)");
 assert(/no steps|at least one step/.test((await errs({ steps: [] }))[0] ?? ""), "an empty flow is refused");
 assert((await errs({ steps: Array.from({ length: 11 }, (_, i) => ({ id: `s${i}`, agent: "nyx", goal: GOAL })) })).some((e) => /at most 10/.test(e)), "more than 10 steps is refused");
 assert((await errs({ steps: [{ id: "a", agent: "ghost", goal: GOAL }] })).some((e) => /no agent "ghost"/.test(e)), "an unknown agent is refused");
@@ -122,12 +124,12 @@ assert(!(await listApprovals({ status: "pending" })).some((a) => a.toolName === 
 const filed = await turn(hemera.id, "hemera", call("propose-flow", good));
 const pending = (await listApprovals({ status: "pending" })).filter((a) => a.toolName === "propose-flow");
 assert(filed.stopReason === "tool-blocked" && /always needs the operator's OK/.test(filed.finalContent), "a sound flow stops the turn, waiting for approval");
-assert(pending.length === 1 && /^Flow: hemera proposes 4 steps across nyx, aether, hermes, argus for "Release Switch in October"/.test(pending[0]!.reason) && /argus checked it: no problems found/.test(pending[0]!.reason), "the approval names who, what and Argus's verdict");
+assert(pending.length === 1 && /^Flow "Switch release prep": hemera proposes 4 steps across nyx, aether, hermes, argus for "Release Switch in October"/.test(pending[0]!.reason) && /argus checked it: no problems found/.test(pending[0]!.reason), "the approval names who, what and Argus's verdict");
 
 // --- 3. Approved: it runs ---------------------------------------------------
 const approved = await executeApprovedCall({ sessionId: hemera.id, agentId: "hemera", toolCall: { name: "propose-flow", args: good }, model: scripted, worker });
-const flowId = /Flow started \(([^)]+)\)/.exec(approved.output)?.[1] ?? "";
-assert(approved.ok && !!flowId, "approved: the flow starts in the background");
+const flowId = /started \(([^)]+)\)/.exec(approved.output)?.[1] ?? "";
+assert(approved.ok && !!flowId && /Flow "Switch release prep" started/.test(approved.output), "approved: the flow starts in the background, by its name");
 let flow = await getFlow(flowId);
 for (let i = 0; i < 100 && flow?.status === "running"; i++) {
   await sleep(100);
@@ -140,10 +142,10 @@ assert(/Result of step "market"/.test(await out("write")) && /Result of step "au
 assert(/Result of step "write"/.test(await out("review")) && /Release Switch|did: Write the one-page/.test(await out("review")), "the reviewer was shown the written plan");
 assert(!/Result of step/.test(await out("market")), "a step with no dependencies is given only its own goal");
 const def = await getFlowDefinition(flowId);
-assert(def?.steps.length === 4 && def.proposedBy === "hemera" && def.goalId === "g-switch", "the definition is stored, not just its shape");
+assert(def?.steps.length === 4 && def.proposedBy === "hemera" && def.goalId === "g-switch" && def.title === "Switch release prep" && flow?.title === "Switch release prep", "the definition is stored, not just its shape, and the flow carries its name");
 await sleep(200);
 const note = (await getSessionHistory(hemera.id)).filter((m) => m.role === "user" && m.content.startsWith("[Flow]")).at(-1)?.content ?? "";
-assert(/finished as succeeded/.test(note) && /review: succeeded/.test(note), "the outcome is posted back to the session that proposed it");
+assert(/The flow "Switch release prep" finished as succeeded/.test(note) && /review: succeeded/.test(note), "the outcome is posted back to the session that proposed it, by name");
 
 // --- 4. Still gated ---------------------------------------------------------
 const { addAllowRule } = await import("./core/index.js");

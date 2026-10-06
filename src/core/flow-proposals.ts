@@ -41,6 +41,8 @@ export interface FlowIssue {
 }
 
 export interface FlowCheck {
+  /** The name for the flow panel. */
+  title: string;
   steps: FlowStepDefinition[];
   goalId?: string;
   goalTitle?: string;
@@ -67,14 +69,17 @@ export async function validateFlow(args: Record<string, unknown>, proposedBy: st
   const err = (message: string, stepId?: string) => issues.push({ level: "error", message, ...(stepId ? { stepId } : {}) });
   const note = (message: string, stepId?: string) => issues.push({ level: "note", message, ...(stepId ? { stepId } : {}) });
 
+  // Whoever creates a flow names it, so the operator can tell flows apart in the flow panel.
+  const title = str(args.title).replace(/\s+/g, " ");
+  if (title.length < 3 || title.length > 60) err("give the flow a short name (3 to 60 characters) that says what it is for, e.g. \"Salient launch prep\"");
   const raw = parseSteps(args.steps);
   if (typeof raw === "string") {
     err(raw);
-    return { steps: [], issues };
+    return { title, steps: [], issues };
   }
   if (raw.length > MAX_FLOW_STEPS) {
     err(`a flow has at most ${MAX_FLOW_STEPS} steps (this has ${raw.length}): split it`);
-    return { steps: [], issues };
+    return { title, steps: [], issues };
   }
 
   const known = new Map((await listAgentIdentities()).map((a) => [a.id, a]));
@@ -162,7 +167,7 @@ export async function validateFlow(args: Record<string, unknown>, proposedBy: st
     for (const m of byLevel.values()) for (const [agent, n] of m) if (n >= 3) note(`${agent} has ${n} steps running at once; they'd compete for one agent`);
     if (!steps.some((s) => s.agentId === verifierId())) note(`no step for ${verifierId()}: a flow of ${steps.length} steps usually wants a review at the end`);
   }
-  return { steps, ...(goalId ? { goalId } : {}), ...(goalTitle ? { goalTitle } : {}), issues: issues.filter((i) => i.message) };
+  return { title, steps, ...(goalId ? { goalId } : {}), ...(goalTitle ? { goalTitle } : {}), issues: issues.filter((i) => i.message) };
 }
 
 export function renderIssues(issues: FlowIssue[]): string {
@@ -190,17 +195,23 @@ export async function flowGateReason(args: Record<string, unknown>, agentId: str
   const steps = check.steps;
   const agents = [...new Set(steps.map((s) => s.agentId))];
   return (
-    `Flow: ${agentId} proposes ${steps.length} step${steps.length === 1 ? "" : "s"} across ${agents.join(", ")}` +
+    `Flow "${check.title}": ${agentId} proposes ${steps.length} step${steps.length === 1 ? "" : "s"} across ${agents.join(", ")}` +
     `${check.goalTitle ? ` for "${check.goalTitle}"` : ""} — ${str(args.summary) || "no summary"}. ${argusVerdict(check)}`
   );
 }
 
 export interface StoredFlowDefinition {
   flowId: string;
+  title?: string;
   proposedBy: string;
   summary: string;
   goalId?: string;
   steps: FlowStepDefinition[];
+}
+
+/** Remembers what a flow was made of (its steps, not just their shape), so the flow panel can label them and a resume has what it needs. */
+export async function storeFlowDefinition(def: StoredFlowDefinition): Promise<void> {
+  await appendEvent(DEFINITIONS_STREAM, "flow.defined", def as unknown as Record<string, unknown>);
 }
 
 export async function getFlowDefinition(flowId: string): Promise<StoredFlowDefinition | undefined> {
@@ -233,10 +244,10 @@ export async function adoptFlow(
   const { appendSessionNote } = await import("./agent-loop.js");
   const focus: SessionFocus | undefined = check.goalId ? { kind: "goal", id: check.goalId } : undefined;
 
-  const flow = await createFlow("managed", check.steps.map((s) => ({ id: s.id, dependsOn: s.dependsOn ?? [] })));
+  const flow = await createFlow("managed", check.steps.map((s) => ({ id: s.id, dependsOn: s.dependsOn ?? [] })), check.title);
   if (focus) await setFlowFocus(flow.id, focus);
   const summary = str(args.summary);
-  await appendEvent(DEFINITIONS_STREAM, "flow.defined", { flowId: flow.id, proposedBy, summary, ...(check.goalId ? { goalId: check.goalId } : {}), steps: check.steps });
+  await storeFlowDefinition({ flowId: flow.id, title: check.title, proposedBy, summary, ...(check.goalId ? { goalId: check.goalId } : {}), steps: check.steps });
   await appendEvent(GOVERNANCE_STREAM, "flow.adopted", { flowId: flow.id, proposedBy, validator: verifierId(), steps: check.steps.length });
   await publishEvent("flow.adopted", { flowId: flow.id, proposedBy });
 
@@ -245,17 +256,17 @@ export async function adoptFlow(
   void resumeFlow(flow.id, check.steps, { ...drive, enableBaseSpace: true, maxToolHopsPerStep: Number.isFinite(stepHops) && stepHops > 0 ? stepHops : 10, ...(focus ? { focus } : {}) }).then(
     async (result) => {
       const lines = result.steps.map((s) => `${s.stepId}: ${s.status}`).join(", ");
-      await appendSessionNote(sessionId, "Flow", `The flow "${summary || flow.id}" finished as ${result.status}. Steps: ${lines}.`).catch(() => {});
+      await appendSessionNote(sessionId, "Flow", `The flow "${check.title}" finished as ${result.status}. Steps: ${lines}.`).catch(() => {});
     },
     async (e) => {
-      await appendSessionNote(sessionId, "Flow", `The flow "${summary || flow.id}" stopped with an error: ${e instanceof Error ? e.message : String(e)}`).catch(() => {});
+      await appendSessionNote(sessionId, "Flow", `The flow "${check.title}" stopped with an error: ${e instanceof Error ? e.message : String(e)}`).catch(() => {});
     },
   );
 
   return {
     ok: true,
     output:
-      `Flow started (${flow.id}): ${check.steps.map((s) => `${s.id} → ${s.agentId}`).join(", ")}. It runs in the background; ` +
+      `Flow "${check.title}" started (${flow.id}): ${check.steps.map((s) => `${s.id} → ${s.agentId}`).join(", ")}. It runs in the background; ` +
       `each step sees what the steps it depends on produced, and the outcome is posted back here. ${argusVerdict(check)}`,
   };
 }

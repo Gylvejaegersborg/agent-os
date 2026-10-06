@@ -495,9 +495,10 @@ const FLOWS_STREAM = "flows";
  *  function ever had; kept unchanged as the contrast case for
  *  createMirroredFlow() below (see that function's header for the
  *  difference). */
-export async function createFlow(kind: Flow["kind"], stepIds: { id: string; dependsOn: string[] }[]): Promise<Flow> {
+export async function createFlow(kind: Flow["kind"], stepIds: { id: string; dependsOn: string[] }[], title?: string): Promise<Flow> {
   const id = generateId();
-  await appendEvent(FLOWS_STREAM, "flow.created", { flowId: id, kind, steps: stepIds });
+  const name = title?.trim().slice(0, 60);
+  await appendEvent(FLOWS_STREAM, "flow.created", { flowId: id, kind, steps: stepIds, ...(name ? { title: name } : {}) });
   const flow = await getFlow(id);
   if (!flow) throw new Error("flow.created event did not project to a flow");
   return flow;
@@ -612,6 +613,7 @@ async function projectFlows(): Promise<FlowProjectionState> {
       const p = event.payload as any;
       state.flows.set(p.flowId, {
         id: p.flowId,
+        ...(typeof p.title === "string" && p.title ? { title: p.title } : {}),
         kind: p.kind,
         status: "running",
         steps: p.steps.map((s: any) => ({ id: s.id, dependsOn: s.dependsOn, status: "queued" as TaskStatus })),

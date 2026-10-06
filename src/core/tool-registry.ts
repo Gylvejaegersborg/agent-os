@@ -196,6 +196,7 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
       "dependencies, vague steps, paused agents) and tells you what to fix; then it always goes to the operator's Approvals. Once approved it runs in the background " +
       "and the outcome is posted back here. Use `propose-plan` for independent items with no dependencies, `delegate` for a single hand-off.",
     inputSchema: {
+      title: { type: "string", required: true, description: "A short, understandable name for the flow panel (3 to 60 characters) that says what it is for, e.g. \"Salient launch prep\"." },
       summary: { type: "string", required: true, description: "The flow in one or two sentences: the approach and why it is shaped this way." },
       goalId: { type: "string", description: "The goal it serves (defaults to this conversation's goal)." },
       steps: {
