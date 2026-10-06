@@ -14,7 +14,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { appendEvent, project } from "./eventlog.js";
 import { publishEvent } from "./eventbus.js";
-import type { ModelAdapter, ModelMessage, ToolSpec } from "./model.js";
+import { MAX_CALLS_PER_REPLY, type ModelAdapter, type ModelMessage, type ToolSpec } from "./model.js";
 import type { Worker } from "./worker.js";
 import { fireHook } from "./hooks.js";
 import { generateId } from "./id.js";
@@ -165,6 +165,19 @@ function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
       },
     );
   });
+}
+
+/** A hard cap on tool EXECUTIONS in one run (one turn), however they are batched: several calls per reply could otherwise
+ *  multiply the work a turn does. When it is reached the turn ends and says so. AGENT_OS_MAX_TOOL_EXECUTIONS overrides it. */
+export function maxToolExecutionsPerRun(): number {
+  const n = Number(process.env.AGENT_OS_MAX_TOOL_EXECUTIONS ?? 8);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 8;
+}
+
+/** The calls in a model reply, in order: `toolCalls` when the adapter parsed several, else the single `toolCall`. */
+function toolCallsOf(response: { toolCall?: { name: string; args: Record<string, unknown> }; toolCalls?: { name: string; args: Record<string, unknown> }[] }): { name: string; args: Record<string, unknown> }[] {
+  const list = response.toolCalls?.length ? response.toolCalls : response.toolCall ? [response.toolCall] : [];
+  return list.slice(0, MAX_CALLS_PER_REPLY);
 }
 
 export function changesLibraryOrAudio(call: { name: string; args: Record<string, unknown> }): boolean {
@@ -779,6 +792,9 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   let hops = 0;
   let finalContent = "";
   let cancelled = false;
+  // Tool executions so far in this run (a call that was skipped, blocked or refused doesn't count).
+  let toolExecutions = 0;
+  const executionCap = maxToolExecutionsPerRun();
   // Fired by cancelSession(): stops the in-flight model request and shell command now.
   const turnAbort = beginTurnAbort(sessionId);
   // Summed across every hop in this turn — a tool-calling turn makes
@@ -833,7 +849,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // response, any test asserting rejection) is unchanged; this only adds
   // a durable trail alongside it.
   try {
-  while (hops < maxHops) {
+  turnLoop: while (hops < maxHops) {
     // Checked at the top of every hop (and again right after tool
     // dispatch below) rather than once before the loop — cancelSession()
     // (session.ts) can be called from a completely different process at
@@ -929,122 +945,150 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       usageOutputTokens += response.usage.outputTokens;
     }
 
-    if (response.toolCall) {
-      toolCalled = response.toolCall.name;
+    const calls = toolCallsOf(response);
+    if (calls.length) {
+      // Several calls in one reply (the model asked for independent things at once) run strictly in order. Each goes through
+      // exactly the same checks as a lone call; anything that stops one (a failure, an approval, a plan-mode block, a
+      // cancel) stops the ones after it, which are recorded as skipped so the model knows they didn't run.
+      let skipReason: string | undefined;
+      for (let ci = 0; ci < calls.length; ci++) {
+        const call = calls[ci]!;
+        toolCalled = call.name;
+        const callLabel = `${call.name} ${JSON.stringify(call.args ?? {})}`.slice(0, 300);
+        if (skipReason) {
+          await appendEvent(sessionStream(sessionId), "session.message", { role: "tool", content: `skipped: ${skipReason}`, call: callLabel });
+          continue;
+        }
+        if (toolExecutions >= executionCap) {
+          // The run's budget is spent: this call and the rest of the reply are not run, and the turn ends saying so.
+          for (const rest of calls.slice(ci)) {
+            await appendEvent(sessionStream(sessionId), "session.message", { role: "tool", content: `skipped: this run reached its limit of ${executionCap} tool executions`, call: `${rest.name} ${JSON.stringify(rest.args ?? {})}`.slice(0, 300) });
+          }
+          stopReason = "max-hops";
+          finalContent = `I reached this run's limit of ${executionCap} tool executions before finishing. What I did so far is in the results above; say "continue" and I'll pick up from there.`;
+          await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent });
+          break turnLoop;
+        }
 
-      // Plan mode is a HARD harness-level override, not a prompt
-      // suggestion — checked before Layer A's own PermissionPolicy, and
-      // not overridable by it (an "allow" rule for e.g. read_file still
-      // has no bearing here). This is what ROADMAP.md's "plan / read-only
-      // mode" item actually asked for: a mode the model is IN, not one
-      // it's merely told about. subagent is blocked too — a delegated
-      // subagent can itself mutate files, so plan mode has to cover it
-      // too to mean anything.
-      if (planMode && (PLAN_MODE_BLOCKED_TOOLS.has(response.toolCall.name) || changesLibraryOrAudio(response.toolCall))) {
-        stopReason = "tool-blocked";
-        finalContent = `Tool call blocked: plan mode is active — "${response.toolCall.name}" would change something, and plan mode only allows read-only inspection. Describe what you'd do instead; the operator can turn plan mode off to actually execute it.`;
-        await appendEvent(sessionStream(sessionId), "session.message", {
-          role: "assistant",
-          content: finalContent,
-        });
-        break;
-      }
+        // Plan mode is a HARD harness-level override, not a prompt
+        // suggestion — checked before Layer A's own PermissionPolicy, and
+        // not overridable by it (an "allow" rule for e.g. read_file still
+        // has no bearing here). This is what ROADMAP.md's "plan / read-only
+        // mode" item actually asked for: a mode the model is IN, not one
+        // it's merely told about. subagent is blocked too — a delegated
+        // subagent can itself mutate files, so plan mode has to cover it
+        // too to mean anything.
+        if (planMode && (PLAN_MODE_BLOCKED_TOOLS.has(call.name) || changesLibraryOrAudio(call))) {
+          stopReason = "tool-blocked";
+          finalContent = `Tool call blocked: plan mode is active — "${call.name}" would change something, and plan mode only allows read-only inspection. Describe what you'd do instead; the operator can turn plan mode off to actually execute it.`;
+          await appendEvent(sessionStream(sessionId), "session.message", {
+            role: "assistant",
+            content: finalContent,
+          });
+          break turnLoop;
+        }
 
-      // Governance gates (governance.ts): hiring and goal plans never run
-      // from a turn — they're filed for the operator's approval, whatever
-      // any hook or allow rule would say.
-      // A proposal with something wrong with it isn't filed: it falls
-      // through to dispatch, which hands the problem back to the agent.
-      const gated = GATED_TOOLS.has(response.toolCall.name);
-      const proposalProblem = gated
-        ? await checkProposal(response.toolCall.name, response.toolCall.args ?? {}, agentId, (await getSession(sessionId))?.focus)
-        : undefined;
-      const blockDecision = gated
-        ? proposalProblem
-          ? { block: false as const }
-          : { block: true, reason: await gateToolCall({ agentId, sessionId, toolName: response.toolCall.name, args: response.toolCall.args ?? {}, sessionFocus: (await getSession(sessionId))?.focus }) }
-        : await fireHook("tool.before", {
+        // Governance gates (governance.ts): hiring and goal plans never run
+        // from a turn — they're filed for the operator's approval, whatever
+        // any hook or allow rule would say.
+        // A proposal with something wrong with it isn't filed: it falls
+        // through to dispatch, which hands the problem back to the agent.
+        const gated = GATED_TOOLS.has(call.name);
+        const proposalProblem = gated ? await checkProposal(call.name, call.args ?? {}, agentId, (await getSession(sessionId))?.focus) : undefined;
+        const blockDecision = gated
+          ? proposalProblem
+            ? { block: false as const }
+            : { block: true, reason: await gateToolCall({ agentId, sessionId, toolName: call.name, args: call.args ?? {}, sessionFocus: (await getSession(sessionId))?.focus }) }
+          : await fireHook("tool.before", {
+              agentId,
+              sessionId,
+              payload: call,
+            });
+        if (blockDecision.block) {
+          stopReason = "tool-blocked";
+          finalContent = `Tool call blocked: ${blockDecision.reason ?? "no reason given"}`;
+          await appendEvent(sessionStream(sessionId), "session.message", {
+            role: "assistant",
+            content: finalContent,
+          });
+          break turnLoop;
+        }
+
+        // Text the model wrote alongside the tool call ("Let me check your
+        // todos…") is part of its answer — keep it, or it streams in live
+        // and then vanishes when the client re-reads the history.
+        if (ci === 0 && response.content?.trim()) {
+          await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: response.content });
+        }
+        await appendEvent(sessionStream(sessionId), "tool.call.start", call);
+        await publishEvent("tool.call.start", { sessionId, agentId, ...call });
+        // A registered ToolDefinition's timeoutMs (tool-registry.ts) is
+        // enforced HERE, at the one call site every tool call passes
+        // through — not inside dispatchTool()'s individual branches — so
+        // it applies uniformly regardless of which tool ran. Every
+        // built-in tool ships with no timeoutMs by default (see
+        // BUILTIN_TOOL_DEFINITIONS), so withTimeout() is a true no-op for
+        // existing behavior unless a caller explicitly registers one.
+        const toolDef = getToolDefinition(call.name);
+        const result = await withTimeout(
+          dispatchTool(call, {
+            worker,
+            skills,
             agentId,
             sessionId,
-            payload: response.toolCall,
-          });
-      if (blockDecision.block) {
-        stopReason = "tool-blocked";
-        finalContent = `Tool call blocked: ${blockDecision.reason ?? "no reason given"}`;
+            model,
+            signal: turnAbort.signal,
+            enableSubagents,
+            enableMemoryNominations,
+            enableArtifacts,
+            sandboxPolicy,
+          }),
+          toolDef?.timeoutMs,
+          () => ({
+            ok: false,
+            output: "",
+            error: `tool "${call.name}" timed out after ${toolDef?.timeoutMs}ms`,
+          }),
+        );
+        toolExecutions++;
+        await appendEvent(sessionStream(sessionId), "tool.call.end", { ...call, result });
+        await publishEvent("tool.call.end", { sessionId, agentId, ...call, result });
+        await fireHook("tool.after", { agentId, sessionId, payload: { ...call, result } });
+
+        // Record which call produced the result: the history keeps no other
+        // record of the model's own tool call, and a model reading back a
+        // bare result can't tell what it asked for (see getModelFacingHistory).
         await appendEvent(sessionStream(sessionId), "session.message", {
-          role: "assistant",
-          content: finalContent,
+          role: "tool",
+          content: result.ok ? result.output : `error: ${result.error}`,
+          call: callLabel,
         });
-        break;
+        // Settling a work item (done / blocked / hand-back) is the last thing
+        // the agent has to do — end here, with the result as the reply,
+        // rather than one more model call to say so.
+        if (call.name === "work" && result.ok && SETTLING_WORK_ACTIONS.has(String(call.args?.action ?? ""))) {
+          const text = typeof call.args?.text === "string" ? call.args.text.trim() : "";
+          finalContent = text || response.content?.trim() || result.output;
+          await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent });
+          break turnLoop;
+        }
+        // Re-checked immediately after the tool actually ran (not just at
+        // the top of the next hop) so a cancellation that arrives WHILE a
+        // tool call is in flight is honored before the next model call is
+        // made, rather than one full extra hop later.
+        if (await isSessionCancelled(sessionId)) {
+          cancelled = true;
+          break turnLoop;
+        }
+        if (!result.ok) skipReason = "an earlier call in this reply failed, so it wasn't run (look at that error first)";
       }
-
-      // Text the model wrote alongside the tool call ("Let me check your
-      // todos…") is part of its answer — keep it, or it streams in live
-      // and then vanishes when the client re-reads the history.
-      if (response.content?.trim()) {
-        await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: response.content });
+      // Anything beyond the cap wasn't run either: say so, so the model asks again instead of assuming.
+      const requested = (response.toolCalls?.length ?? 0);
+      if (requested > calls.length) {
+        await appendEvent(sessionStream(sessionId), "session.message", { role: "tool", content: `skipped: only the first ${MAX_CALLS_PER_REPLY} calls of a reply are run; ask for the rest in your next reply`, call: "(extra calls)" });
       }
-      await appendEvent(sessionStream(sessionId), "tool.call.start", response.toolCall);
-      await publishEvent("tool.call.start", { sessionId, agentId, ...response.toolCall });
-      // A registered ToolDefinition's timeoutMs (tool-registry.ts) is
-      // enforced HERE, at the one call site every tool call passes
-      // through — not inside dispatchTool()'s individual branches — so
-      // it applies uniformly regardless of which tool ran. Every
-      // built-in tool ships with no timeoutMs by default (see
-      // BUILTIN_TOOL_DEFINITIONS), so withTimeout() is a true no-op for
-      // existing behavior unless a caller explicitly registers one.
-      const toolDef = getToolDefinition(response.toolCall.name);
-      const result = await withTimeout(
-        dispatchTool(response.toolCall, {
-          worker,
-          skills,
-          agentId,
-          sessionId,
-          model,
-          signal: turnAbort.signal,
-          enableSubagents,
-          enableMemoryNominations,
-          enableArtifacts,
-          sandboxPolicy,
-        }),
-        toolDef?.timeoutMs,
-        () => ({
-          ok: false,
-          output: "",
-          error: `tool "${response.toolCall!.name}" timed out after ${toolDef?.timeoutMs}ms`,
-        }),
-      );
-      await appendEvent(sessionStream(sessionId), "tool.call.end", { ...response.toolCall, result });
-      await publishEvent("tool.call.end", { sessionId, agentId, ...response.toolCall, result });
-      await fireHook("tool.after", { agentId, sessionId, payload: { ...response.toolCall, result } });
-
-      // Record which call produced the result: the history keeps no other
-      // record of the model's own tool call, and a model reading back a
-      // bare result can't tell what it asked for (see getModelFacingHistory).
-      const callLabel = `${response.toolCall.name} ${JSON.stringify(response.toolCall.args ?? {})}`.slice(0, 300);
-      await appendEvent(sessionStream(sessionId), "session.message", {
-        role: "tool",
-        content: result.ok ? result.output : `error: ${result.error}`,
-        call: callLabel,
-      });
+      // One reply is one tool step, however many calls it carried.
       hops++;
-      // Settling a work item (done / blocked / hand-back) is the last thing
-      // the agent has to do — end here, with the result as the reply,
-      // rather than one more model call to say so.
-      if (response.toolCall.name === "work" && result.ok && SETTLING_WORK_ACTIONS.has(String(response.toolCall.args?.action ?? ""))) {
-        const text = typeof response.toolCall.args?.text === "string" ? response.toolCall.args.text.trim() : "";
-        finalContent = text || response.content?.trim() || result.output;
-        await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent });
-        break;
-      }
-      // Re-checked immediately after the tool actually ran (not just at
-      // the top of the next hop) so a cancellation that arrives WHILE a
-      // tool call is in flight is honored before the next model call is
-      // made, rather than one full extra hop later.
-      if (await isSessionCancelled(sessionId)) {
-        cancelled = true;
-        break;
-      }
       continue;
     }
 

@@ -33,7 +33,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import os from "node:os";
 import { connectorGrantsFor } from "../connectors.js";
-import type { ModelAdapter, ModelCallOptions, ModelMessage, ModelResponse } from "../model.js";
+import { MAX_CALLS_PER_REPLY, type ModelAdapter, type ModelCallOptions, type ModelMessage, type ModelResponse } from "../model.js";
 import { registryToolSpecs, type ToolSpec } from "./real.js";
 
 export interface ClaudeCliOptions {
@@ -103,8 +103,10 @@ export function renderToolProtocol(tools: ToolSpec[], withConnectors = true): st
     `Agent-OS tools you can call right now (exact names): ${tools.map((t) => t.name).join(", ")}. They are NOT native tools and not MCP: you call them only by ending your reply with the block below.`,
     "Agent-OS runs tools for you (your built-in tools are off). To use one, end your reply with exactly one block:",
     `${TOOL_OPEN}{"name": "<tool>", "args": {...}}${TOOL_CLOSE}`,
-    "That format only for the Agent-OS tools below (not <function_calls> or XML), one call per reply, nothing after it — never guess a result. " +
-      "The output comes back as a [tool result] message (some calls wait for the operator's approval). No tool needed → just answer.",
+    "That format only for the Agent-OS tools below (not <function_calls> or XML) — never guess a result. " +
+      `You may end a reply with up to ${MAX_CALLS_PER_REPLY} blocks in a row when the calls are independent (none needs another's result): they run in order, and each result comes back as its own [tool result]. ` +
+      "If a call needs the result of another, send it alone and wait. If one fails, the ones after it are skipped. Nothing after the last block. " +
+      "(Some calls wait for the operator's approval.) No tool needed → just answer.",
     ...(withConnectors
       ? [
           "You may also be offered native connector tools (names starting mcp__, e.g. a search or docs tool). Those are extras: call them natively, as usual. " +
@@ -235,6 +237,25 @@ export function parseToolCall(text: string): { content: string; toolCall?: Parse
   return call ? { content: text.slice(0, start).trim(), toolCall: call } : { content: text.trim() };
 }
 
+/** Splits a reply into its visible text and EVERY tool call it carries, in order (a model may send several independent
+ *  calls at once). A block that doesn't parse is skipped, not guessed at. `content` is the text before the first block. */
+export function parseToolCalls(text: string): { content: string; toolCalls: ParsedCall[] } {
+  const starts: number[] = [];
+  for (let from = 0; from < text.length; ) {
+    const at = firstOpener(text.slice(from));
+    if (at === -1) break;
+    starts.push(from + at);
+    from += at + 1;
+  }
+  if (!starts.length) return { content: text.trim(), toolCalls: [] };
+  const toolCalls: ParsedCall[] = [];
+  starts.forEach((start, i) => {
+    const call = parseBlock(text.slice(start, starts[i + 1] ?? text.length));
+    if (call) toolCalls.push(call);
+  });
+  return { content: toolCalls.length ? text.slice(0, starts[0]).trim() : text.trim(), toolCalls };
+}
+
 /** How much of `text` is safe to show live: everything before a tool-call
  *  block, minus any trailing characters that could be the start of one. */
 function visiblePrefixLength(text: string): number {
@@ -359,8 +380,8 @@ export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter 
           const reason = stderr.trim().split("\n").find(Boolean) ?? `exit code ${code}`;
           return reject(new Error(`Claude CLI returned no result: ${reason}`));
         }
-        const parsed = parseToolCall(finalText);
-        resolve({ ...parsed, ...(usage ? { usage } : {}) });
+        const { content, toolCalls } = parseToolCalls(finalText);
+        resolve({ content, ...(toolCalls.length ? { toolCall: toolCalls[0], toolCalls } : {}), ...(usage ? { usage } : {}) });
       });
 
       child.stdin.on("error", () => {
