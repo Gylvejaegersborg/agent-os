@@ -24,7 +24,8 @@ export interface ModelResponse {
    *  per-model pricing changes and varies by provider/tier in ways this
    *  scaffold has no reliable source of truth for; inventing a cost
    *  figure would be worse than not showing one. */
-  usage?: { inputTokens: number; outputTokens: number };
+  /** inputTokens includes the cached part; cachedInputTokens is how much of it was read from the provider's prompt cache. */
+  usage?: { inputTokens: number; outputTokens: number; cachedInputTokens?: number };
 }
 
 /** A tool as the provider APIs take it: name, description, JSON Schema. */

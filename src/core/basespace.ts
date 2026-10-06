@@ -282,6 +282,50 @@ function hours(time: unknown): number | undefined {
 
 const cap1 = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
+const clip = (s: string, n = 70) => {
+  const one = s.replace(/\s+/g, " ").trim();
+  return one.length > n ? `${one.slice(0, n)}...` : one;
+};
+
+/** Changes a note the agent wrote, in place: `edit` is a list of {find, replace} (each `find` must match exactly once) and/or
+ *  `append` adds text at the end. All or nothing: one edit that doesn't match changes nothing and says which. The result echoes
+ *  what changed, so the agent doesn't have to read the note back to check, and doesn't rewrite a whole note to change a line. */
+async function editOwnNote(o: Overlay, args: Record<string, unknown>, agentId: string): Promise<ToolResult> {
+  const id = typeof args.id === "string" ? args.id.trim() : "";
+  const title = typeof args.title === "string" ? args.title.trim() : "";
+  const mine = o.notes.filter((n) => Array.isArray(n.tags) && (n.tags as string[]).includes(agentId));
+  const note = id
+    ? mine.find((n) => n.id === id)
+    : mine.filter((n) => n.title === title).sort((a, b) => String(b.updated ?? "").localeCompare(String(a.updated ?? "")))[0];
+  if (!note) return { ok: false, output: "", error: `no note of yours with ${id ? `id ${id}` : `the title "${title}"`} (you can only edit notes you wrote; give its id or exact title)` };
+  const edits = Array.isArray(args.edit) ? (args.edit as unknown[]) : [];
+  const append = typeof args.append === "string" ? args.append.trim() : "";
+  if (!edits.length && !append) return { ok: false, output: "", error: "edit needs a list of {find, replace}, or append text" };
+  const before = String(note.body ?? "");
+  let body = before;
+  const done: string[] = [];
+  for (let i = 0; i < edits.length; i++) {
+    const e = (edits[i] ?? {}) as { find?: unknown; replace?: unknown };
+    const find = typeof e.find === "string" ? e.find : "";
+    const replace = typeof e.replace === "string" ? e.replace : "";
+    if (!find) return { ok: false, output: "", error: `edit ${i + 1}: find is empty (nothing was changed)` };
+    const count = body.split(find).length - 1;
+    if (count === 0) return { ok: false, output: "", error: `edit ${i + 1}: that text is not in the note (nothing was changed). Read the note with basespace (id ${note.id}) and copy the text exactly.` };
+    if (count > 1) return { ok: false, output: "", error: `edit ${i + 1}: that text appears ${count} times (nothing was changed). Add surrounding words so it matches once.` };
+    body = body.replace(find, () => replace);
+    done.push(`"${clip(find)}" -> ${replace ? `"${clip(replace)}"` : "(removed)"}`);
+  }
+  if (append) {
+    body = `${body}${body ? "\n\n" : ""}${append}`;
+    done.push(`appended "${clip(append)}"`);
+  }
+  if (body === before) return { ok: true, output: `No change: the note "${note.title}" already reads that way.` };
+  note.body = body;
+  note.updated = new Date().toISOString();
+  await saveOverlay(o);
+  return { ok: true, output: `Saved note "${note.title}" (${note.folder}), id ${note.id}. ${done.length} change${done.length === 1 ? "" : "s"}:\n- ${done.join("\n- ")}\nIt is saved and checked: no need to read it back.` };
+}
+
 /** What the `basespace-add` tool does. */
 export async function addOverlayItem(kind: OverlayKind, args: Record<string, unknown>, agentId: string, focus?: SessionFocus): Promise<ToolResult> {
   const str = (k: string) => (typeof args[k] === "string" ? (args[k] as string).trim() : "");
@@ -294,7 +338,10 @@ export async function addOverlayItem(kind: OverlayKind, args: Record<string, unk
 
   if (kind === "note") {
     const title = str("title");
-    if (!title) return { ok: false, output: "", error: "a note needs a title" };
+    if (!title && !str("id") && (Array.isArray(args.edit) || str("append"))) return { ok: false, output: "", error: "to edit a note give its id or its exact title" };
+    if (!title && !(Array.isArray(args.edit) || str("append"))) return { ok: false, output: "", error: "a note needs a title" };
+    // Changing a note you wrote: edit/append, not a rewrite.
+    if (Array.isArray(args.edit) || str("append")) return editOwnNote(o, args, agentId);
     const folder = str("folder") || `Agents/${cap1(agentId)}`;
     let body = str("body");
     // The same agent adding a note with the same title again (a retry, a

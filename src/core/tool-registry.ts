@@ -241,9 +241,9 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
     name: "basespace",
     description:
       "Reads the operator's BaseSpace dashboard (a snapshot it syncs here): section = summary | goals | notes | projects | todos | events | crons | teams | songs " +
-      "(songs: the operator's music library: title, beat or song, BPM, key, tags, a note. Nothing else is known about a song; don't guess). " +
-      "Goals are what the work is for; projects serve goals; todos and notes link to them. Use query to filter by text; use id to get one item in full " +
-      "(a goal or project by id comes with its goal chain, linked notes and open todos; notes are listed without their text until you ask for one by id).",
+      "(songs: title, beat or song, BPM, key, tags, a note; nothing else is known, don't guess). " +
+      "Goals are what the work is for; projects serve goals; todos and notes link to them. query filters by text; id returns one item in full " +
+      "(a goal or project comes with its goal chain, linked notes and open todos; notes are listed without text until you ask by id).",
     inputSchema: {
       section: { type: "string", required: true, description: "summary, goals, notes, projects, todos, events, crons, teams or songs." },
       query: { type: "string", description: "Only items containing this text." },
@@ -255,19 +255,28 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
     description:
       "Adds something to the operator's BaseSpace: kind = note {title, body, folder?} | todo {title, due? YYYY-MM-DD, time? HH:MM, priority? high|med|low, notes?} | " +
       "project-update {projectId, text}. Todos can name the projectId or goalId they serve. When this conversation is focused on a goal or project, " +
-      "what you add links to it automatically. Internal to their own dashboard — use approvals for anything that goes outside it.",
+      "what you add links to it automatically. To CHANGE a note you wrote, do not write it again: use kind note with its id (or exact title) and edit [{find, replace}] " +
+      "(each find matches once) and/or append: it is saved at once and the changes come back, so there is nothing to read back. " +
+      "Internal to their own dashboard — use approvals for anything that goes outside it.",
     inputSchema: {
       kind: { type: "string", required: true, description: "note, todo or project-update." },
-      title: { type: "string", description: "Note or todo title." },
+      title: { type: "string" },
       body: { type: "string", description: "Note text (markdown)." },
-      folder: { type: "string", description: "Note folder, e.g. Team/Meetings. Defaults to Agents/<your name>." },
-      due: { type: "string", description: "Todo due date, YYYY-MM-DD." },
-      time: { type: "string", description: "Todo time, HH:MM (the operator gets a notification then)." },
-      priority: { type: "string", description: "Todo priority: high, med or low." },
+      folder: { type: "string", description: "Default Agents/<your name>." },
+      due: { type: "string", description: "YYYY-MM-DD." },
+      time: { type: "string", description: "HH:MM (the operator is notified then)." },
+      priority: { type: "string", description: "high, med or low." },
       notes: { type: "string", description: "Todo details." },
-      projectId: { type: "string", description: "Project id (from the basespace tool): required for a project-update; for a todo, the project it serves." },
-      goalId: { type: "string", description: "For a todo: the goal it serves (from the basespace tool, section goals)." },
+      projectId: { type: "string", description: "Required for a project-update; for a todo, the project it serves." },
+      goalId: { type: "string", description: "For a todo: the goal it serves." },
       text: { type: "string", description: "The project update." },
+      id: { type: "string", description: "Editing a note: its id." },
+      edit: {
+        type: "array",
+        description: "Changes to a note you wrote: find is copied exactly from it and appears once; replace may be empty.",
+        items: { type: "object", properties: { find: { type: "string" }, replace: { type: "string" } }, required: ["find", "replace"] },
+      },
+      append: { type: "string", description: "Text to add at the end of a note you wrote." },
     },
   },
   {
@@ -280,13 +289,13 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
       "Only write down what you were told. Never invent BPM, key or lyrics; leave a field out when unknown. You can't hear audio.",
     inputSchema: {
       action: { type: "string", required: true, description: "list, read, add or update." },
-      id: { type: "string", description: "Song id (from list). Required for read and update." },
-      path: { type: "string", description: "add: path to the audio file (mp3, wav, flac, m4a, aac, ogg, aiff)." },
-      title: { type: "string", description: "Song title." },
-      kind: { type: "string", description: "beat (an instrumental) or song." },
-      bpm: { type: "number", description: "Tempo, only if known." },
-      key: { type: "string", description: "Musical key, only if known." },
-      tags: { type: "array", description: "Tags (descriptive words, not people).", items: { type: "string" } },
+      id: { type: "string", description: "Song id (from list); needed for read and update." },
+      path: { type: "string", description: "add: the audio file (mp3, wav, flac, m4a, aac, ogg, aiff)." },
+      title: { type: "string" },
+      kind: { type: "string", description: "beat or song." },
+      bpm: { type: "number", description: "Only if known." },
+      key: { type: "string", description: "Only if known." },
+      tags: { type: "array", description: "Descriptive words, not people.", items: { type: "string" } },
       collaborators: { type: "array", description: "Who else made it, each as \"Name\" or \"Name: what they did\" (e.g. \"Gswish: melody\"). Credits only; never invent splits.", items: { type: "string" } },
       note: { type: "string", description: "A short note." },
       lyrics: { type: "string", description: "The lyrics, exactly as given to you. Empty string clears them." },
@@ -303,9 +312,9 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: "soundlab",
     description:
-      "The operator's Sound Lab: synthesized drums and melodic one-shots they listen to and judge. action = kept | packs | license. " +
-      "kept {kind?}: the sounds they kept (name and kind) and how many are waiting or in maybe. packs: the sound packs built from kept sounds and what is in them. license: the full text of the DRAFT license that ships with a pack, and the [brackets] still open in it (read it to explain it; you can't change it). " +
-      "You can't hear anything, and you can't accept, skip or build: only the operator judges and builds packs. Describe sounds only by their names and the counts; never say how one sounds.",
+      "The operator's Sound Lab (synthesized drums and melodic one-shots they judge). action = kept | packs | license. " +
+      "kept {kind?}: sounds they kept (name, kind) and how many are waiting or maybe. packs: packs built from kept sounds and what is in them. license: the DRAFT license text and its open [brackets] (read-only). " +
+      "You can't hear audio or judge/build: describe sounds only by name and count, never how one sounds.",
     inputSchema: {
       action: { type: "string", required: true, description: "kept, packs or license." },
       kind: { type: "string", description: "kept: only this kind (808, kick, snare, clap, perc, hat-closed, hat-open, bell, pluck, keys, pad, strings, lead)." },
@@ -321,46 +330,45 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
       "It measures levels; it can't judge how something sounds.",
     inputSchema: {
       action: { type: "string", required: true, description: "info or edit." },
-      path: { type: "string", required: true, description: "The input audio file." },
-      output: { type: "string", description: "edit: the new file to write." },
-      trim_start: { type: "number", description: "Seconds to cut from the start." },
-      trim_end: { type: "number", description: "Seconds at which to stop." },
-      reverse: { type: "boolean", description: "Play backwards." },
-      speed: { type: "number", description: "Speed factor (changes length, keeps pitch)." },
-      pitch_semitones: { type: "number", description: "Shift pitch, keeps length." },
-      high_pass_hz: { type: "number", description: "Cut frequencies below this." },
-      low_pass_hz: { type: "number", description: "Cut frequencies above this." },
-      gain_db: { type: "number", description: "Louder (+) or quieter (-)." },
-      normalize_peak_db: { type: "number", description: "Set the loudest peak to this level, e.g. -1." },
-      limit_db: { type: "number", description: "Hard ceiling, e.g. -1." },
-      fade_in_sec: { type: "number", description: "Fade in length." },
-      fade_out_sec: { type: "number", description: "Fade out length." },
-      bit_depth: { type: "number", description: "16 or 24 (wav output)." },
+      path: { type: "string", required: true, description: "Input file." },
+      output: { type: "string", description: "edit: the new file." },
+      trim_start: { type: "number", description: "Seconds." },
+      trim_end: { type: "number", description: "Seconds." },
+      reverse: { type: "boolean", description: "Reverse." },
+      speed: { type: "number", description: "0.25-4." },
+      pitch_semitones: { type: "number", description: "-12..12." },
+      high_pass_hz: { type: "number", description: "Hz." },
+      low_pass_hz: { type: "number", description: "Hz." },
+      gain_db: { type: "number", description: "dB." },
+      normalize_peak_db: { type: "number", description: "dB, e.g. -1." },
+      limit_db: { type: "number", description: "dB, e.g. -1." },
+      fade_in_sec: { type: "number", description: "Seconds." },
+      fade_out_sec: { type: "number", description: "Seconds." },
+      bit_depth: { type: "number", description: "16 or 24 (wav)." },
     },
   },
   {
     name: "read_file",
-    description: "Reads a file's full text content from disk, subject to the session's SandboxPolicy (if one is configured).",
-    inputSchema: { path: { type: "string", required: true, description: "Path to the file, absolute or relative to the sandbox's workspaceRoot." } },
+    description: "Reads a file's text from disk (within the sandbox policy, if any).",
+    inputSchema: { path: { type: "string", required: true } },
   },
   {
     name: "edit_file",
     description:
-      "Replaces an exact, unique occurrence of old_string with new_string in an existing file — the structured alternative to editing via shell redirection/sed. " +
-      "old_string must match exactly once in the file unless replace_all is set, otherwise the call fails with no write made (so a bad match never silently edits the wrong spot).",
+      "Replaces old_string with new_string in an existing file. old_string must match exactly once unless replace_all is set; otherwise nothing is written.",
     inputSchema: {
-      path: { type: "string", required: true, description: "Path to the existing file to edit." },
-      old_string: { type: "string", required: true, description: "The exact text to replace. Must occur exactly once unless replace_all is true." },
-      new_string: { type: "string", required: true, description: "The replacement text." },
-      replace_all: { type: "boolean", description: "Replace every occurrence of old_string instead of requiring exactly one. Default false." },
+      path: { type: "string", required: true },
+      old_string: { type: "string", required: true },
+      new_string: { type: "string", required: true },
+      replace_all: { type: "boolean", description: "Replace every occurrence." },
     },
   },
   {
     name: "write_file",
-    description: "Creates a new file (or fully overwrites an existing one) with the given content. Creates parent directories as needed.",
+    description: "Creates a file, or fully overwrites one, with the given content (parent directories are created).",
     inputSchema: {
-      path: { type: "string", required: true, description: "Path to the file to create or overwrite." },
-      content: { type: "string", required: true, description: "The full file content to write." },
+      path: { type: "string", required: true },
+      content: { type: "string", required: true },
     },
   },
 ];

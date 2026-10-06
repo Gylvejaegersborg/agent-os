@@ -43,7 +43,7 @@ export interface AgentTurnResult {
    *  makes several) — omitted entirely when the model adapter never
    *  reported usage at all (the stub model, or a provider response that
    *  didn't carry it), never a fabricated {0,0}. */
-  usage?: { inputTokens: number; outputTokens: number };
+  usage?: { inputTokens: number; outputTokens: number; cachedInputTokens?: number };
   /** How the turn ended: a real answer, a tool call the harness refused
    *  (plan mode, policy, an approval still pending), out of tool steps, or
    *  cancelled. Lets callers like the work runner tell "finished" from
@@ -343,6 +343,8 @@ async function maybeCompactSession(sessionId: string, model: ModelAdapter): Prom
 export interface SessionUsage {
   inputTokens: number;
   outputTokens: number;
+  /** Part of inputTokens that came from the provider's prompt cache (only when the provider says). */
+  cachedInputTokens?: number;
   /** How many of this session's turns actually reported usage — lets a
    *  caller distinguish "zero tokens used" (impossible in practice) from
    *  "no turn in this session ever reported usage" (the honest default
@@ -357,8 +359,9 @@ export interface SessionUsage {
 export async function getSessionUsage(sessionId: string): Promise<SessionUsage> {
   return project<SessionUsage>(sessionStream(sessionId), { inputTokens: 0, outputTokens: 0, turnsWithUsage: 0 }, (state, event) => {
     if (event.type === "agent.turn.end") {
-      const usage = (event.payload as any).usage as { inputTokens: number; outputTokens: number } | undefined;
+      const usage = (event.payload as any).usage as { inputTokens: number; outputTokens: number; cachedInputTokens?: number } | undefined;
       if (usage) {
+        if (usage.cachedInputTokens) state.cachedInputTokens = (state.cachedInputTokens ?? 0) + usage.cachedInputTokens;
         state.inputTokens += usage.inputTokens;
         state.outputTokens += usage.outputTokens;
         state.turnsWithUsage += 1;
@@ -823,6 +826,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   let stopReason: AgentTurnResult["stopReason"] = "answered";
   let usageInputTokens = 0;
   let usageOutputTokens = 0;
+  let usageCachedTokens = 0;
   let sawUsage = false;
 
   // Fetched once per turn, outside the hop loop — see renderIdentityContext's
@@ -914,7 +918,9 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     // personaText first — "who you are" precedes "what you remember/can do"
     // in the assembled system message, matching how a human-written system
     // prompt would order identity before capability context.
-    const systemParts = [personaText, focusText, orgText, memoryText, catalogText, subagentText, nominationText, artifactText, baseSpaceText, fileToolsText, planModeText].filter(
+    // Stable parts first, the ones that change from turn to turn (focus, recalled memory) last: the provider caches a prompt by its
+    // prefix, so this keeps the long unchanging part reusable.
+    const systemParts = [personaText, orgText, catalogText, subagentText, nominationText, artifactText, baseSpaceText, fileToolsText, planModeText, focusText, memoryText].filter(
       Boolean,
     );
     const messages: ModelMessage[] = systemParts.length
@@ -959,6 +965,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       sawUsage = true;
       usageInputTokens += response.usage.inputTokens;
       usageOutputTokens += response.usage.outputTokens;
+      usageCachedTokens += response.usage.cachedInputTokens ?? 0;
     }
 
     const calls = toolCallsOf(response);
@@ -1124,7 +1131,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     finalContent = `⚠ ${message}`;
-    const usage = sawUsage ? { inputTokens: usageInputTokens, outputTokens: usageOutputTokens } : undefined;
+    const usage = sawUsage ? { inputTokens: usageInputTokens, outputTokens: usageOutputTokens, ...(usageCachedTokens ? { cachedInputTokens: usageCachedTokens } : {}) } : undefined;
     if (usage) await recordAgentUsage(agentId, usage, sessionId);
     await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent, error: true });
     await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled, error: message, usage });
@@ -1155,7 +1162,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     });
   }
 
-  const usage = sawUsage ? { inputTokens: usageInputTokens, outputTokens: usageOutputTokens } : undefined;
+  const usage = sawUsage ? { inputTokens: usageInputTokens, outputTokens: usageOutputTokens, ...(usageCachedTokens ? { cachedInputTokens: usageCachedTokens } : {}) } : undefined;
   // Counts toward the agent's budget (controls.ts) — including a cancelled
   // turn's tokens, since those were spent too.
   if (usage) {

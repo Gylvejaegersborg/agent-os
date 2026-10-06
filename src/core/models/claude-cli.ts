@@ -299,7 +299,10 @@ export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter 
     const system = messages.find((m) => m.role === "system")?.content ?? "";
     const grants = connectorGrantsFor(model);
     const toolText = renderToolProtocol(callOpts?.tools ?? opts.tools ?? registryToolSpecs(), grants.allow.length > 0);
-    const systemPrompt = [system, toolText].filter(Boolean).join("\n\n") || "You are a helpful assistant.";
+    // The tool protocol goes FIRST: it is the biggest block and identical on every call an agent makes, so the provider's prompt
+    // cache can reuse the whole prefix (tools + persona + the other stable parts). What changes per turn (the conversation focus,
+    // recalled memory) is last in `system`, so it only breaks the cache at the very end.
+    const systemPrompt = [toolText, system].filter(Boolean).join("\n\n") || "You are a helpful assistant.";
     const args = claudeCliArgs(systemPrompt, model, grants);
     // The CLI authenticates with its own login. ANTHROPIC_TOKEN is Agent-OS's
     // own variable for the direct-API path, not something the CLI reads —
@@ -354,6 +357,7 @@ export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter 
             usage = {
               inputTokens: (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0),
               outputTokens: u.output_tokens ?? 0,
+              ...(u.cache_read_input_tokens ? { cachedInputTokens: u.cache_read_input_tokens } : {}),
             };
           }
         }

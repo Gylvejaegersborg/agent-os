@@ -19,10 +19,12 @@ export interface FlowReportAttempt {
   /** What the agent said at the end (or the error, when it stopped early). */
   result?: string;
   error?: string;
-  tokens?: { input: number; output: number };
+  tokens?: { input: number; output: number; cached?: number };
   toolCalls: { name: string; summary: string; ok: boolean }[];
   /** What it added to BaseSpace (basespace-add calls that worked). */
   added: { kind: string; title: string; folder?: string }[];
+  /** Notes it changed in place (edit/append), with how many changes. */
+  edited: { note: string; changes: number }[];
 }
 
 export interface FlowReportStep {
@@ -51,7 +53,7 @@ export interface FlowReport {
   summary?: string;
   proposedBy?: string;
   steps: FlowReportStep[];
-  totals: { tokens: { input: number; output: number }; toolCalls: number; added: number; seconds: number };
+  totals: { tokens: { input: number; output: number; cached: number }; toolCalls: number; added: number; seconds: number };
 }
 
 const short = (v: unknown, n = 90) => {
@@ -62,7 +64,7 @@ const short = (v: unknown, n = 90) => {
 async function attemptOf(task: Task): Promise<FlowReportAttempt> {
   const out = (task.output ?? {}) as { finalContent?: unknown; error?: unknown; sessionId?: unknown };
   const sessionId = typeof out.sessionId === "string" ? out.sessionId : undefined;
-  const attempt: FlowReportAttempt = { taskId: task.id, status: task.status, toolCalls: [], added: [] };
+  const attempt: FlowReportAttempt = { taskId: task.id, status: task.status, toolCalls: [], added: [], edited: [] };
   if (task.startedAt) attempt.startedAt = task.startedAt;
   if (task.completedAt) attempt.completedAt = task.completedAt;
   if (task.startedAt && task.completedAt) attempt.seconds = Math.max(0, Math.round((Date.parse(task.completedAt) - Date.parse(task.startedAt)) / 1000));
@@ -71,14 +73,18 @@ async function attemptOf(task: Task): Promise<FlowReportAttempt> {
   if (!sessionId) return attempt;
   attempt.sessionId = sessionId;
   const usage = await getSessionUsage(sessionId);
-  if (usage.turnsWithUsage) attempt.tokens = { input: usage.inputTokens, output: usage.outputTokens };
+  if (usage.turnsWithUsage) attempt.tokens = { input: usage.inputTokens, output: usage.outputTokens, ...(usage.cachedInputTokens ? { cached: usage.cachedInputTokens } : {}) };
   for (const e of await readStream(`session:${sessionId}`)) {
     if (e.type !== "tool.call.end") continue;
     const p = e.payload as { name?: string; args?: Record<string, unknown>; result?: { ok?: boolean } };
     if (!p.name) continue;
     const ok = p.result?.ok !== false;
     attempt.toolCalls.push({ name: p.name, summary: short(p.args), ok });
-    if (p.name === "basespace-add" && ok) {
+    if (p.name === "basespace-add" && ok && (Array.isArray(p.args?.edit) || typeof p.args?.append === "string")) {
+      const a = p.args ?? {};
+      const changes = (Array.isArray(a.edit) ? a.edit.length : 0) + (typeof a.append === "string" && a.append.trim() ? 1 : 0);
+      attempt.edited.push({ note: String(a.title ?? a.id ?? "(note)"), changes });
+    } else if (p.name === "basespace-add" && ok) {
       const a = p.args ?? {};
       attempt.added.push({ kind: String(a.kind ?? "item"), title: String(a.title ?? a.text ?? "(untitled)"), ...(typeof a.folder === "string" ? { folder: a.folder } : {}) });
     }
@@ -104,11 +110,12 @@ export async function buildFlowReport(flowId: string): Promise<FlowReport | unde
       attempts: await Promise.all(mine.map(attemptOf)),
     });
   }
-  const totals = { tokens: { input: 0, output: 0 }, toolCalls: 0, added: 0, seconds: 0 };
+  const totals = { tokens: { input: 0, output: 0, cached: 0 }, toolCalls: 0, added: 0, seconds: 0 };
   for (const st of steps)
     for (const a of st.attempts) {
       totals.tokens.input += a.tokens?.input ?? 0;
       totals.tokens.output += a.tokens?.output ?? 0;
+      totals.tokens.cached += a.tokens?.cached ?? 0;
       totals.toolCalls += a.toolCalls.length;
       totals.added += a.added.length;
       totals.seconds += a.seconds ?? 0;

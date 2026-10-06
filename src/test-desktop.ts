@@ -39,6 +39,7 @@ function assert(cond: boolean, msg: string): void {
 // A fixed local morning today, so every span lands on the same local day.
 const base = new Date();
 base.setHours(9, 0, 0, 0);
+if (base.getTime() > Date.now() - 3600_000) base.setDate(base.getDate() - 1); // run before 10:00: 9:00 today is still in the future, and spans from the future are refused
 const at = (min: number) => new Date(base.getTime() + min * 60_000).toISOString();
 const day = localDay(base);
 
