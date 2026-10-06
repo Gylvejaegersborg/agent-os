@@ -121,7 +121,7 @@ assert(toolMsgs(small.history as any).filter((m) => !/^skipped/.test(m.content))
 delete process.env.AGENT_OS_MAX_TOOL_EXECUTIONS;
 
 // A flow step that hits the cap is a failed step, like any step that runs out of tool steps.
-const flowResult = await runFlow([{ id: "busy", agentId: "nyx", goal: "keep going" }], { model: script([[summary, summary, summary, summary], [summary, summary, summary, summary], [summary, summary, summary, summary]]), worker, enableBaseSpace: true, maxToolHopsPerStep: 20 });
+const flowResult = await runFlow([{ id: "busy", agentId: "nyx", goal: "keep going" }], { model: script([[summary, summary, summary, summary], [summary, summary, summary, summary], [summary, summary, summary, summary]]), worker, enableBaseSpace: true, maxToolHopsPerStep: 20, maxToolExecutionsPerStep: 8 });
 assert(flowResult.steps[0]!.status === "failed" && flowResult.status === "failed", "a flow step that runs into the cap is reported failed, not succeeded");
 
 // --- 5. one at a time is unchanged ------------------------------------------------------------------------------

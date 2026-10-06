@@ -8,7 +8,7 @@
 // Run with: node dist/test-flow-resume.js
 
 import "./test-helpers/isolate.js";
-import { storeFlowDefinition, buildFlowReport, createArtifact, recordFileRevision, subscribeToEvent, cancelFlow, createFlow, createStubWorker, getFlow, reopenFlow, resumeFlow, runFlow, seedDefaultAgents, type ModelAdapter, type ModelResponse } from "./core/index.js";
+import { markStepDone, flowStepExecutions, storeFlowDefinition, buildFlowReport, createArtifact, recordFileRevision, subscribeToEvent, cancelFlow, createFlow, createStubWorker, getFlow, reopenFlow, resumeFlow, runFlow, seedDefaultAgents, type ModelAdapter, type ModelResponse } from "./core/index.js";
 
 let failed = false;
 function assert(cond: boolean, msg: string): void {
@@ -98,6 +98,24 @@ await createArtifact({ type: "report", location: "x", producer: "nyx" } as any);
 await recordFileRevision({ path: "a.txt", previousContent: "", existedBefore: false, tool: "write_file" } as any);
 off.forEach((d) => d());
 assert(seen.includes("artifact") && seen.includes("file"), "creating an artifact and recording a file revision each publish an event");
+
+// the operator accepts a stopped step as done; the flow carries on without re-running it
+busy = true;
+const ds = [
+  { id: "list", agentId: "nyx", goal: "BUSY: write the list", dependsOn: [] as string[] },
+  { id: "verify", agentId: "argus", goal: "V: check the list", dependsOn: ["list"] },
+];
+const df = await runFlow(ds, opts);
+assert((await getFlow(df.flowId))!.status === "failed", "a step that ran out of tool steps stops the flow");
+goals.length = 0;
+busy = false;
+await markStepDone(df.flowId, "list", ds, opts);
+const after = (await getFlow(df.flowId))!;
+assert(after.status === "succeeded" && after.steps.find((x) => x.id === "list")!.status === "succeeded" && goals.every((g) => !g.startsWith("BUSY")) && goals.some((g) => g.startsWith("V:")), "marking the step done runs the next step and does not run the accepted one again");
+assert(await markStepDone(df.flowId, "list", ds, opts).then(() => false, () => true), "a step that already succeeded can not be marked done");
+
+// a flow step gets a bigger execution cap than a chat turn (25 vs 8)
+assert(flowStepExecutions() === 25, "a flow step's default cap is 25 tool executions");
 
 console.log(failed ? "\nSome flow-resume tests FAILED." : "\nAll flow-resume tests passed.");
 process.exit(failed ? 1 : 0);

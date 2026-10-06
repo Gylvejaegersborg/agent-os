@@ -91,6 +91,7 @@ import {
   cancelFlow,
   resumeFlow,
   reopenFlow,
+  markStepDone,
   listApprovals,
   getApproval,
   approveRequest,
@@ -1301,6 +1302,42 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         console.error(`[gateway] flow ${flow.id} resume failed:`, err instanceof Error ? err.message : err);
       });
       sendJson(res, 202, flow);
+      return;
+    }
+    // The operator accepts a stopped step as done and the flow carries on from there.
+    if (method === "POST" && segments.length === 5 && segments[2] === "steps" && segments[4] === "done") {
+      const flow = await getFlow(segments[1]!);
+      if (!flow) {
+        sendJson(res, 404, { error: `no such flow: ${segments[1]}` });
+        return;
+      }
+      const body = await readRequestBody(req);
+      const steps = parseFlowSteps(body.steps);
+      if (!steps) {
+        sendJson(res, 400, { error: "steps (the flow's step definitions) are required" });
+        return;
+      }
+      try {
+        const stepId = decodeURIComponent(segments[3]!);
+        const current = flow.steps.find((s) => s.id === stepId);
+        if (!current) throw new Error(`no step "${stepId}" in flow ${flow.id}`);
+        if (current.status === "succeeded") throw new Error(`step "${stepId}" already succeeded`);
+        if (current.status === "running") throw new Error(`step "${stepId}" is still running`);
+        markStepDone(flow.id, stepId, steps, {
+          model: deps.model,
+          worker: deps.worker,
+          skills: deps.skills,
+          maxToolHopsPerStep: deps.maxToolHops,
+          enableSubagents: deps.enableSubagents,
+          enableMemoryNominations: deps.enableMemoryNominations,
+          enableArtifacts: deps.enableArtifacts,
+          enableBaseSpace: deps.enableBaseSpace,
+          sandboxPolicy: deps.sandboxPolicy,
+        }).catch((err) => console.error(`[gateway] flow ${flow.id} mark-done failed:`, err instanceof Error ? err.message : err));
+        sendJson(res, 202, flow);
+      } catch (err) {
+        sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
+      }
       return;
     }
     if (method === "POST" && segments.length === 3 && segments[2] === "cancel") {

@@ -49,7 +49,7 @@
 //      checks, not instantly.
 
 import { createFlow, getFlow, getTask, reopenFlow, updateFlowStep, createTask, transitionTask } from "./tasks.js";
-import { runTurn } from "./agent-loop.js";
+import { flowStepExecutions, runTurn } from "./agent-loop.js";
 import { createSession, linkSessionWork } from "./session.js";
 import type { SessionFocus } from "./types.js";
 import { createModelForAgent } from "./models/real.js";
@@ -83,6 +83,8 @@ export interface DriveFlowOptions {
   worker: Worker;
   skills?: SkillRegistry;
   maxToolHopsPerStep?: number;
+  /** Cap on tool executions inside one step (default flowStepExecutions()). */
+  maxToolExecutionsPerStep?: number;
   /** Forwarded as-is to each step's runTurn() call (agent-loop.ts) — same
    *  meaning as the gateway's direct-chat turns route. Previously just
    *  missing from this options type entirely, so even a gateway that
@@ -156,6 +158,20 @@ export async function resumeFlow(flowId: string, steps: FlowStepDefinition[], op
   return driveFlow(flowId, steps, opts);
 }
 
+/** The operator accepts a stopped step as done (for instance it finished its work and only ran out of steps saying so).
+ *  The flow is reopened, that step is recorded as succeeded against its latest attempt, and the rest of the flow runs. */
+export async function markStepDone(flowId: string, stepId: string, steps: FlowStepDefinition[], opts: DriveFlowOptions): Promise<DriveFlowResult> {
+  const flow = await getFlow(flowId);
+  const step = flow?.steps.find((s) => s.id === stepId);
+  if (!flow || !step) throw new Error(`no step "${stepId}" in flow ${flowId}`);
+  if (step.status === "succeeded") throw new Error(`step "${stepId}" already succeeded`);
+  if (step.status === "running") throw new Error(`step "${stepId}" is still running`);
+  await reopenFlow(flowId, { includeCancelled: true });
+  await setStepStatus(flowId, stepId, "succeeded", step.taskId);
+  await publishEvent("flow.step.completed", { flowId, stepId, taskId: step.taskId, status: "succeeded", acceptedBy: "operator" });
+  return driveFlow(flowId, steps, opts);
+}
+
 async function setStepStatus(flowId: string, stepId: string, status: TaskStatus, taskId?: string): Promise<void> {
   // Optimistic-concurrency retry loop: multiple steps in the same
   // parallel batch race to bump the SAME Flow's revision counter, so a
@@ -222,6 +238,7 @@ async function runStepOnce(
       worker: opts.worker,
       skills: opts.skills,
       maxToolHops: opts.maxToolHopsPerStep,
+      maxToolExecutions: opts.maxToolExecutionsPerStep ?? flowStepExecutions(),
       enableSubagents: opts.enableSubagents,
       enableMemoryNominations: opts.enableMemoryNominations,
       enableArtifacts: opts.enableArtifacts,

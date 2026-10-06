@@ -58,6 +58,9 @@ export interface RunTurnOptions {
   model: ModelAdapter;
   worker: Worker;
   maxToolHops?: number;
+  /** Overrides the per-run cap on tool executions (maxToolExecutionsPerRun) for this turn: a flow step that has a whole
+   *  list to write needs more than a chat reply does. */
+  maxToolExecutions?: number;
   /** Layer-1 progressive disclosure: when provided, every skill's
    *  name+description is injected as a system message each turn (not
    *  stored in the session log — the catalog is external state re-read
@@ -172,6 +175,13 @@ function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 export function maxToolExecutionsPerRun(): number {
   const n = Number(process.env.AGENT_OS_MAX_TOOL_EXECUTIONS ?? 8);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 8;
+}
+
+/** The cap for one flow step (AGENT_OS_FLOW_STEP_EXECUTIONS, default 25). A step is a whole job, so it gets more room than
+ *  a chat turn; it still ends, and says so, when it reaches it. */
+export function flowStepExecutions(): number {
+  const n = Number(process.env.AGENT_OS_FLOW_STEP_EXECUTIONS ?? 25);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 25;
 }
 
 /** The calls in a model reply, in order: `toolCalls` when the adapter parsed several, else the single `toolCall`. */
@@ -794,7 +804,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   let cancelled = false;
   // Tool executions so far in this run (a call that was skipped, blocked or refused doesn't count).
   let toolExecutions = 0;
-  const executionCap = maxToolExecutionsPerRun();
+  const executionCap = opts.maxToolExecutions && opts.maxToolExecutions > 0 ? Math.floor(opts.maxToolExecutions) : maxToolExecutionsPerRun();
   // Fired by cancelSession(): stops the in-flight model request and shell command now.
   const turnAbort = beginTurnAbort(sessionId);
   // Summed across every hop in this turn — a tool-calling turn makes
