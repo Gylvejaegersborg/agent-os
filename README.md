@@ -1378,7 +1378,7 @@ sound.** Routes (`gateway/soundlab-routes.ts`): `POST /soundlab/batches`,
 `GET /soundlab/candidates`, `GET /soundlab/candidates/:id/audio` (Range),
 `POST /soundlab/candidates/:id/judge`, `GET /soundlab/stats`. Tests: `npm run test-soundlab`
 (checks what code can: clean renders, pitch of an 808, spectrum of kicks and hats, ffmpeg
-decodes the WAV, steering). It can't say how a sound *feels*: that is the operator's ears,
+decodes the WAV, steering). **Engine v2** (after the first listening round): 808s and all melodic sounds are tuned to C, 808s keep a real tail and a steady timbre, kicks have a soft transient, snares have no hiss, claps and open hats vary, melodic sounds are stereo with several architectures per kind (e.g. glass/music-box/chime bells, string/saw/marimba/glass plucks, e-piano/piano/organ, strings/choir/glass pads, super/PWM/flute leads), pads can run long (`hold`). Sounds from an older engine are hidden, not re-rendered, because a changed recipe would make a kept sound a different sound. BaseSpace's **Rounds** view runs a tournament over the kept sounds of a kind (pairwise, A then B, resumes after a reload) and can move the rest to a **Maybe** tab, which can bring any back. It can't say how a sound *feels*: that is the operator's ears,
 and melodic one-shots from plain synthesis can come out thin.
 
 ## Flows designed by leaders, checked by Argus

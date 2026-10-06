@@ -98,7 +98,7 @@ const withDefaults = (kind: SoundKind, over: Record<string, number>) => ({ ...cl
 // --- 1. clean, deterministic, sensible -----------------------------------------------
 const LEN: Record<SoundKind, [number, number]> = {
   kick: [0.1, 0.65], "808": [1, 3.6], snare: [0.1, 0.8], clap: [0.12, 1], "hat-closed": [0.02, 0.2], "hat-open": [0.2, 1.3],
-  bell: [1, 5], pluck: [0.3, 4], keys: [1, 4.5], pad: [2.2, 5.8], lead: [1, 3.6],
+  bell: [1, 5], pluck: [0.3, 4], keys: [1, 4.5], pad: [2.4, 11], lead: [1, 3.6],
 };
 for (const kind of SOUND_KINDS) {
   const rand = rng(7);

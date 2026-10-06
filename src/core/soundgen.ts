@@ -46,7 +46,7 @@ export const RECIPES: Record<SoundKind, Record<string, Range>> = {
   bell: { type: r(0, 2, true), octave: r(4, 5, true), ratioIdx: r(0, 3, true), index: r(0.6, 3.2), indexDecay: r(0.12, 0.6), decay: r(1.2, 3.4), tone: r(3200, 7000), chorus: r(0, 0.4), wet: r(0.12, 0.4) },
   pluck: { type: r(0, 3, true), octave: r(3, 5, true), damp: r(0.8, 0.995), spread: r(4, 22), cutoff0: r(2200, 8000), cutoff1: r(250, 1000), filterDecay: r(0.08, 0.5), decay: r(0.4, 1.4), drive: r(1, 2.5), chorus: r(0, 0.5), wet: r(0.05, 0.35) },
   keys: { type: r(0, 2, true), octave: r(3, 5, true), index: r(0.4, 1.6), indexDecay: r(0.3, 1.1), decay: r(1.2, 2.8), bright: r(0.2, 1), chorus: r(0, 0.6), wet: r(0.05, 0.3), drive: r(1, 2.5) },
-  pad: { type: r(0, 2, true), octave: r(3, 4, true), spread: r(6, 24), cutoff: r(700, 3200), attack: r(0.25, 0.9), release: r(0.9, 1.4), vowel: r(0, 1), chorus: r(0.2, 0.8), wet: r(0.25, 0.5) },
+  pad: { type: r(0, 2, true), octave: r(3, 4, true), spread: r(6, 24), cutoff: r(700, 3200), attack: r(0.25, 0.9), hold: r(1.2, 5), release: r(1, 2), vowel: r(0, 1), chorus: r(0.2, 0.8), wet: r(0.25, 0.5) },
   lead: { type: r(0, 2, true), octave: r(4, 5, true), spread: r(5, 22), vibrato: r(0, 22), cutoff: r(2200, 5800), glideSemi: r(0, 2.5), decay: r(0.2, 0.7), wet: r(0.1, 0.35), drive: r(1, 2.6) },
 };
 
@@ -569,7 +569,7 @@ function renderKeys(p: Params, rand: () => number): Float32Array[] {
 
 function renderPad(p: Params, rand: () => number): Float32Array[] {
   const f = freqC(p.octave!);
-  const total = p.attack! + 1.2 + p.release!;
+  const total = p.attack! + p.hold! + p.release!;
   const len = samples(total);
   const out = new Float32Array(len);
   const amp = (t: number) => Math.min(1, t / p.attack!) * (t > total - p.release! ? Math.max(0, (total - t) / p.release!) : 1);
@@ -629,7 +629,7 @@ function renderPad(p: Params, rand: () => number): Float32Array[] {
     }
     filterAll("lp", p.cutoff! + 1500, 0.707, out);
   }
-  return space(out, { chorus: p.chorus, wet: p.wet, rt60: 1.8, chorusRate: 0.35 });
+  return space(out, { chorus: p.chorus, wet: p.wet, rt60: 2.4, chorusRate: 0.35 });
 }
 
 function renderLead(p: Params, rand: () => number): Float32Array[] {
