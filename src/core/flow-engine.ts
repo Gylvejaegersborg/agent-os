@@ -160,15 +160,26 @@ export async function resumeFlow(flowId: string, steps: FlowStepDefinition[], op
 
 /** The operator accepts a stopped step as done (for instance it finished its work and only ran out of steps saying so).
  *  The flow is reopened, that step is recorded as succeeded against its latest attempt, and the rest of the flow runs. */
-export async function markStepDone(flowId: string, stepId: string, steps: FlowStepDefinition[], opts: DriveFlowOptions): Promise<DriveFlowResult> {
+export async function markStepDone(flowId: string, stepIds: string | string[], steps: FlowStepDefinition[], opts: DriveFlowOptions): Promise<DriveFlowResult> {
+  const ids = Array.isArray(stepIds) ? stepIds : [stepIds];
   const flow = await getFlow(flowId);
-  const step = flow?.steps.find((s) => s.id === stepId);
-  if (!flow || !step) throw new Error(`no step "${stepId}" in flow ${flowId}`);
-  if (step.status === "succeeded") throw new Error(`step "${stepId}" already succeeded`);
-  if (step.status === "running") throw new Error(`step "${stepId}" is still running`);
+  if (!flow) throw new Error(`no such flow: ${flowId}`);
+  if (!ids.length) throw new Error("no steps given");
+  // Check every step first, so nothing is changed when one of them can't be accepted.
+  const picked = ids.map((stepId) => {
+    const step = flow.steps.find((s) => s.id === stepId);
+    if (!step) throw new Error(`no step "${stepId}" in flow ${flowId}`);
+    if (step.status === "succeeded") throw new Error(`step "${stepId}" already succeeded`);
+    if (step.status === "running") throw new Error(`step "${stepId}" is still running`);
+    return step;
+  });
+  // Reopening puts every unfinished step back to queued; the ones the operator did NOT accept would run again, so say so
+  // in the caller (the panel shows each failed step on its own). Accepted steps are marked before anything is driven.
   await reopenFlow(flowId, { includeCancelled: true });
-  await setStepStatus(flowId, stepId, "succeeded", step.taskId);
-  await publishEvent("flow.step.completed", { flowId, stepId, taskId: step.taskId, status: "succeeded", acceptedBy: "operator" });
+  for (const step of picked) {
+    await setStepStatus(flowId, step.id, "succeeded", step.taskId);
+    await publishEvent("flow.step.completed", { flowId, stepId: step.id, taskId: step.taskId, status: "succeeded", acceptedBy: "operator" });
+  }
   return driveFlow(flowId, steps, opts);
 }
 

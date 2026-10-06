@@ -117,5 +117,24 @@ assert(await markStepDone(df.flowId, "list", ds, opts).then(() => false, () => t
 // a flow step gets a bigger execution cap than a chat turn (25 vs 8)
 assert(flowStepExecutions() === 25, "a flow step's default cap is 25 tool executions");
 
+// several stopped steps accepted at once: none of them runs again, and the step waiting on them does
+busy = true;
+const ms = [
+  { id: "p", agentId: "nyx", goal: "BUSY: p", dependsOn: [] as string[] },
+  { id: "q", agentId: "aether", goal: "BUSY: q", dependsOn: [] as string[] },
+  { id: "r", agentId: "hermes", goal: "R: fine", dependsOn: [] as string[] },
+  { id: "check", agentId: "argus", goal: "V: recheck", dependsOn: ["p", "q", "r"] },
+];
+const mf = await runFlow(ms, opts);
+const mst = new Map((await getFlow(mf.flowId))!.steps.map((x) => [x.id, x.status]));
+assert(mst.get("p") === "failed" && mst.get("q") === "failed" && mst.get("r") === "succeeded" && mst.get("check") === "cancelled", "two steps stopped, one finished, the check was cancelled");
+goals.length = 0;
+busy = false;
+await markStepDone(mf.flowId, ["p", "q"], ms, opts);
+assert((await getFlow(mf.flowId))!.status === "succeeded" && goals.length === 1 && goals[0]!.startsWith("V:"), "accepting both runs only the check (the accepted steps and the finished one are not run again)");
+busy = true;
+const mf2 = await runFlow(ms, opts);
+assert(await markStepDone(mf2.flowId, ["p", "nope"], ms, opts).then(() => false, () => true) && (await getFlow(mf2.flowId))!.status === "failed", "one unknown step in the list changes nothing");
+
 console.log(failed ? "\nSome flow-resume tests FAILED." : "\nAll flow-resume tests passed.");
 process.exit(failed ? 1 : 0);

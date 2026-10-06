@@ -25,6 +25,7 @@ import { getAgentControlState } from "./controls.js";
 import { listAgentIdentities } from "./identity.js";
 import { loadSnapshot } from "./basespace.js";
 import { verifierId } from "./watchdog.js";
+import { flowStepHops } from "./agent-loop.js";
 import type { DriveFlowOptions, FlowStepDefinition } from "./flow-engine.js";
 import type { SessionFocus } from "./types.js";
 
@@ -252,7 +253,7 @@ export async function adoptFlow(
   await publishEvent("flow.adopted", { flowId: flow.id, proposedBy });
 
   // A flow step does real work (read notes, write notes), so it gets more tool steps than a chat message does.
-  const stepHops = Number(process.env.AGENT_OS_FLOW_STEP_HOPS ?? 10);
+  const stepHops = flowStepHops();
   void resumeFlow(flow.id, check.steps, { ...drive, enableBaseSpace: true, maxToolHopsPerStep: Number.isFinite(stepHops) && stepHops > 0 ? stepHops : 10, ...(focus ? { focus } : {}) }).then(
     async (result) => {
       const lines = result.steps.map((s) => `${s.stepId}: ${s.status}`).join(", ");

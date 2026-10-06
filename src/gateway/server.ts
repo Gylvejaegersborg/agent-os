@@ -92,6 +92,7 @@ import {
   resumeFlow,
   reopenFlow,
   markStepDone,
+  flowStepHops,
   listApprovals,
   getApproval,
   approveRequest,
@@ -1262,7 +1263,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         model: deps.model,
         worker: deps.worker,
         skills: deps.skills,
-        maxToolHopsPerStep: deps.maxToolHops,
+        maxToolHopsPerStep: flowStepHops(),
         enableSubagents: deps.enableSubagents,
         enableMemoryNominations: deps.enableMemoryNominations,
         enableArtifacts: deps.enableArtifacts,
@@ -1292,7 +1293,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         model: deps.model,
         worker: deps.worker,
         skills: deps.skills,
-        maxToolHopsPerStep: deps.maxToolHops,
+        maxToolHopsPerStep: flowStepHops(),
         enableSubagents: deps.enableSubagents,
         enableMemoryNominations: deps.enableMemoryNominations,
         enableArtifacts: deps.enableArtifacts,
@@ -1305,6 +1306,49 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
       return;
     }
     // The operator accepts a stopped step as done and the flow carries on from there.
+    // ...one step per call, or several at once: POST /flows/:id/steps/done {steps, stepIds: [...]}. Several at once matters:
+    // reopening a flow re-queues every unfinished step, so accepting them one by one would re-run the others.
+    if (method === "POST" && segments.length === 4 && segments[2] === "steps" && segments[3] === "done") {
+      const flow = await getFlow(segments[1]!);
+      if (!flow) {
+        sendJson(res, 404, { error: `no such flow: ${segments[1]}` });
+        return;
+      }
+      const body = await readRequestBody(req);
+      const steps = parseFlowSteps(body.steps);
+      const stepIds = Array.isArray(body.stepIds) ? body.stepIds.filter((x): x is string => typeof x === "string") : [];
+      if (!steps || !stepIds.length) {
+        sendJson(res, 400, { error: "steps (the flow's step definitions) and stepIds are required" });
+        return;
+      }
+      try {
+        // Validates first (markStepDone throws before changing anything), then drives in the background.
+        const check = (flowNow: typeof flow) => {
+          for (const id of stepIds) {
+            const st = flowNow.steps.find((s) => s.id === id);
+            if (!st) throw new Error(`no step "${id}" in flow ${flow.id}`);
+            if (st.status === "succeeded") throw new Error(`step "${id}" already succeeded`);
+            if (st.status === "running") throw new Error(`step "${id}" is still running`);
+          }
+        };
+        check(flow);
+        markStepDone(flow.id, stepIds, steps, {
+          model: deps.model,
+          worker: deps.worker,
+          skills: deps.skills,
+          maxToolHopsPerStep: flowStepHops(),
+          enableSubagents: deps.enableSubagents,
+          enableMemoryNominations: deps.enableMemoryNominations,
+          enableArtifacts: deps.enableArtifacts,
+          enableBaseSpace: deps.enableBaseSpace,
+          sandboxPolicy: deps.sandboxPolicy,
+        }).catch((err) => console.error(`[gateway] flow ${flow.id} mark-done failed:`, err instanceof Error ? err.message : err));
+        sendJson(res, 202, flow);
+      } catch (err) {
+        sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
     if (method === "POST" && segments.length === 5 && segments[2] === "steps" && segments[4] === "done") {
       const flow = await getFlow(segments[1]!);
       if (!flow) {
@@ -1327,7 +1371,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
           model: deps.model,
           worker: deps.worker,
           skills: deps.skills,
-          maxToolHopsPerStep: deps.maxToolHops,
+          maxToolHopsPerStep: flowStepHops(),
           enableSubagents: deps.enableSubagents,
           enableMemoryNominations: deps.enableMemoryNominations,
           enableArtifacts: deps.enableArtifacts,
