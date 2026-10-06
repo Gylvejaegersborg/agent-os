@@ -11,7 +11,7 @@
 
 import { appendEvent, project } from "./eventlog.js";
 import { generateId } from "./id.js";
-import { MELODIC_KINDS, SOUND_KINDS, cleanParams, durationSec, encodeWav24, mutateParams, randomParams, renderSound, rng, soundLabel, type SoundKind } from "./soundgen.js";
+import { ENGINE_VERSION, MELODIC_KINDS, SOUND_KINDS, cleanParams, durationSec, encodeWav24, mutateParams, randomParams, renderSound, rng, soundLabel, type SoundKind } from "./soundgen.js";
 
 const STREAM = "soundlab";
 export const MAX_BATCH = 24;
@@ -28,6 +28,8 @@ export interface Candidate {
   /** The accepted sound this one is a nudge of, if any. */
   parentId?: string;
   createdAt: string;
+  /** Which sound engine made it. Sounds from an older engine would render differently now, so they're hidden, not re-rendered. */
+  engine: number;
   verdict: Verdict;
   judgedAt?: string;
 }
@@ -46,7 +48,7 @@ export const isKind = (k: unknown): k is SoundKind => typeof k === "string" && (
 async function candidates(): Promise<Map<string, Candidate>> {
   return project<Map<string, Candidate>>(STREAM, new Map(), (state, e) => {
     const p = e.payload as any;
-    if (e.type === "sound.candidate") state.set(p.id, { ...p, verdict: "pending" });
+    if (e.type === "sound.candidate") state.set(p.id, { ...p, engine: p.engine ?? 1, verdict: "pending" });
     else if (e.type === "sound.judged") {
       const c = state.get(p.id);
       if (c) state.set(p.id, { ...c, verdict: p.verdict, judgedAt: e.timestamp });
@@ -55,13 +57,15 @@ async function candidates(): Promise<Map<string, Candidate>> {
   });
 }
 
+/** Only sounds of the current engine exist as far as callers are concerned (older ones are archived in the log). */
 export async function getCandidate(id: string): Promise<Candidate | undefined> {
-  return (await candidates()).get(id);
+  const c = (await candidates()).get(id);
+  return c && c.engine === ENGINE_VERSION ? c : undefined;
 }
 
 export async function listCandidates(filter: { verdict?: Verdict; kind?: SoundKind } = {}): Promise<Candidate[]> {
   return [...(await candidates()).values()]
-    .filter((c) => (!filter.verdict || c.verdict === filter.verdict) && (!filter.kind || c.kind === filter.kind))
+    .filter((c) => c.engine === ENGINE_VERSION && (!filter.verdict || c.verdict === filter.verdict) && (!filter.kind || c.kind === filter.kind))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
@@ -78,6 +82,7 @@ export async function generateBatch(kind: SoundKind, count: number, seed = Math.
     const parent = liked.length && rand() < 0.6 ? liked[Math.floor(rand() * liked.length)]! : undefined;
     const params = parent ? mutateParams(kind, parent.params, rand) : randomParams(kind, rand);
     const candidate: Omit<Candidate, "verdict"> = {
+      engine: ENGINE_VERSION,
       id: `snd-${generateId().toLowerCase().replace(/[^a-z0-9]/g, "")}`,
       batchId,
       kind,
@@ -107,6 +112,7 @@ export async function stats(): Promise<Record<string, Record<Verdict, number>> &
   const out: Record<string, Record<Verdict, number>> = { total: empty() };
   for (const k of SOUND_KINDS) out[k] = empty();
   for (const c of (await candidates()).values()) {
+    if (c.engine !== ENGINE_VERSION) continue;
     out[c.kind]![c.verdict]++;
     out.total![c.verdict]++;
   }
@@ -126,8 +132,9 @@ export async function renderCandidateWav(id: string): Promise<{ wav: Buffer; can
     cache.set(id, wav);
     if (cache.size > 80) cache.delete(cache.keys().next().value!);
   }
-  // Duration from the WAV header math (24-bit mono): (bytes - 44) / 3 / rate.
-  return { wav: wav!, candidate, durationSec: durationSec(new Float32Array((wav!.length - 44) / 3)) };
+  // Duration from the WAV itself: frames = bytes / (3 bytes x channels).
+  const channels = wav!.readUInt16LE(22);
+  return { wav: wav!, candidate, durationSec: durationSec([new Float32Array((wav!.length - 44) / (3 * channels))]) };
 }
 
 export { MELODIC_KINDS, cleanParams };

@@ -1,20 +1,26 @@
 // Procedural sound design: drums and melodic one-shots made from plain DSP (oscillators,
-// FM, noise, envelopes, filters, saturation). Nothing is sampled from anyone else's audio,
-// so everything it makes is the operator's own to sell.
+// FM, additive and Karplus-Strong synthesis, noise, envelopes, filters, saturation,
+// chorus, reverb). Nothing is sampled from anyone else's audio, so everything it makes is
+// the operator's own to sell.
 //
 // A sound is a RECIPE (the kind) plus PARAMETERS (numbers inside the recipe's ranges).
-// Rendering is deterministic: the same kind + params always give the same samples, so a
-// candidate only needs its params stored, and the audio is rendered when it's played.
+// Rendering is deterministic: the same kind + params + seed always give the same samples,
+// so a candidate only needs its params stored, and the audio is rendered when it's played.
+//
+// ENGINE_VERSION changes whenever a recipe changes how it sounds, so sounds judged under an
+// older engine are never silently re-rendered as something else (soundlab.ts hides them).
 //
 // What this can't do: judge how a sound feels. It guarantees the technical basics (no NaN,
-// no clicks at the tail, peak at -1 dBFS, silence trimmed). The operator's ears decide what
-// is good, and their accepted sounds steer the next batch (mutateParams).
+// no clicks at the tail, peak at -1 dBFS, silence trimmed, melodic sounds tuned to C), and
+// the operator's ears decide what is good; their accepted sounds steer the next batch.
 //
-// Honest limit: classic synthesized drums are a well-trodden technique; melodic one-shots
-// from plain FM/subtractive synthesis can sound thin, which is why the loop is "generate,
-// listen, keep the few that work", not "trust the first render".
+// Version 2 (after the first listening round): 808s on C with a real tail and consistent
+// timbre; kicks with a soft transient; fuller snares without hiss; varied claps; hats with
+// body; melodic sounds in stereo with several architectures per kind, harmonic (in-tune)
+// bells with a rolled-off top, no spring-like FM keys.
 
 export const SAMPLE_RATE = 44100;
+export const ENGINE_VERSION = 2;
 
 export type SoundKind = "kick" | "808" | "snare" | "clap" | "hat-closed" | "hat-open" | "bell" | "pluck" | "keys" | "pad" | "lead";
 export const SOUND_KINDS: SoundKind[] = ["808", "kick", "snare", "clap", "hat-closed", "hat-open", "bell", "pluck", "keys", "pad", "lead"];
@@ -24,25 +30,35 @@ type Params = Record<string, number>;
 interface Range {
   min: number;
   max: number;
-  /** Integer-valued (notes, octaves). */
+  /** Integer-valued (octaves, architecture choices). */
   int?: boolean;
 }
 
 const r = (min: number, max: number, int = false): Range => ({ min, max, ...(int ? { int: true } : {}) });
 
-const NOTE = r(0, 11, true);
 export const RECIPES: Record<SoundKind, Record<string, Range>> = {
-  kick: { f0: r(110, 260), f1: r(38, 62), pitchDecay: r(0.015, 0.07), decay: r(0.14, 0.5), click: r(0, 0.45), drive: r(1, 4.5) },
-  "808": { note: NOTE, glide: r(0, 1.5), glideTime: r(0.01, 0.07), decay: r(0.7, 2.2), drive: r(1, 7), tone: r(350, 2600), click: r(0, 0.35) },
-  snare: { body: r(150, 240), bodyDecay: r(0.05, 0.14), noiseDecay: r(0.1, 0.34), noiseFreq: r(1600, 5200), mix: r(0.25, 0.8), drive: r(1, 4) },
-  clap: { spread: r(0.007, 0.016), tail: r(0.12, 0.34), freq: r(900, 2100), q: r(0.8, 2.6), drive: r(1, 3) },
-  "hat-closed": { scale: r(0.85, 1.35), hp: r(5500, 9500), decay: r(0.025, 0.075), noise: r(0, 0.45) },
-  "hat-open": { scale: r(0.85, 1.35), hp: r(5000, 9000), decay: r(0.22, 0.6), noise: r(0, 0.45) },
-  bell: { note: NOTE, octave: r(4, 6, true), ratio: r(1.4, 4.1), index: r(1.5, 7), indexDecay: r(0.25, 1.2), decay: r(0.9, 3), partial: r(0, 0.3) },
-  pluck: { note: NOTE, octave: r(3, 5, true), detune: r(3, 14), cutoff0: r(2200, 9000), cutoff1: r(200, 900), filterDecay: r(0.08, 0.5), decay: r(0.3, 1.2), sub: r(0, 0.5), q: r(0.8, 5) },
-  keys: { note: NOTE, octave: r(3, 5, true), index1: r(0.4, 3), index1Decay: r(0.3, 1), index2: r(0.3, 2.2), index2Decay: r(0.04, 0.16), decay: r(1, 2.6) },
-  pad: { note: NOTE, octave: r(3, 5, true), detune: r(6, 20), cutoff: r(600, 3200), attack: r(0.12, 0.6), release: r(0.8, 1.4) },
-  lead: { note: NOTE, octave: r(4, 5, true), mix: r(0, 1), vibrato: r(4, 26), cutoff: r(2400, 6200), decay: r(0.25, 0.7) },
+  kick: { f0: r(100, 210), f1: r(38, 58), pitchDecay: r(0.02, 0.06), decay: r(0.12, 0.34), click: r(0, 0.25), clickTone: r(1500, 4000), drive: r(1, 2.8) },
+  "808": { octave: r(1, 2, true), glide: r(0.2, 1.2), glideTime: r(0.012, 0.05), decay: r(1.1, 3), punch: r(0.2, 0.65), punchDecay: r(0.1, 0.35), drive: r(1, 4.5), tone: r(500, 3000), harm: r(0, 0.35), click: r(0, 0.2) },
+  snare: { body: r(160, 230), bodyDecay: r(0.07, 0.18), noiseDecay: r(0.1, 0.26), noiseFreq: r(1400, 3600), noiseTop: r(5000, 9500), mix: r(0.25, 0.6), crack: r(0, 0.5), thump: r(0, 0.5), drive: r(1, 2.4) },
+  clap: { bursts: r(3, 6, true), spread: r(0.005, 0.02), tail: r(0.1, 0.42), freq: r(700, 2800), q: r(0.6, 3.2), bright: r(4000, 11000), second: r(0, 0.5), room: r(0, 0.3), drive: r(1, 2.4) },
+  "hat-closed": { scale: r(0.85, 1.35), hp: r(3500, 7500), peak: r(7000, 11000), decay: r(0.035, 0.11), noise: r(0.15, 0.55), body: r(0.05, 0.5), drive: r(1, 2) },
+  "hat-open": { scale: r(0.85, 1.35), spread: r(0, 0.12), hp: r(3000, 7000), air: r(9000, 16000), decay: r(0.25, 0.8), swell: r(0.002, 0.014), noise: r(0.35, 0.85) },
+  bell: { type: r(0, 2, true), octave: r(4, 5, true), ratioIdx: r(0, 3, true), index: r(0.6, 3.2), indexDecay: r(0.12, 0.6), decay: r(1.2, 3.4), tone: r(3200, 7000), chorus: r(0, 0.4), wet: r(0.12, 0.4) },
+  pluck: { type: r(0, 3, true), octave: r(3, 5, true), damp: r(0.8, 0.995), spread: r(4, 22), cutoff0: r(2200, 8000), cutoff1: r(250, 1000), filterDecay: r(0.08, 0.5), decay: r(0.4, 1.4), drive: r(1, 2.5), chorus: r(0, 0.5), wet: r(0.05, 0.35) },
+  keys: { type: r(0, 2, true), octave: r(3, 5, true), index: r(0.4, 1.6), indexDecay: r(0.3, 1.1), decay: r(1.2, 2.8), bright: r(0.2, 1), chorus: r(0, 0.6), wet: r(0.05, 0.3), drive: r(1, 2.5) },
+  pad: { type: r(0, 2, true), octave: r(3, 4, true), spread: r(6, 24), cutoff: r(700, 3200), attack: r(0.25, 0.9), release: r(0.9, 1.4), vowel: r(0, 1), chorus: r(0.2, 0.8), wet: r(0.25, 0.5) },
+  lead: { type: r(0, 2, true), octave: r(4, 5, true), spread: r(5, 22), vibrato: r(0, 22), cutoff: r(2200, 5800), glideSemi: r(0, 2.5), decay: r(0.2, 0.7), wet: r(0.1, 0.35), drive: r(1, 2.6) },
+};
+
+/** Params that pick an architecture: nudging a sound you liked should rarely switch it to a different one. */
+const STICKY = new Set(["type"]);
+
+const TYPE_NAMES: Partial<Record<SoundKind, string[]>> = {
+  bell: ["Glass", "Music Box", "Chime"],
+  pluck: ["String", "Saw", "Marimba", "Glass"],
+  keys: ["E-Piano", "Piano", "Organ"],
+  pad: ["Strings", "Choir", "Glass"],
+  lead: ["Super", "PWM", "Flute"],
 };
 
 // ---- randomness ------------------------------------------------------------------
@@ -64,7 +80,10 @@ const fit = (range: Range, v: number) => (range.int ? Math.round(clamp(v, range.
 /** A fresh sound anywhere in the recipe's ranges. */
 export function randomParams(kind: SoundKind, rand: () => number): Params {
   const out: Params = {};
-  for (const [k, range] of Object.entries(RECIPES[kind])) out[k] = fit(range, range.min + rand() * (range.max - range.min));
+  for (const [k, range] of Object.entries(RECIPES[kind])) {
+    // Integers are drawn so every value is equally likely (a plain round() would halve the ends).
+    out[k] = range.int ? range.min + Math.floor(rand() * (range.max - range.min + 1)) : fit(range, range.min + rand() * (range.max - range.min));
+  }
   return out;
 }
 
@@ -74,8 +93,10 @@ export function mutateParams(kind: SoundKind, parent: Params, rand: () => number
   const out: Params = {};
   for (const [k, range] of Object.entries(RECIPES[kind])) {
     const base = typeof parent[k] === "number" ? parent[k]! : range.min + rand() * (range.max - range.min);
-    // Notes: usually keep the pitch (the operator liked how it sounds), sometimes move it to get variety in the pack.
-    out[k] = range.int ? (rand() < 0.35 ? fit(range, range.min + rand() * (range.max - range.min)) : fit(range, base)) : fit(range, base + gauss() * amount * (range.max - range.min));
+    if (range.int) {
+      const resample = rand() < (STICKY.has(k) ? 0.08 : 0.35);
+      out[k] = resample ? range.min + Math.floor(rand() * (range.max - range.min + 1)) : fit(range, base);
+    } else out[k] = fit(range, base + gauss() * amount * (range.max - range.min));
   }
   return out;
 }
@@ -91,16 +112,16 @@ export function cleanParams(kind: SoundKind, raw: unknown): Params {
   return out;
 }
 
-const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-const midiOf = (p: Params, kind: SoundKind) => 12 * (((kind === "808" ? 1 : p.octave) ?? 4) + 1) + (p.note ?? 0);
-const freqOf = (midi: number) => 440 * 2 ** ((midi - 69) / 12);
+/** Everything melodic is tuned to C: only the octave varies. */
+const freqC = (octave: number) => 440 * 2 ** ((12 * (octave + 1) - 69) / 12);
 
-/** What a sound is called in the pack: "808 F1", "Bell A4", "Kick". */
+/** What a sound is called in the pack: "808 C1", "Glass Bell C5", "Kick". */
 export function soundLabel(kind: SoundKind, params: Params): string {
   const title: Record<SoundKind, string> = { kick: "Kick", "808": "808", snare: "Snare", clap: "Clap", "hat-closed": "Closed Hat", "hat-open": "Open Hat", bell: "Bell", pluck: "Pluck", keys: "Keys", pad: "Pad", lead: "Lead" };
   if (!MELODIC_KINDS.has(kind)) return title[kind];
-  const midi = midiOf(params, kind);
-  return `${title[kind]} ${NOTE_NAMES[((midi % 12) + 12) % 12]}${Math.floor(midi / 12) - 1}`;
+  if (kind === "808") return `808 C${params.octave}`;
+  const type = TYPE_NAMES[kind]?.[params.type ?? 0] ?? "";
+  return `${type} ${title[kind]} C${params.octave}`.trim();
 }
 
 // ---- DSP building blocks ------------------------------------------------------------
@@ -147,15 +168,18 @@ class Biquad {
   }
 }
 
-function filterAll(type: "lp" | "hp" | "bp", freq: number, q: number, data: Float32Array): void {
+function filterAll(type: "lp" | "hp" | "bp", freq: number, q: number, data: Float32Array): Float32Array {
   const f = new Biquad(type, freq, q);
   for (let i = 0; i < data.length; i++) data[i] = f.next(data[i]!);
+  return data;
 }
 
 const sat = (x: number, drive: number) => Math.tanh(drive * x) / Math.tanh(drive);
 const samples = (sec: number) => Math.max(1, Math.round(sec * SAMPLE_RATE));
 /** Exponential decay that reaches -60 dB after `decay` seconds. */
 const env = (t: number, decay: number) => Math.exp((-6.9 * t) / decay);
+const cents = (c: number) => 2 ** (c / 1200);
+const noise = (rand: () => number) => rand() * 2 - 1;
 
 /** One cycle of a band-limited saw (or square) for the given pitch: oscillators read it by phase. */
 function table(freq: number, square = false): Float32Array {
@@ -178,233 +202,548 @@ const readTable = (t: Float32Array, phase: number) => {
   return t[i]! * (1 - frac) + t[(i + 1) % t.length]! * frac;
 };
 
-// ---- recipes ------------------------------------------------------------------------
+/** Two slightly modulated delay lines give a mono sound some width (and a little life). */
+function chorus(x: Float32Array, mixAmt: number, rate = 0.6): Float32Array[] {
+  if (mixAmt <= 0.001) return [x, x];
+  const out = [new Float32Array(x.length), new Float32Array(x.length)];
+  const base = 0.014 * SAMPLE_RATE;
+  const depth = 0.0035 * SAMPLE_RATE;
+  for (let ch = 0; ch < 2; ch++) {
+    const phase = ch * Math.PI * 0.5;
+    for (let i = 0; i < x.length; i++) {
+      const d = base + depth * Math.sin((2 * Math.PI * rate * i) / SAMPLE_RATE + phase);
+      const pos = i - d;
+      const i0 = Math.floor(pos);
+      const frac = pos - i0;
+      const delayed = (x[i0] ?? 0) * (1 - frac) + (x[i0 + 1] ?? 0) * frac;
+      out[ch]![i] = x[i]! * (1 - mixAmt * 0.5) + delayed * mixAmt * 0.7;
+    }
+  }
+  return out;
+}
+
+/** A small stereo room (parallel damped combs into two allpasses). `wet` is how much of it you hear. */
+function reverb(input: Float32Array[], wet: number, rt60: number): Float32Array[] {
+  if (wet <= 0.001) return input.length === 2 ? input : [input[0]!, input[0]!];
+  const inLen = input[0]!.length;
+  const n = inLen + samples(Math.min(3.2, rt60 * 1.1));
+  const mono = new Float32Array(n);
+  for (let i = 0; i < inLen; i++) mono[i] = ((input[0]![i] ?? 0) + (input[1]?.[i] ?? input[0]![i] ?? 0)) / 2;
+  const sets = [[29.7, 37.1, 41.1, 43.7], [30.9, 38.3, 42.7, 45.1]];
+  const out: Float32Array[] = [];
+  for (let ch = 0; ch < 2; ch++) {
+    const combs = sets[ch]!.map((ms) => ({ buf: new Float32Array(samples(ms / 1000)), i: 0, last: 0, g: 10 ** ((-3 * (ms / 1000)) / rt60) }));
+    const aps = [{ buf: new Float32Array(samples(0.005)), i: 0 }, { buf: new Float32Array(samples(0.0017)), i: 0 }];
+    const o = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      let sum = 0;
+      for (const c of combs) {
+        const y = c.buf[c.i]!;
+        c.last = y * 0.7 + c.last * 0.3;
+        c.buf[c.i] = mono[i]! + c.g * c.last;
+        c.i = (c.i + 1) % c.buf.length;
+        sum += y;
+      }
+      let v = sum * 0.25;
+      for (const a of aps) {
+        const bufOut = a.buf[a.i]!;
+        const w = v + 0.5 * bufOut;
+        a.buf[a.i] = w;
+        v = bufOut - 0.5 * w;
+        a.i = (a.i + 1) % a.buf.length;
+      }
+      o[i] = (i < inLen ? (input[ch]?.[i] ?? input[0]![i]!) : 0) + wet * 1.6 * v;
+    }
+    out.push(o);
+  }
+  return out;
+}
+
+/** The melodic finishing chain: warmth, tone, width and room. */
+function space(mono: Float32Array, o: { drive?: number; tone?: number; chorus?: number; wet?: number; rt60?: number; chorusRate?: number }): Float32Array[] {
+  if (o.drive && o.drive > 1) for (let i = 0; i < mono.length; i++) mono[i] = sat(mono[i]!, o.drive);
+  if (o.tone) filterAll("lp", o.tone, 0.707, mono);
+  return reverb(chorus(mono, o.chorus ?? 0, o.chorusRate), o.wet ?? 0, o.rt60 ?? 1.4);
+}
+
+// ---- drums --------------------------------------------------------------------------
 
 function renderKick(p: Params, rand: () => number): Float32Array {
-  const out = new Float32Array(samples(Math.min(0.9, p.decay! * 1.4)));
+  const out = new Float32Array(samples(Math.min(0.6, p.decay! * 1.5)));
+  const click = new Float32Array(samples(0.006));
+  for (let i = 0; i < click.length; i++) click[i] = noise(rand) * (1 - i / click.length);
+  filterAll("lp", p.clickTone!, 0.7, click);
   let phase = 0;
   for (let i = 0; i < out.length; i++) {
     const t = i / SAMPLE_RATE;
     phase += (p.f1! + (p.f0! - p.f1!) * Math.exp(-t / p.pitchDecay!)) / SAMPLE_RATE;
-    const click = t < 0.004 ? (rand() * 2 - 1) * p.click! * (1 - t / 0.004) : 0;
-    out[i] = sat(Math.sin(2 * Math.PI * phase) * env(t, p.decay!) + click, p.drive!);
+    out[i] = sat(Math.sin(2 * Math.PI * phase) * env(t, p.decay!) + (click[i] ?? 0) * p.click! * 2, p.drive!);
   }
   return out;
 }
 
+/** An 808: drive comes BEFORE the envelope, so the timbre stays the same as the note fades
+ *  (distorting a fading signal makes the tone change over the tail), and the envelope has a
+ *  punchy first stage and a long second one, so the tail is a real tail. */
 function render808(p: Params, rand: () => number): Float32Array {
-  const f = freqOf(midiOf(p, "808"));
-  const out = new Float32Array(samples(p.decay! * 1.15));
+  const f = freqC(p.octave!);
+  const out = new Float32Array(samples(p.decay! * 1.05 + 0.1));
   let phase = 0;
   for (let i = 0; i < out.length; i++) {
     const t = i / SAMPLE_RATE;
     phase += (f * (1 + p.glide! * Math.exp(-t / p.glideTime!))) / SAMPLE_RATE;
-    const attack = Math.min(1, t / 0.002);
-    const click = t < 0.003 ? (rand() * 2 - 1) * p.click! * (1 - t / 0.003) : 0;
-    out[i] = sat(Math.sin(2 * Math.PI * phase) * env(t, p.decay!) * attack + click, p.drive!);
+    out[i] = sat(Math.sin(2 * Math.PI * phase) + p.harm! * Math.sin(4 * Math.PI * phase), p.drive!);
   }
   filterAll("lp", p.tone!, 0.707, out);
+  const click = new Float32Array(samples(0.004));
+  for (let i = 0; i < click.length; i++) click[i] = noise(rand) * (1 - i / click.length);
+  filterAll("lp", 2200, 0.7, click);
+  for (let i = 0; i < out.length; i++) {
+    const t = i / SAMPLE_RATE;
+    const e = p.punch! * Math.exp(-t / p.punchDecay!) + (1 - p.punch!) * env(t, p.decay!);
+    out[i] = out[i]! * e * Math.min(1, t / 0.003) + (click[i] ?? 0) * p.click!;
+  }
   return out;
 }
 
 function renderSnare(p: Params, rand: () => number): Float32Array {
-  const len = samples(Math.max(p.noiseDecay!, p.bodyDecay!) * 1.3);
-  const noise = new Float32Array(len);
-  for (let i = 0; i < len; i++) noise[i] = (rand() * 2 - 1) * env(i / SAMPLE_RATE, p.noiseDecay!);
-  filterAll("bp", p.noiseFreq!, 0.7, noise);
-  const out = new Float32Array(len);
-  let phase = 0;
+  const len = samples(Math.max(p.noiseDecay!, p.bodyDecay!) * 1.4 + 0.03);
+  const n = new Float32Array(len);
   for (let i = 0; i < len; i++) {
     const t = i / SAMPLE_RATE;
-    phase += (p.body! * (1 + 0.5 * Math.exp(-t / 0.012))) / SAMPLE_RATE;
-    out[i] = sat((1 - p.mix!) * Math.sin(2 * Math.PI * phase) * env(t, p.bodyDecay!) + p.mix! * noise[i]! * 2.2, p.drive!);
+    // A short crack on top of a longer rattle.
+    n[i] = noise(rand) * (env(t, p.noiseDecay!) * (1 - p.crack! * 0.5) + p.crack! * env(t, 0.035));
+  }
+  filterAll("hp", 900, 0.707, n);
+  filterAll("bp", p.noiseFreq!, 0.6, n);
+  filterAll("lp", p.noiseTop!, 0.707, n);
+  const out = new Float32Array(len);
+  let ph1 = 0;
+  let ph2 = 0;
+  let ph3 = 0;
+  for (let i = 0; i < len; i++) {
+    const t = i / SAMPLE_RATE;
+    const drop = 1 + 0.45 * Math.exp(-t / 0.012);
+    ph1 += (p.body! * drop) / SAMPLE_RATE;
+    ph2 += (p.body! * 1.59 * drop) / SAMPLE_RATE;
+    ph3 += (p.body! * 0.62) / SAMPLE_RATE;
+    const tone = Math.sin(2 * Math.PI * ph1) * env(t, p.bodyDecay!) + 0.45 * Math.sin(2 * Math.PI * ph2) * env(t, p.bodyDecay! * 0.7) + p.thump! * Math.sin(2 * Math.PI * ph3) * env(t, 0.09);
+    out[i] = sat((1 - p.mix!) * tone * 0.8 + p.mix! * n[i]! * 2.6, p.drive!);
   }
   return out;
 }
 
 function renderClap(p: Params, rand: () => number): Float32Array {
-  const len = samples(p.tail! * 1.25 + 0.05);
+  const len = samples(p.tail! * 1.3 + p.spread! * p.bursts! + 0.04);
   const out = new Float32Array(len);
-  const bursts = [0, p.spread!, p.spread! * 2, p.spread! * 3];
+  const last = p.spread! * (p.bursts! - 1);
+  const offsets = Array.from({ length: p.bursts! }, (_, b) => b * p.spread! * (0.8 + rand() * 0.4));
   for (let i = 0; i < len; i++) {
     const t = i / SAMPLE_RATE;
     let a = 0;
-    for (const b of bursts) if (t >= b && t < b + 0.012) a = Math.max(a, env(t - b, 0.014));
-    if (t >= bursts[3]!) a = Math.max(a, 0.85 * env(t - bursts[3]!, p.tail!));
-    out[i] = (rand() * 2 - 1) * a;
+    for (const b of offsets) if (t >= b && t < b + 0.018) a = Math.max(a, env(t - b, 0.012));
+    if (t >= last) a = Math.max(a, 0.8 * env(t - last, p.tail!));
+    out[i] = noise(rand) * a;
   }
-  filterAll("bp", p.freq!, p.q!, out);
+  const high = filterAll("bp", p.freq!, p.q!, out.slice());
+  const second = filterAll("bp", Math.min(9000, p.freq! * 1.9), p.q! * 0.8, out.slice());
+  for (let i = 0; i < len; i++) out[i] = high[i]! + p.second! * second[i]!;
+  filterAll("hp", 350, 0.707, out);
+  filterAll("lp", p.bright!, 0.707, out);
   for (let i = 0; i < len; i++) out[i] = sat(out[i]! * 3, p.drive!);
-  return out;
+  return p.room! > 0.01 ? reverb([out], p.room!, 0.5)[0]! : out;
 }
 
 const HAT_RATIOS = [205.3, 304.4, 369.6, 522.7, 540, 800];
-function renderHat(p: Params, rand: () => number): Float32Array {
-  const out = new Float32Array(samples(p.decay! * 1.2 + 0.01));
+function metallic(len: number, scale: number, spread: number, rand: () => number): Float32Array {
+  const out = new Float32Array(len);
   const phases = HAT_RATIOS.map(() => rand());
-  for (let i = 0; i < out.length; i++) {
-    const t = i / SAMPLE_RATE;
+  const ratios = HAT_RATIOS.map((x) => x * scale * 4 * (1 + (rand() * 2 - 1) * spread));
+  for (let i = 0; i < len; i++) {
     let s = 0;
-    for (let k = 0; k < HAT_RATIOS.length; k++) {
-      phases[k]! += (HAT_RATIOS[k]! * p.scale! * 4) / SAMPLE_RATE;
+    for (let k = 0; k < ratios.length; k++) {
+      phases[k]! += ratios[k]! / SAMPLE_RATE;
       s += Math.sin(2 * Math.PI * phases[k]!) >= 0 ? 1 : -1;
     }
-    out[i] = (s / 6 * (1 - p.noise!) + (rand() * 2 - 1) * p.noise!) * env(t, p.decay!) * Math.min(1, t / 0.0005);
-  }
-  filterAll("hp", p.hp!, 0.9, out);
-  filterAll("hp", p.hp!, 0.9, out);
-  return out;
-}
-
-function renderBell(p: Params): Float32Array {
-  const f = freqOf(midiOf(p, "bell"));
-  const out = new Float32Array(samples(p.decay! * 1.1));
-  for (let i = 0; i < out.length; i++) {
-    const t = i / SAMPLE_RATE;
-    const mod = Math.sin(2 * Math.PI * f * p.ratio! * t) * p.index! * Math.exp(-t / p.indexDecay!);
-    const main = Math.sin(2 * Math.PI * f * t + mod);
-    const part = Math.sin(2 * Math.PI * f * 2.76 * t) * p.partial! * env(t, p.decay! * 0.5);
-    out[i] = (main + part) * env(t, p.decay!) * Math.min(1, t / 0.001);
-  }
-  filterAll("lp", 9000, 0.707, out);
-  return out;
-}
-
-function renderPluck(p: Params): Float32Array {
-  const f = freqOf(midiOf(p, "pluck"));
-  const cents = (c: number) => 2 ** (c / 1200);
-  const tab = table(f);
-  const out = new Float32Array(samples(p.decay! * 1.2));
-  const lp = new Biquad("lp", p.cutoff0!, p.q!);
-  let ph1 = 0;
-  let ph2 = 0.37;
-  let sub = 0;
-  for (let i = 0; i < out.length; i++) {
-    const t = i / SAMPLE_RATE;
-    ph1 += (f * cents(p.detune!)) / SAMPLE_RATE;
-    ph2 += (f * cents(-p.detune!)) / SAMPLE_RATE;
-    sub += f / 2 / SAMPLE_RATE;
-    if (i % 32 === 0) lp.set(p.cutoff1! + (p.cutoff0! - p.cutoff1!) * Math.exp(-t / p.filterDecay!));
-    const osc = (readTable(tab, ph1) + readTable(tab, ph2)) * 0.5 + Math.sin(2 * Math.PI * sub) * p.sub!;
-    out[i] = lp.next(osc) * env(t, p.decay!) * Math.min(1, t / 0.002);
+    out[i] = s / ratios.length;
   }
   return out;
 }
 
-function renderKeys(p: Params): Float32Array {
-  const f = freqOf(midiOf(p, "keys"));
-  const out = new Float32Array(samples(p.decay! * 1.1));
-  for (let i = 0; i < out.length; i++) {
-    const t = i / SAMPLE_RATE;
-    const m1 = Math.sin(2 * Math.PI * f * t) * p.index1! * Math.exp(-t / p.index1Decay!);
-    const m2 = Math.sin(2 * Math.PI * f * 14 * t) * p.index2! * Math.exp(-t / p.index2Decay!);
-    out[i] = Math.sin(2 * Math.PI * f * t + m1 + m2) * env(t, p.decay!) * Math.min(1, t / 0.002);
+function renderHatClosed(p: Params, rand: () => number): Float32Array {
+  const len = samples(p.decay! * 1.3 + 0.01);
+  const metal = metallic(len, p.scale!, 0, rand);
+  const air = new Float32Array(len);
+  const body = new Float32Array(len);
+  for (let i = 0; i < len; i++) {
+    air[i] = noise(rand);
+    body[i] = noise(rand);
   }
-  filterAll("lp", 7500, 0.707, out);
+  filterAll("bp", 3200, 0.8, body);
+  const out = new Float32Array(len);
+  for (let i = 0; i < len; i++) out[i] = (metal[i]! * (1 - p.noise!) + air[i]! * p.noise!) * 0.8 + body[i]! * p.body! * 2.2;
+  filterAll("hp", p.hp!, 0.8, out);
+  filterAll("bp", p.peak!, 0.9, (() => { const peakBand = out.slice(); return peakBand; })());
+  // A resonant lift around `peak`: the band-passed copy added back (gives the hat its pitch-ish colour).
+  const lift = filterAll("bp", p.peak!, 1.2, out.slice());
+  for (let i = 0; i < len; i++) {
+    const t = i / SAMPLE_RATE;
+    out[i] = sat((out[i]! + lift[i]! * 0.7) * env(t, p.decay!) * Math.min(1, t / 0.0006), p.drive!);
+  }
   return out;
 }
 
-function renderPad(p: Params): Float32Array {
-  const f = freqOf(midiOf(p, "pad"));
-  const tab = table(f);
-  const total = p.attack! + 1.6 + p.release!;
-  const out = new Float32Array(samples(total));
-  const voices = [-p.detune!, 0, p.detune!].map((c) => f * 2 ** (c / 1200));
-  const phases = [0, 0.31, 0.67];
-  const lp = new Biquad("lp", p.cutoff!, 0.9);
-  for (let i = 0; i < out.length; i++) {
+function renderHatOpen(p: Params, rand: () => number): Float32Array {
+  const len = samples(p.decay! * 1.25 + 0.02);
+  const metal = metallic(len, p.scale!, p.spread!, rand);
+  const out = new Float32Array(len);
+  for (let i = 0; i < len; i++) out[i] = metal[i]! * (1 - p.noise!) + noise(rand) * p.noise!;
+  filterAll("hp", p.hp!, 0.8, out);
+  filterAll("lp", p.air!, 0.707, out);
+  for (let i = 0; i < len; i++) {
     const t = i / SAMPLE_RATE;
-    let s = 0;
-    for (let v = 0; v < 3; v++) {
-      phases[v]! += voices[v]! / SAMPLE_RATE;
-      s += readTable(tab, phases[v]!);
+    // A sizzle that swells in, holds, then lets go in two stages (a fast drop, then a long fade).
+    const swell = Math.min(1, t / p.swell!);
+    out[i] = out[i]! * swell * (0.65 * env(t, p.decay!) + 0.35 * env(t, p.decay! * 0.35));
+  }
+  return out;
+}
+
+// ---- melodic ------------------------------------------------------------------------
+
+function renderBell(p: Params, rand: () => number): Float32Array[] {
+  const f = freqC(p.octave!);
+  const out = new Float32Array(samples(p.decay! * 1.05));
+  if (p.type === 0) {
+    // Glass bell: gentle FM with a whole-number ratio (so it stays in tune), plus a soft octave.
+    const ratio = [1, 2, 3, 4][p.ratioIdx!]!;
+    for (let i = 0; i < out.length; i++) {
+      const t = i / SAMPLE_RATE;
+      const mod = Math.sin(2 * Math.PI * f * ratio * t) * p.index! * Math.exp(-t / p.indexDecay!);
+      out[i] = (Math.sin(2 * Math.PI * f * t + mod) + 0.22 * Math.sin(4 * Math.PI * f * t) * env(t, p.decay! * 0.5)) * env(t, p.decay!) * Math.min(1, t / 0.002);
     }
-    const a = Math.min(1, t / p.attack!);
-    const rel = t > total - p.release! ? Math.max(0, (total - t) / p.release!) : 1;
-    if (i % 64 === 0) lp.set(p.cutoff! * (0.5 + 0.5 * a));
-    out[i] = lp.next(s / 3) * a * rel;
+  } else if (p.type === 1) {
+    // Music box: a few whole harmonics, the upper ones dying faster, and a small tick.
+    const parts = [[1, 1, 1], [3, 0.32, 0.45], [5, 0.16, 0.28], [6, 0.1, 0.2]] as const;
+    for (let i = 0; i < out.length; i++) {
+      const t = i / SAMPLE_RATE;
+      let s = 0;
+      for (const [k, a, d] of parts) s += a * Math.sin(2 * Math.PI * f * k * t) * env(t, p.decay! * d);
+      out[i] = s * Math.min(1, t / 0.0015) + (t < 0.004 ? noise(rand) * 0.12 * (1 - t / 0.004) : 0);
+    }
+  } else {
+    // Chime: a soft fundamental with low harmonics and a little shimmer.
+    for (let i = 0; i < out.length; i++) {
+      const t = i / SAMPLE_RATE;
+      const shimmer = Math.sin(2 * Math.PI * f * t * 2) * 0.25 * Math.exp(-t / 0.3);
+      out[i] = (Math.sin(2 * Math.PI * f * t + shimmer) + 0.35 * Math.sin(4 * Math.PI * f * t) * env(t, p.decay! * 0.6) + 0.12 * Math.sin(6 * Math.PI * f * t) * env(t, p.decay! * 0.35)) * env(t, p.decay!) * Math.min(1, t / 0.002);
+    }
+  }
+  // The top is rolled off twice: bright bells are what hurts.
+  filterAll("lp", p.tone!, 0.707, out);
+  filterAll("lp", p.tone! * 1.6, 0.707, out);
+  return space(out, { chorus: p.chorus, wet: p.wet, rt60: 1.8 });
+}
+
+/** Karplus-Strong string, tuned exactly (the loop's own delay is accounted for). */
+function karplus(f: number, seconds: number, damp: number, bright: number, rand: () => number): Float32Array {
+  const out = new Float32Array(samples(seconds));
+  const target = SAMPLE_RATE / f - 0.5;
+  let L = Math.floor(target);
+  let d = target - L;
+  if (d < 0.1) {
+    L -= 1;
+    d += 1;
+  }
+  const a = (1 - d) / (1 + d);
+  const line = new Float32Array(L);
+  let prev = 0;
+  for (let i = 0; i < L; i++) {
+    prev = prev * bright + noise(rand) * (1 - bright);
+    line[i] = prev;
+  }
+  let ptr = 0;
+  let last = 0;
+  let apx = 0;
+  let apy = 0;
+  const loss = Math.exp(-6.9 / (f * seconds * 0.9));
+  for (let i = 0; i < out.length; i++) {
+    const v = line[ptr]!;
+    const avg = damp * 0.5 * (v + last) * loss + (1 - damp) * v * loss;
+    last = v;
+    const y = a * avg + apx - a * apy;
+    apx = avg;
+    apy = y;
+    line[ptr] = y;
+    ptr = (ptr + 1) % L;
+    out[i] = v;
   }
   return out;
 }
 
-function renderLead(p: Params): Float32Array {
-  const f = freqOf(midiOf(p, "lead"));
-  const saw = table(f);
-  const sq = table(f, true);
-  const out = new Float32Array(samples(1.5));
-  const lp = new Biquad("lp", p.cutoff!, 1.2);
-  let phase = 0;
-  for (let i = 0; i < out.length; i++) {
-    const t = i / SAMPLE_RATE;
-    const vib = 1 + (2 ** ((p.vibrato! * Math.min(1, t / 0.15) * Math.sin(2 * Math.PI * 5.5 * t)) / 1200) - 1);
-    phase += (f * vib) / SAMPLE_RATE;
-    const osc = readTable(saw, phase) * (1 - p.mix!) + readTable(sq, phase) * p.mix!;
-    const amp = 0.6 + 0.4 * Math.exp(-t / p.decay!);
-    const rel = t > 1.35 ? Math.max(0, (1.5 - t) / 0.15) : 1;
-    out[i] = lp.next(osc) * amp * rel * Math.min(1, t / 0.005);
+function renderPluck(p: Params, rand: () => number): Float32Array[] {
+  const f = freqC(p.octave!);
+  const len = samples(p.decay! * 1.2);
+  let out: Float32Array = new Float32Array(len);
+  const lpEnv = (x: Float32Array, c0: number, c1: number, fd: number, q: number) => {
+    const lp = new Biquad("lp", c0, q);
+    for (let i = 0; i < x.length; i++) {
+      if (i % 32 === 0) lp.set(c1 + (c0 - c1) * Math.exp(-(i / SAMPLE_RATE) / fd));
+      x[i] = lp.next(x[i]!);
+    }
+  };
+  if (p.type === 0) {
+    out = karplus(f, p.decay! * 1.2, p.damp!, 0.35, rand);
+    for (let i = 0; i < len; i++) out[i]! *= Math.min(1, i / SAMPLE_RATE / 0.001);
+  } else if (p.type === 1) {
+    const tab = table(f);
+    const voices = [-1, -0.55, -0.2, 0, 0.2, 0.55, 1].map((x) => f * cents(x * p.spread!));
+    const ph = voices.map(() => rand());
+    for (let i = 0; i < len; i++) {
+      let s = 0;
+      for (let v = 0; v < voices.length; v++) {
+        ph[v]! += voices[v]! / SAMPLE_RATE;
+        s += readTable(tab, ph[v]!);
+      }
+      out[i] = (s / voices.length) * env(i / SAMPLE_RATE, p.decay!) * Math.min(1, i / SAMPLE_RATE / 0.002);
+    }
+    lpEnv(out, p.cutoff0!, p.cutoff1!, p.filterDecay!, 1.4);
+  } else if (p.type === 2) {
+    // Marimba-like FM: a hollow fourth-partial ring that fades almost at once.
+    for (let i = 0; i < len; i++) {
+      const t = i / SAMPLE_RATE;
+      const m = Math.sin(2 * Math.PI * f * 4 * t) * 1.6 * Math.exp(-t / 0.045);
+      out[i] = (Math.sin(2 * Math.PI * f * t + m) + 0.25 * Math.sin(2 * Math.PI * f * 2 * t) * env(t, 0.25)) * env(t, p.decay! * 0.7) * Math.min(1, t / 0.0015);
+    }
+    filterAll("lp", p.cutoff0! * 0.8, 0.707, out);
+  } else {
+    // Glass pluck: whole harmonics whose upper partials die quickly.
+    for (let i = 0; i < len; i++) {
+      const t = i / SAMPLE_RATE;
+      let s = 0;
+      for (let k = 1; k <= 6; k++) s += (Math.sin(2 * Math.PI * f * k * t) / k ** 1.1) * env(t, p.decay! / (1 + 0.9 * (k - 1)));
+      out[i] = s * Math.min(1, t / 0.0015);
+    }
   }
-  return out;
+  return space(out, { drive: p.drive, chorus: p.chorus, wet: p.wet, rt60: 1.2 });
+}
+
+function renderKeys(p: Params, rand: () => number): Float32Array[] {
+  const f = freqC(p.octave!);
+  const len = samples(p.decay! * 1.1);
+  const out = new Float32Array(len);
+  if (p.type === 0) {
+    // Electric piano: a 1:1 FM pair (soft, round), with a little bark from saturation.
+    for (let i = 0; i < len; i++) {
+      const t = i / SAMPLE_RATE;
+      const m = Math.sin(2 * Math.PI * f * t) * p.index! * Math.exp(-t / p.indexDecay!);
+      out[i] = Math.sin(2 * Math.PI * f * t + m) * env(t, p.decay!) * Math.min(1, t / 0.002);
+    }
+  } else if (p.type === 1) {
+    // Soft piano: harmonics with their own decays (upper ones fade first), a touch of stretch, and a hammer thump.
+    for (let i = 0; i < len; i++) {
+      const t = i / SAMPLE_RATE;
+      let s = 0;
+      for (let k = 1; k <= 10; k++) {
+        const stretch = k * Math.sqrt(1 + 0.0003 * k * k);
+        s += (Math.sin(2 * Math.PI * f * stretch * t) / k ** (1.1 + (1 - p.bright!) * 0.8)) * env(t, p.decay! / (1 + 0.55 * (k - 1)));
+      }
+      out[i] = s * Math.min(1, t / 0.002) + (t < 0.008 ? noise(rand) * 0.08 * (1 - t / 0.008) : 0);
+    }
+    filterAll("lp", 1500 + p.bright! * 5000, 0.707, out);
+  } else {
+    // Organ: drawbars on whole harmonics, steady until a short release.
+    const bars = [1, 2, 3, 4, 6, 8].map((k, n) => ({ k, a: (0.35 + rand() * 0.65) / (1 + n * 0.4) }));
+    const total = Math.min(1.8, p.decay!);
+    const o = new Float32Array(samples(total));
+    for (let i = 0; i < o.length; i++) {
+      const t = i / SAMPLE_RATE;
+      let s = 0;
+      for (const b of bars) s += b.a * Math.sin(2 * Math.PI * f * b.k * t);
+      o[i] = s * Math.min(1, t / 0.006) * (t > total - 0.15 ? Math.max(0, (total - t) / 0.15) : 1);
+    }
+    return space(filterAll("lp", 2500 + p.bright! * 4000, 0.707, o), { drive: p.drive, chorus: Math.max(0.3, p.chorus!), chorusRate: 6, wet: p.wet, rt60: 1.2 });
+  }
+  return space(out, { drive: p.drive, chorus: p.chorus, wet: p.wet, rt60: 1.4 });
+}
+
+function renderPad(p: Params, rand: () => number): Float32Array[] {
+  const f = freqC(p.octave!);
+  const total = p.attack! + 1.2 + p.release!;
+  const len = samples(total);
+  const out = new Float32Array(len);
+  const amp = (t: number) => Math.min(1, t / p.attack!) * (t > total - p.release! ? Math.max(0, (total - t) / p.release!) : 1);
+  if (p.type === 0) {
+    // Strings: a stack of detuned saws under a slowly opening filter.
+    const tab = table(f);
+    const detunes = [-1, -0.6, -0.25, 0, 0.25, 0.6, 1].map((x) => f * cents(x * p.spread!));
+    const ph = detunes.map(() => rand());
+    const lp = new Biquad("lp", p.cutoff!, 0.8);
+    for (let i = 0; i < len; i++) {
+      const t = i / SAMPLE_RATE;
+      let s = 0;
+      for (let v = 0; v < detunes.length; v++) {
+        ph[v]! += detunes[v]! / SAMPLE_RATE;
+        s += readTable(tab, ph[v]!);
+      }
+      if (i % 64 === 0) lp.set(p.cutoff! * (0.45 + 0.55 * Math.min(1, t / (p.attack! + 0.5))));
+      out[i] = lp.next(s / detunes.length) * amp(t);
+    }
+  } else if (p.type === 1) {
+    // Choir: saws through vowel formants (an "ah" to "oo" blend) with a breath of noise.
+    const tab = table(f);
+    const ph = [rand(), rand(), rand()];
+    const dets = [-p.spread!, 0, p.spread!].map((c) => f * cents(c));
+    const v = p.vowel!;
+    const form = [
+      [800 + (350 - 800) * v, 1],
+      [1150 + (600 - 1150) * v, 0.5],
+      [2900 + (2700 - 2900) * v, 0.25],
+    ] as const;
+    const src = new Float32Array(len);
+    for (let i = 0; i < len; i++) {
+      let s = 0;
+      for (let k = 0; k < 3; k++) {
+        ph[k]! += (dets[k]! * (1 + 0.0025 * Math.sin((2 * Math.PI * 5 * i) / SAMPLE_RATE))) / SAMPLE_RATE;
+        s += readTable(tab, ph[k]!);
+      }
+      src[i] = s / 3 + noise(rand) * 0.06;
+    }
+    for (const [fc, g] of form) {
+      const band = filterAll("bp", fc, 7, src.slice());
+      for (let i = 0; i < len; i++) out[i]! += band[i]! * g * 4;
+    }
+    for (let i = 0; i < len; i++) out[i]! *= amp(i / SAMPLE_RATE);
+  } else {
+    // Glass: odd harmonics that each breathe slowly, so it shimmers without any detune.
+    const rates = [0.31, 0.47, 0.62, 0.83, 1.05].map((x) => x + rand() * 0.2);
+    const phases = rates.map(() => rand() * 6.28);
+    for (let i = 0; i < len; i++) {
+      const t = i / SAMPLE_RATE;
+      let s = 0;
+      for (let h = 0; h < 5; h++) {
+        const k = 2 * h + 1;
+        s += (Math.sin(2 * Math.PI * f * k * t) / k) * (0.6 + 0.4 * Math.sin(2 * Math.PI * rates[h]! * t + phases[h]!));
+      }
+      out[i] = s * amp(t);
+    }
+    filterAll("lp", p.cutoff! + 1500, 0.707, out);
+  }
+  return space(out, { chorus: p.chorus, wet: p.wet, rt60: 1.8, chorusRate: 0.35 });
+}
+
+function renderLead(p: Params, rand: () => number): Float32Array[] {
+  const f = freqC(p.octave!);
+  const len = samples(1.5);
+  const out = new Float32Array(len);
+  const rel = (t: number) => (t > 1.35 ? Math.max(0, (1.5 - t) / 0.15) : 1);
+  const amp = (t: number) => (0.62 + 0.38 * Math.exp(-t / p.decay!)) * rel(t) * Math.min(1, t / 0.006);
+  const pitch = (t: number) => 2 ** (-(p.glideSemi! * Math.exp(-t / 0.05)) / 12) * cents(p.vibrato! * Math.min(1, t / 0.2) * Math.sin(2 * Math.PI * 5.4 * t));
+  if (p.type === 0) {
+    const tab = table(f);
+    const detunes = [-1, -0.55, -0.2, 0, 0.2, 0.55, 1].map((x) => cents(x * p.spread!));
+    const ph = detunes.map(() => rand());
+    for (let i = 0; i < len; i++) {
+      const t = i / SAMPLE_RATE;
+      let s = 0;
+      for (let v = 0; v < detunes.length; v++) {
+        ph[v]! += (f * detunes[v]! * pitch(t)) / SAMPLE_RATE;
+        s += readTable(tab, ph[v]!);
+      }
+      out[i] = (s / detunes.length) * amp(t);
+    }
+    filterAll("lp", p.cutoff!, 1.1, out);
+  } else if (p.type === 1) {
+    const saw = table(f);
+    let ph = 0;
+    for (let i = 0; i < len; i++) {
+      const t = i / SAMPLE_RATE;
+      ph += (f * pitch(t)) / SAMPLE_RATE;
+      const w = 0.5 + 0.34 * Math.sin(2 * Math.PI * 0.7 * t);
+      out[i] = (readTable(saw, ph) - readTable(saw, ph + w)) * amp(t);
+    }
+    filterAll("lp", p.cutoff!, 1.1, out);
+  } else {
+    // Flute-ish: a nearly pure tone with a breath of band-passed noise riding on it.
+    let ph = 0;
+    const breath = new Float32Array(len);
+    for (let i = 0; i < len; i++) breath[i] = noise(rand);
+    filterAll("bp", f * 2, 2.5, breath);
+    for (let i = 0; i < len; i++) {
+      const t = i / SAMPLE_RATE;
+      ph += (f * pitch(t)) / SAMPLE_RATE;
+      out[i] = (Math.sin(2 * Math.PI * ph) + 0.2 * Math.sin(4 * Math.PI * ph) + 0.07 * Math.sin(6 * Math.PI * ph) + breath[i]! * 0.5 * Math.min(1, t / 0.05)) * amp(t);
+    }
+    filterAll("lp", p.cutoff! * 0.8, 0.707, out);
+  }
+  return space(out, { drive: p.drive, wet: p.wet, rt60: 1.6, chorus: p.type === 2 ? 0.1 : 0.25 });
 }
 
 // ---- finishing + encoding ---------------------------------------------------------------
 
 /** Technical clean-up every sound gets: no DC, no click at the end, trailing silence trimmed, peak at -1 dBFS. */
-function finish(data: Float32Array): Float32Array {
-  for (let i = 0; i < data.length; i++) if (!Number.isFinite(data[i])) data[i] = 0;
-  filterAll("hp", 12, 0.707, data);
-  let end = data.length;
+function finish(channels: Float32Array[]): Float32Array[] {
+  for (const ch of channels) {
+    for (let i = 0; i < ch.length; i++) if (!Number.isFinite(ch[i])) ch[i] = 0;
+    filterAll("hp", 12, 0.707, ch);
+  }
   const floor = 10 ** (-70 / 20);
-  while (end > samples(0.1) && Math.abs(data[end - 1]!) < floor) end--;
-  const out = data.slice(0, end);
-  const fade = Math.min(out.length, samples(0.008));
-  for (let i = 0; i < fade; i++) out[out.length - 1 - i]! *= i / fade;
+  const len = Math.min(...channels.map((c) => c.length));
+  let end = len;
+  while (end > samples(0.1) && channels.every((c) => Math.abs(c[end - 1]!) < floor)) end--;
+  const out = channels.map((c) => c.slice(0, end));
+  const fade = Math.min(end, samples(0.008));
+  for (const ch of out) for (let i = 0; i < fade; i++) ch[end - 1 - i]! *= i / fade;
   let peak = 0;
-  for (const v of out) peak = Math.max(peak, Math.abs(v));
+  for (const ch of out) for (const v of ch) peak = Math.max(peak, Math.abs(v));
   const gain = peak > 0 ? 10 ** (-1 / 20) / peak : 1;
-  for (let i = 0; i < out.length; i++) out[i]! *= gain;
+  for (const ch of out) for (let i = 0; i < end; i++) ch[i]! *= gain;
   return out;
 }
 
-export function renderSound(kind: SoundKind, rawParams: unknown, seed = 1): Float32Array {
+/** The sound as 1 (drums, 808) or 2 (melodic) channels. */
+export function renderSound(kind: SoundKind, rawParams: unknown, seed = 1): Float32Array[] {
   const p = cleanParams(kind, rawParams);
   const rand = rng(seed);
-  const data =
+  const made: Float32Array | Float32Array[] =
     kind === "kick" ? renderKick(p, rand)
     : kind === "808" ? render808(p, rand)
     : kind === "snare" ? renderSnare(p, rand)
     : kind === "clap" ? renderClap(p, rand)
-    : kind === "hat-closed" || kind === "hat-open" ? renderHat(p, rand)
-    : kind === "bell" ? renderBell(p)
-    : kind === "pluck" ? renderPluck(p)
-    : kind === "keys" ? renderKeys(p)
-    : kind === "pad" ? renderPad(p)
-    : renderLead(p);
-  return finish(data);
+    : kind === "hat-closed" ? renderHatClosed(p, rand)
+    : kind === "hat-open" ? renderHatOpen(p, rand)
+    : kind === "bell" ? renderBell(p, rand)
+    : kind === "pluck" ? renderPluck(p, rand)
+    : kind === "keys" ? renderKeys(p, rand)
+    : kind === "pad" ? renderPad(p, rand)
+    : renderLead(p, rand);
+  return finish(Array.isArray(made) ? made : [made]);
 }
 
-/** Mono WAV, 24-bit PCM at 44.1 kHz (what a producer expects from a sound kit). */
-export function encodeWav24(data: Float32Array): Buffer {
-  const bytes = data.length * 3;
+/** 24-bit PCM WAV at 44.1 kHz, mono or stereo (what a producer expects from a sound kit). */
+export function encodeWav24(channels: Float32Array[]): Buffer {
+  const n = channels.length;
+  const frames = channels[0]!.length;
+  const bytes = frames * n * 3;
   const buf = Buffer.alloc(44 + bytes);
   buf.write("RIFF", 0);
   buf.writeUInt32LE(36 + bytes, 4);
   buf.write("WAVEfmt ", 8);
   buf.writeUInt32LE(16, 16);
   buf.writeUInt16LE(1, 20);
-  buf.writeUInt16LE(1, 22);
+  buf.writeUInt16LE(n, 22);
   buf.writeUInt32LE(SAMPLE_RATE, 24);
-  buf.writeUInt32LE(SAMPLE_RATE * 3, 28);
-  buf.writeUInt16LE(3, 32);
+  buf.writeUInt32LE(SAMPLE_RATE * 3 * n, 28);
+  buf.writeUInt16LE(3 * n, 32);
   buf.writeUInt16LE(24, 34);
   buf.write("data", 36);
   buf.writeUInt32LE(bytes, 40);
-  for (let i = 0; i < data.length; i++) {
-    const v = Math.round(clamp(data[i]!, -1, 1) * 8388607);
-    buf.writeIntLE(v, 44 + i * 3, 3);
+  for (let i = 0; i < frames; i++) {
+    for (let c = 0; c < n; c++) buf.writeIntLE(Math.round(clamp(channels[c]![i]!, -1, 1) * 8388607), 44 + (i * n + c) * 3, 3);
   }
   return buf;
 }
 
-export function durationSec(data: Float32Array): number {
-  return Math.round((data.length / SAMPLE_RATE) * 1000) / 1000;
+export function durationSec(channels: Float32Array[]): number {
+  return Math.round((channels[0]!.length / SAMPLE_RATE) * 1000) / 1000;
 }
