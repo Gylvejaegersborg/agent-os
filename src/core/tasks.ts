@@ -643,9 +643,30 @@ async function projectFlows(): Promise<FlowProjectionState> {
       const flow = state.flows.get(p.flowId);
       if (!flow) return state;
       state.flows.set(p.flowId, { ...flow, status: "cancelled", revision: flow.revision + 1 });
+    } else if (event.type === "flow.reopened") {
+      // Resume after a stop: every step that didn't succeed goes back to queued (its taskId stays, as the previous attempt).
+      const p = event.payload as any;
+      const flow = state.flows.get(p.flowId);
+      if (!flow) return state;
+      const steps: FlowStep[] = flow.steps.map((s) => (s.status === "succeeded" ? s : { ...s, status: "queued" as TaskStatus }));
+      state.flows.set(p.flowId, { ...flow, steps, status: "running", revision: flow.revision + 1 });
     }
     return state;
   });
+}
+
+/** Puts a stopped flow back to running, with every step that didn't succeed queued again. Steps that succeeded keep
+ *  their results. A running or finished-successfully flow is returned unchanged; a cancelled one stays cancelled unless
+ *  `includeCancelled` (the operator pressing Resume on it is the only caller that sets it). */
+export async function reopenFlow(flowId: string, opts: { includeCancelled?: boolean } = {}): Promise<Flow> {
+  const existing = await getFlow(flowId);
+  if (!existing) throw new Error(`no such flow: ${flowId}`);
+  if (existing.status === "running" || existing.status === "succeeded") return existing;
+  if (existing.status === "cancelled" && !opts.includeCancelled) return existing;
+  await appendEvent(FLOWS_STREAM, "flow.reopened", { flowId });
+  const updated = await getFlow(flowId);
+  if (!updated) throw new Error("flow.reopened event did not project to a flow");
+  return updated;
 }
 
 export async function getFlow(flowId: string): Promise<Flow | undefined> {

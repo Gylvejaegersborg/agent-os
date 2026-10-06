@@ -90,6 +90,7 @@ import {
   createFlow,
   cancelFlow,
   resumeFlow,
+  reopenFlow,
   listApprovals,
   getApproval,
   approveRequest,
@@ -134,6 +135,7 @@ import {
   weekDigest,
   recordDesktopCorrection,
   getFlowDefinition,
+  buildFlowReport,
   storeFlowDefinition,
   listConnectors,
   refreshConnectors,
@@ -1216,6 +1218,17 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
       sendJson(res, 200, { ...flow, definition: (await getFlowDefinition(flow.id)) ?? null });
       return;
     }
+    // Everything about one flow in one answer: per step the goal, agent, attempts, result, tool calls, what it added to
+    // BaseSpace and its tokens (flow-report.ts).
+    if (method === "GET" && segments.length === 3 && segments[2] === "report") {
+      const report = await buildFlowReport(segments[1]!);
+      if (!report) {
+        sendJson(res, 404, { error: `no such flow: ${segments[1]}` });
+        return;
+      }
+      sendJson(res, 200, report);
+      return;
+    }
     if (method === "POST" && segments.length === 1) {
       const body = await readRequestBody(req);
       const steps = parseFlowSteps(body.steps);
@@ -1272,6 +1285,8 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         sendJson(res, 400, { error: "steps (the SAME FlowStepDefinition[] originally used to create this flow) is required to resume it" });
         return;
       }
+      // The operator pressed Resume: a stopped flow (failed, or cancelled) runs its unfinished steps again.
+      await reopenFlow(flow.id, { includeCancelled: true });
       resumeFlow(flow.id, steps, {
         model: deps.model,
         worker: deps.worker,

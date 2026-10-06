@@ -45,6 +45,7 @@ export * from "./observability.js";
 export * from "./desktop.js";
 export * from "./desktop-learning.js";
 export * from "./flow-proposals.js";
+export * from "./flow-report.js";
 export * from "./soundgen.js";
 export * from "./soundlab.js";
 export * from "./soundpack.js";

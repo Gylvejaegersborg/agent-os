@@ -48,7 +48,7 @@
 //      mid-runTurn() — it stops at the next checkpoint runTurn() itself
 //      checks, not instantly.
 
-import { createFlow, getFlow, getTask, updateFlowStep, createTask, transitionTask } from "./tasks.js";
+import { createFlow, getFlow, getTask, reopenFlow, updateFlowStep, createTask, transitionTask } from "./tasks.js";
 import { runTurn } from "./agent-loop.js";
 import { createSession, linkSessionWork } from "./session.js";
 import type { SessionFocus } from "./types.js";
@@ -150,6 +150,9 @@ export async function runFlow(steps: FlowStepDefinition[], opts: DriveFlowOption
  *  already fully done (returns immediately with its current, unchanged
  *  state) or already cancelled. */
 export async function resumeFlow(flowId: string, steps: FlowStepDefinition[], opts: DriveFlowOptions): Promise<DriveFlowResult> {
+  // A flow that stopped (a step failed, or it was cancelled) is reopened: the steps that didn't succeed run again,
+  // the ones that did keep their results. Without this a stopped flow is terminal and Resume did nothing.
+  await reopenFlow(flowId);
   return driveFlow(flowId, steps, opts);
 }
 
@@ -188,6 +191,12 @@ async function runStepOnce(
   step: FlowStepDefinition,
   opts: DriveFlowOptions,
 ): Promise<{ status: TaskStatus; taskId: string; finalContent?: string }> {
+  // An earlier attempt at this step (the flow was resumed): tell the agent, so it checks what already exists
+  // instead of adding it all again.
+  const previous = (await getFlow(flowId))?.steps.find((s) => s.id === step.id)?.taskId;
+  const retryNote = previous
+    ? "\n\n---\nNote: an earlier attempt at this step was stopped before it finished (it may have run out of tool steps). Some of its work may already be in BaseSpace: look first (basespace, with a search for the titles you would add) and only add what is missing. Never add a duplicate."
+    : "";
   const task = await createTask({ type: "flow-step", agentId: step.agentId, flowId, input: { stepId: step.id, goal: step.goal } });
   await transitionTask(task.id, "running");
   await setStepStatus(flowId, step.id, "running", task.id);
@@ -208,7 +217,7 @@ async function runStepOnce(
     const result = await runTurn({
       sessionId: session.id,
       agentId: step.agentId,
-      userMessage: step.goal + (await upstreamResults(flowId, step)),
+      userMessage: step.goal + retryNote + (await upstreamResults(flowId, step)),
       model,
       worker: opts.worker,
       skills: opts.skills,
