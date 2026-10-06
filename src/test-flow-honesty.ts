@@ -29,7 +29,12 @@ assert(!args.includes("--strict-mcp-config"), "the operator's connectors are NOT
 assert(args[args.indexOf("--system-prompt") + 1] === "SYSTEM PROMPT" && args[args.indexOf("--model") + 1] === "haiku", "the system prompt and model are passed through");
 const bare = claudeCliArgs("x");
 assert(!bare.includes("--model") && !bare.includes("--allowedTools") && !bare.includes("--disallowedTools"), "no model or grant flags when there are none");
-assert(/native connector tools/.test(renderToolProtocol([{ name: "soundlab", description: "d", parameters: { type: "object", properties: {} } }])) && /ONLY with the block/.test(renderToolProtocol([{ name: "soundlab", description: "d", parameters: { type: "object", properties: {} } }])), "the prompt says plainly that connector tools are extras and Agent-OS tools are used with the block (seen live: without this a model said it couldn't use ours)");
+const spec = [{ name: "soundlab", description: "d", parameters: { type: "object" as const, properties: {} } }, { name: "basespace", description: "d", parameters: { type: "object" as const, properties: {} } }];
+const withC = renderToolProtocol(spec as any, true);
+const withoutC = renderToolProtocol(spec as any, false);
+assert(/exact names\): soundlab, basespace\./.test(withC) && /NOT native tools and not MCP/.test(withC), "the prompt lists the exact tool names and says they are not native or MCP (seen live: a small model read the list, then said a listed tool \"isn't available\")");
+assert(/native connector tools/.test(withC) && /ONLY with the block/.test(withC), "…and, when connectors are granted, that connector tools are extras and Agent-OS tools use the block");
+assert(!/native connector tools/.test(withoutC), "…and says nothing about connectors when none are granted");
 
 // --- 2/3. honest step outcomes ---------------------------------------------------------------
 await seedDefaultAgents();

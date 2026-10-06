@@ -134,6 +134,17 @@ export function connectorGrants(): { allow: string[]; deny: string[] } {
   };
 }
 
+/** Small models can't reliably use two kinds of tools at once: measured live, a Haiku agent made its Agent-OS tool call
+ *  4 times out of 4 with the connectors withheld, and mostly failed (calling the tool "not available") with them granted.
+ *  So an agent on a small model gets no connectors (AGENT_OS_CONNECTORS_SMALL=1 to grant them anyway). */
+export function connectorGrantsFor(model?: string): { allow: string[]; deny: string[] } {
+  const grants = connectorGrants();
+  if (model && /haiku/i.test(model) && process.env.AGENT_OS_CONNECTORS_SMALL !== "1") {
+    return { allow: [], deny: [...new Set([...grants.allow, ...grants.deny])] };
+  }
+  return grants;
+}
+
 /** Starts discovery now and every few minutes, so the list follows the account. */
 export function startConnectorSync(intervalMs = 5 * 60_000): { stop: () => void } {
   const run = () =>

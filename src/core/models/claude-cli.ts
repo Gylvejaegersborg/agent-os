@@ -32,7 +32,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import os from "node:os";
-import { connectorGrants } from "../connectors.js";
+import { connectorGrantsFor } from "../connectors.js";
 import type { ModelAdapter, ModelCallOptions, ModelMessage, ModelResponse } from "../model.js";
 import { registryToolSpecs, type ToolSpec } from "./real.js";
 
@@ -89,7 +89,7 @@ function renderArgs(parameters: Record<string, unknown>): string {
  *  JSON Schema per tool: this goes out in the system prompt of every call
  *  (the CLI gives no prompt caching here), so every character is paid for
  *  again on each tool step. */
-export function renderToolProtocol(tools: ToolSpec[]): string {
+export function renderToolProtocol(tools: ToolSpec[], withConnectors = true): string {
   if (!tools.length) return "";
   const list = tools
     .map((t) => {
@@ -99,12 +99,18 @@ export function renderToolProtocol(tools: ToolSpec[]): string {
     .join("\n");
   return [
     "# Tools",
+    // The exact names up front, and what kind of tool they are: without this a small model reads the list, then says a tool "isn't available".
+    `Agent-OS tools you can call right now (exact names): ${tools.map((t) => t.name).join(", ")}. They are NOT native tools and not MCP: you call them only by ending your reply with the block below.`,
     "Agent-OS runs tools for you (your built-in tools are off). To use one, end your reply with exactly one block:",
     `${TOOL_OPEN}{"name": "<tool>", "args": {...}}${TOOL_CLOSE}`,
     "That format only for the Agent-OS tools below (not <function_calls> or XML), one call per reply, nothing after it — never guess a result. " +
       "The output comes back as a [tool result] message (some calls wait for the operator's approval). No tool needed → just answer.",
-    "You may also be offered native connector tools (names starting mcp__, e.g. a search or docs tool). Those are extras: call them natively, as usual. " +
-      "They never replace the Agent-OS tools below: those are always available to you, and are used ONLY with the block above.",
+    ...(withConnectors
+      ? [
+          "You may also be offered native connector tools (names starting mcp__, e.g. a search or docs tool). Those are extras: call them natively, as usual. " +
+            "They never replace the Agent-OS tools below: those are always available to you, and are used ONLY with the block above.",
+        ]
+      : []),
     "Tools (* = required argument):",
     list,
   ].join("\n");
@@ -270,9 +276,10 @@ export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter 
 
   async function run(messages: ModelMessage[], onDelta?: (delta: string) => void, callOpts?: ModelCallOptions): Promise<ModelResponse> {
     const system = messages.find((m) => m.role === "system")?.content ?? "";
-    const toolText = renderToolProtocol(callOpts?.tools ?? opts.tools ?? registryToolSpecs());
+    const grants = connectorGrantsFor(model);
+    const toolText = renderToolProtocol(callOpts?.tools ?? opts.tools ?? registryToolSpecs(), grants.allow.length > 0);
     const systemPrompt = [system, toolText].filter(Boolean).join("\n\n") || "You are a helpful assistant.";
-    const args = claudeCliArgs(systemPrompt, model, connectorGrants());
+    const args = claudeCliArgs(systemPrompt, model, grants);
     // The CLI authenticates with its own login. ANTHROPIC_TOKEN is Agent-OS's
     // own variable for the direct-API path, not something the CLI reads —
     // dropped so it can't leak into the child's environment.

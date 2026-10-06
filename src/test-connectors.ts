@@ -10,7 +10,7 @@
 // Run with: node dist/test-connectors.js
 
 import "./test-helpers/isolate.js";
-import { connectorGrants, listConnectors, parseMcpList, refreshConnectors, setConnectorDiscovery, setConnectorEnabled, toolPrefix, createStubModel, createStubWorker } from "./core/index.js";
+import { connectorGrants, connectorGrantsFor, listConnectors, parseMcpList, refreshConnectors, setConnectorDiscovery, setConnectorEnabled, toolPrefix, createStubModel, createStubWorker } from "./core/index.js";
 import { startGateway } from "./gateway/server.js";
 
 let failed = false;
@@ -62,6 +62,16 @@ assert(!g.allow.includes("mcp__claude_ai_Claude_Docs") && g.deny.includes("mcp__
 await refreshConnectors();
 assert(listConnectors().connectors.find((c) => c.name === "discord")!.enabled === true && listConnectors().connectors.find((c) => c.name === "claude.ai Claude Docs")!.enabled === false, "…and survive a refresh (they're remembered)");
 assert(await setConnectorEnabled("nope", true).then(() => false, () => true), "an unknown connector can't be toggled");
+
+// --- 3b. small models --------------------------------------------------------------------------------
+const sonnet = connectorGrantsFor("sonnet");
+const haiku = connectorGrantsFor("haiku");
+assert(sonnet.allow.includes("mcp__claude_ai_BeatStars") === connectorGrants().allow.includes("mcp__claude_ai_BeatStars") && sonnet.allow.length === connectorGrants().allow.length, "an agent on Sonnet gets the enabled connectors");
+assert(haiku.allow.length === 0 && haiku.deny.includes("mcp__claude_ai_BeatStars") && haiku.deny.includes("mcp__discord"), "an agent on Haiku gets none (measured: it can't reliably use two kinds of tools at once), and every one is withheld");
+assert(connectorGrantsFor(undefined).allow.length === connectorGrants().allow.length, "no model named: the normal grants");
+process.env.AGENT_OS_CONNECTORS_SMALL = "1";
+assert(connectorGrantsFor("haiku").allow.length === connectorGrants().allow.length, "AGENT_OS_CONNECTORS_SMALL=1 grants them to Haiku anyway");
+delete process.env.AGENT_OS_CONNECTORS_SMALL;
 
 // --- 4. following the account --------------------------------------------------------------------
 current = SAMPLE + "claude.ai Notion: https://mcp.notion.com/mcp - ✔ Connected\n";
