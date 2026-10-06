@@ -177,10 +177,10 @@ export function maxToolExecutionsPerRun(): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 8;
 }
 
-/** Model replies one flow step may take (AGENT_OS_FLOW_STEP_HOPS, default 10), wherever the flow came from. */
+/** Model replies one flow step may take (AGENT_OS_FLOW_STEP_HOPS, default 25), wherever the flow came from. */
 export function flowStepHops(): number {
-  const n = Number(process.env.AGENT_OS_FLOW_STEP_HOPS ?? 10);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 10;
+  const n = Number(process.env.AGENT_OS_FLOW_STEP_HOPS ?? 25);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 25;
 }
 
 /** The cap for one flow step (AGENT_OS_FLOW_STEP_EXECUTIONS, default 25). A step is a whole job, so it gets more room than
