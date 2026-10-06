@@ -142,6 +142,7 @@ import type { SandboxPolicy } from "../core/permissions.js";
 import type { ConfiguredHook } from "../core/configured-hooks.js";
 import { handleMcp, type McpDeps } from "./mcp.js";
 import { handleLibrary } from "./library-routes.js";
+import { handleSoundlab } from "./soundlab-routes.js";
 import { listSongAssets } from "../core/library.js";
 import type { SessionFocus } from "../core/types.js";
 import { closeAllTerminals, closeTerminal, setTerminalGatewayUrl, createTerminal, listTerminals, ptyBackend, resizeTerminal, streamTerminal, terminalsEnabled, writeTerminal } from "./terminal.js";
@@ -495,6 +496,8 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
 
   // ---- Music library (core/library.ts): the operator's own uploads. ----
   if (segments[0] === "library" && (await handleLibrary(req, res, segments, url, { readJson: readRequestBody, sendJson }))) return;
+  // ---- Sound Lab (core/soundlab.ts): synthesized candidates the operator listens to and judges. ----
+  if (segments[0] === "soundlab" && (await handleSoundlab(req, res, segments, url, { readJson: readRequestBody, sendJson }))) return;
 
   // ---- Team reviews (core/review.ts, review-loop.ts): what each lead's
   // review would look at (free — no model call), past reviews, and the
