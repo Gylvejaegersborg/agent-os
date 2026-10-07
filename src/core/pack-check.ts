@@ -13,6 +13,12 @@ const KIND = KINDS.map((k) => k.replace("-", "\\-")).join("|");
 // A plural "kicks"/"claps"/"hats" is the same kind: kinds are matched with an optional trailing s.
 const K = `(${KIND})s?`;
 
+/** The two groups the notes use. */
+const GROUPS: Record<string, string[]> = {
+  percussion: ["808", "kick", "snare", "clap", "hat-closed", "hat-open", "perc"],
+  melodic: ["bell", "keys", "pad", "strings", "lead", "pluck"],
+};
+
 const PATTERNS: { re: RegExp; kind: number; count: number }[] = [
   { re: new RegExp(`\\b(\\d+)\\s*[×x]\\s*${K}\\b`, "gi"), kind: 2, count: 1 }, // 6 × 808
   { re: new RegExp(`\\b${K}\\s*\\(\\s*(\\d+)\\s*\\)`, "gi"), kind: 1, count: 2 }, // keys (9)
@@ -57,7 +63,14 @@ export function checkTextAgainstPack(text: string, facts: PackFacts): string[] {
       else if (said !== real) flag(`"${m[0].trim()}": the pack has ${real} ${k}, not ${said}`);
     }
   }
-  for (const m of text.matchAll(/\b(\d+)[-\s]sounds?\b/gi)) {
+  // Group subtotals ("Percussion (37 sounds)"): the sum of that group's kinds in the pack.
+  for (const m of text.matchAll(/\b(percussion|melodic)\b[^\n(]{0,12}\(\s*(\d+)\s*(?:sounds?)?\s*\)/gi)) {
+    const group = GROUPS[m[1]!.toLowerCase()]!;
+    const real = group.reduce((n, k) => n + (facts.counts[k] ?? 0), 0);
+    if (Number(m[2]) !== real) flag(`"${m[0].trim()}": ${m[1]!.toLowerCase()} (${group.join(", ")}) is ${real} sounds in the pack, not ${m[2]}`);
+  }
+  // (a number inside parentheses is a group subtotal, checked above, not the pack total)
+  for (const m of text.matchAll(/(?<!\(\s*)\b(\d+)[-\s]sounds?\b/gi)) {
     if (Number(m[1]) !== facts.total) flag(`"${m[0]}": the pack has ${facts.total} sounds, not ${m[1]}`);
   }
   // The artist name: the stylized lambda is only styling; searchable text uses plain ISARK.

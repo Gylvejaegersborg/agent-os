@@ -5,7 +5,7 @@
 // Run with: node dist/test-note-edit.js
 
 import "./test-helpers/isolate.js";
-import { addOverlayItem, getToolDefinition, loadOverlay, toToolSpec } from "./core/index.js";
+import { addOverlayItem, getToolDefinition, loadOverlay, readSnapshotSection, removeOverlayItem, saveSnapshot, toToolSpec } from "./core/index.js";
 
 let failed = false;
 function assert(cond: boolean, msg: string): void {
@@ -51,6 +51,18 @@ assert(old.ok && (await loadOverlay()).notes.length === count, "an edit never ma
 
 const spec = toToolSpec(getToolDefinition("basespace-add")!);
 assert(!!(spec.parameters.properties as Record<string, unknown>).edit && !!(spec.parameters.properties as Record<string, unknown>).append && /CHANGE a note/.test(spec.description), "the tool schema offers edit and append and says when to use them");
+
+// The basespace tool reads the LIVE overlay for agent items, not a stale snapshot copy of them
+const nid = /id (\S+?)[,.]/.exec((await addOverlayItem("note", { title: "Live", body: "version two", folder: "Agents/Nyx" }, "nyx")).output)![1]!;
+const tid = /id (\S+?)[,.]/.exec((await addOverlayItem("todo", { title: "Live todo" }, "nyx")).output)![1]!;
+await saveSnapshot({ schema: 1, notes: [{ id: nid, title: "Live", body: "version one (stale)" }, { id: "mine-1", title: "Operator note", body: "x" }], todos: [{ id: tid, title: "Live todo", status: "todo" }, { id: "agent-nyx-gone", title: "Deleted todo", status: "todo" }] } as any);
+const one2 = await readSnapshotSection("notes", { id: nid });
+assert(/version two/.test(one2.output) && !/stale/.test(one2.output), "a note edited after the snapshot is read in its newer version");
+const todos = await readSnapshotSection("todos", {});
+assert(/Live todo/.test(todos.output) && !/Deleted todo/.test(todos.output), "an agent todo that is no longer in the overlay is not listed, even though the snapshot still has it");
+assert(/Operator note/.test((await readSnapshotSection("notes", {})).output), "the operator's own notes are untouched");
+await removeOverlayItem("note", nid);
+assert(!/Live/.test((await readSnapshotSection("notes", {})).output.replace(/Operator note/g, "")), "a deleted agent note disappears at once");
 
 console.log(failed ? "\nSome note-edit tests FAILED." : "\nAll note-edit tests passed.");
 process.exit(failed ? 1 : 0);

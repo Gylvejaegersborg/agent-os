@@ -93,19 +93,19 @@ export async function readSnapshotSection(section: string, opts: { query?: strin
     return { ok: false, output: "", error: "BaseSpace hasn't sent a snapshot yet — it syncs automatically while BaseSpace is open and connected." };
   }
   const header = `BaseSpace snapshot from ${snap.exportedAt ?? snap.receivedAt}.`;
-  // What agents added (the overlay) shows up in the snapshot only after
-  // BaseSpace syncs again — until then, read it straight from the overlay,
-  // or an agent can't see what a teammate just added (a verifier would
-  // call finished work missing).
+  // What agents added (the overlay) reaches the snapshot only when BaseSpace syncs again, and the snapshot copy of an item
+  // does not follow later edits or deletions. So for notes and todos the live overlay is the truth about agent items: a newer
+  // version replaces the snapshot's copy, an agent item the overlay no longer has is dropped, and new ones are added. (Reading
+  // the stale copy made a verifier judge old text, and count todos that had been deleted.) The operator's own items are untouched.
   const overlay = await loadOverlay();
-  const pending = (key: string, have: any[]): any[] => {
-    const src = key === "notes" ? overlay.notes : key === "todos" ? overlay.tasks : [];
-    const ids = new Set(have.map((i) => i.id));
-    return src.filter((i) => !ids.has(i.id));
-  };
   const list = (key: string): any[] => {
-    const have = Array.isArray(snap[key]) ? snap[key] : [];
-    return [...have, ...pending(key, have)];
+    const have: any[] = Array.isArray(snap[key]) ? snap[key] : [];
+    const src: any[] | undefined = key === "notes" ? overlay.notes : key === "todos" ? overlay.tasks : undefined;
+    if (!src) return have;
+    const live = new Map(src.map((i) => [i.id, i]));
+    const haveIds = new Set(have.map((i) => i.id));
+    const kept = have.filter((i) => !String(i.id).startsWith("agent-") || live.has(i.id)).map((i) => live.get(i.id) ?? i);
+    return [...kept, ...src.filter((i) => !haveIds.has(i.id))];
   };
 
   if (section === "summary") {

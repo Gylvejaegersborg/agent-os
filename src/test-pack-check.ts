@@ -27,6 +27,9 @@ assert(checkTextAgainstPack(good, facts).length === 0, "a note whose numbers are
 const bad = checkTextAgainstPack("5 × kick, 5 × snare, keys (10), | pad | 6 |, 70 sounds, tagged isark, the salient pack", facts);
 assert(bad.some((p) => /has 4 kick, not 5/.test(p)) && bad.some((p) => /has 4 snare, not 5/.test(p)) && bad.some((p) => /has 9 keys, not 10/.test(p)) && bad.some((p) => /has 5 pad, not 6/.test(p)), "every wrong count is named with the real one");
 assert(bad.some((p) => /71 sounds, not 70/.test(p)) && bad.some((p) => /write ISARK/.test(p)) && bad.some((p) => /Salient/.test(p)), "the wrong total, lowercase isark and lowercase salient are flagged");
+const sub = checkTextAgainstPack("**Percussion (36 sounds):**\n**Melodic (35 sounds):**", facts);
+assert(sub.length === 2 && /is 37 sounds in the pack, not 36/.test(sub[0]!) && /is 34 sounds in the pack, not 35/.test(sub[1]!), "group subtotals are summed from the pack: percussion 37, melodic 34");
+assert(checkTextAgainstPack("**Percussion (37 sounds):** and Melodic (34)", facts).length === 0, "right subtotals pass");
 assert(checkTextAgainstPack("made by isark tag", facts).length === 1, "lowercase isark followed by a space is still flagged");
 assert(checkTextAgainstPack("see isark.net and @isark and ISARK", facts).length === 0, "a url or handle containing isark is not flagged; ISARK is fine");
 assert(checkTextAgainstPack("6 × 808 and 6 × 808 and 6 × 808", facts).length === 0 && checkTextAgainstPack("5 × kick 5 × kick", facts).length === 1, "the same problem is listed once");
