@@ -20,6 +20,8 @@ import {
   startMemoryDreamingSweeper,
   startDesktopLearning,
   startConnectorSync,
+  generateFlowBriefing,
+  worthBriefing,
   registerHook,
   setToolVisibility,
   subscribeToAllEvents,
@@ -268,6 +270,25 @@ async function main(): Promise<void> {
           if (type.startsWith("work.") || type === "watch.created") void checkWatches().catch((err) => console.error("[watchdog]", err instanceof Error ? err.message : err));
         });
   console.log(`[gateway] watchdog ${unwatch ? `on (verifier: ${verifierId()})` : "off (AGENT_OS_WATCHDOG=off)"}`);
+  // When a flow finishes, its lead writes the briefing the operator reads first (flow-briefing.ts).
+  if (process.env.AGENT_OS_FLOW_BRIEFING !== "off") {
+    const writing = new Set<string>();
+    subscribeToAllEvents((type, payload) => {
+      if (type !== "flow.completed") return;
+      const flowId = String(payload.flowId ?? "");
+      if (!flowId || writing.has(flowId) || payload.status === "running") return;
+      writing.add(flowId);
+      void (async () => {
+        try {
+          if (await worthBriefing(flowId)) await generateFlowBriefing(flowId, model);
+        } catch (err) {
+          console.error("[briefing]", err instanceof Error ? err.message : err);
+        } finally {
+          writing.delete(flowId);
+        }
+      })();
+    });
+  }
   // Leads review their team's work when something needs them (review.ts).
   const reviewLoop = process.env.AGENT_OS_REVIEW === "off" ? undefined : startReviewLoop({ model, worker, skills, sandboxPolicy });
   console.log(`[gateway] team reviews ${reviewLoop ? "on" : "off (AGENT_OS_REVIEW=off)"}`);

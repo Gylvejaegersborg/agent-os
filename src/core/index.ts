@@ -46,6 +46,7 @@ export * from "./desktop.js";
 export * from "./desktop-learning.js";
 export * from "./flow-proposals.js";
 export * from "./flow-report.js";
+export * from "./flow-briefing.js";
 export * from "./pack-check.js";
 export * from "./soundgen.js";
 export * from "./soundlab.js";

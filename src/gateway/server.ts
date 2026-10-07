@@ -95,6 +95,8 @@ import {
   flowStepHops,
   completeOverlayTodo,
   reopenOverlayTodo,
+  generateFlowBriefing,
+  getFlowBriefing,
   listApprovals,
   getApproval,
   approveRequest,
@@ -1244,7 +1246,21 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         sendJson(res, 404, { error: `no such flow: ${segments[1]}` });
         return;
       }
-      sendJson(res, 200, report);
+      sendJson(res, 200, { ...report, briefing: (await getFlowBriefing(report.flowId)) ?? null });
+      return;
+    }
+    // Write (or rewrite) the briefing: what to decide, what was done, what was found. One model call by the flow's lead.
+    if (method === "POST" && segments.length === 3 && segments[2] === "briefing") {
+      if (!(await getFlow(segments[1]!))) {
+        sendJson(res, 404, { error: `no such flow: ${segments[1]}` });
+        return;
+      }
+      try {
+        const b = await generateFlowBriefing(segments[1]!, deps.model);
+        sendJson(res, b ? 200 : 500, b ?? { error: "the briefing came back empty" });
+      } catch (err) {
+        sendJson(res, 502, { error: err instanceof Error ? err.message : String(err) });
+      }
       return;
     }
     if (method === "POST" && segments.length === 1) {
