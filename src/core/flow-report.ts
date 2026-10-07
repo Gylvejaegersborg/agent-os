@@ -54,12 +54,12 @@ export interface FlowOutcome {
     agentId: string;
     steps: { id: string; status: string }[];
     notes: { title: string; folder?: string; edited: boolean }[];
-    todos: { title: string; open: boolean }[];
+    todos: { id: string; title: string; open: boolean; answer?: string }[];
     /** The start of what the agent reported, in its own words (not verified). */
     said?: string;
   }[];
   /** What still needs doing: steps that stopped or never ran, a missing verification, and the open todos this flow created. */
-  toDo: { kind: "step" | "review" | "todo"; text: string; detail?: string }[];
+  toDo: { kind: "step" | "review" | "todo"; text: string; detail?: string; todoId?: string }[];
 }
 
 export interface FlowReport {
@@ -130,7 +130,7 @@ async function buildOutcome(steps: FlowReportStep[], verdict: FlowVerdict): Prom
     for (const a of st.attempts) {
       for (const x of a.added) {
         if (x.kind === "note" && liveNotes.has(x.title) && !entry.notes.some((n) => n.title === x.title)) entry.notes.push({ title: x.title, ...(x.folder ? { folder: x.folder } : {}), edited: false });
-        if (x.kind === "todo" && liveTodos.has(x.title) && !entry.todos.some((t) => t.title === x.title)) entry.todos.push({ title: x.title, open: String(liveTodos.get(x.title)!.status) !== "done" });
+        if (x.kind === "todo" && liveTodos.has(x.title) && !entry.todos.some((t) => t.title === x.title)) { const lt = liveTodos.get(x.title)!; entry.todos.push({ id: String(lt.id), title: x.title, open: String(lt.status) !== "done", ...(typeof lt.answer === "string" && lt.answer ? { answer: lt.answer } : {}) }); }
       }
       for (const e of a.edited) {
         const existing = entry.notes.find((n) => n.title === e.note);
@@ -154,7 +154,7 @@ async function buildOutcome(steps: FlowReportStep[], verdict: FlowVerdict): Prom
   else if (verdict.status === "failed") toDo.push({ kind: "review", text: `${verdict.agentId}'s check stopped before it finished`, ...(verdict.error ? { detail: verdict.error } : {}) });
 
   const all = [...agents.values()];
-  for (const a of all) for (const t of a.todos) if (t.open) toDo.push({ kind: "todo", text: t.title, detail: `added by ${a.agentId}` });
+  for (const a of all) for (const t of a.todos) if (t.open) toDo.push({ kind: "todo", text: t.title, detail: `added by ${a.agentId}`, todoId: t.id });
 
   const done = steps.filter((x) => x.status === "succeeded").length;
   const notes = all.reduce((n, a) => n + a.notes.length, 0);

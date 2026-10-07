@@ -271,6 +271,8 @@ export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
       goalId: { type: "string", description: "For a todo: the goal it serves." },
       text: { type: "string", description: "The project update." },
       id: { type: "string", description: "Editing a note: its id." },
+      doneWhenNote: { type: "string", description: "Todo that completes itself: the exact title of a note." },
+      doneWhenGone: { type: "string", description: "...done once this exact text, e.g. [email], is no longer in that note." },
       edit: {
         type: "array",
         description: "Changes to a note you wrote: find is copied exactly from it and appears once; replace may be empty.",

@@ -93,6 +93,8 @@ import {
   reopenFlow,
   markStepDone,
   flowStepHops,
+  completeOverlayTodo,
+  reopenOverlayTodo,
   listApprovals,
   getApproval,
   approveRequest,
@@ -693,6 +695,19 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         // DB already merges `library` from here.
         const overlay = await loadOverlay();
         sendJson(res, 200, { ...overlay, library: [...(Array.isArray(overlay.library) ? overlay.library : []), ...(await listSongAssets())] });
+        return;
+      }
+      // The operator completes (optionally with an answer) or reopens an agent's todo.
+      if (method === "POST" && segments.length === 5 && segments[2] === "tasks" && (segments[4] === "complete" || segments[4] === "reopen")) {
+        const id = decodeURIComponent(segments[3]!);
+        if (segments[4] === "reopen") {
+          const ok = await reopenOverlayTodo(id);
+          sendJson(res, ok ? 200 : 404, ok ? { ok: true } : { error: `no todo ${id}` });
+          return;
+        }
+        const body = await readRequestBody(req);
+        const done = await completeOverlayTodo(id, { answer: typeof body.answer === "string" ? body.answer : undefined });
+        sendJson(res, done.ok ? 200 : 404, done.ok ? done.todo : { error: done.error });
         return;
       }
       if (method === "DELETE" && segments.length === 4) {

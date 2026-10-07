@@ -69,6 +69,8 @@ export async function saveSnapshot(body: unknown): Promise<{ savedAt: string; by
   if (text.length > MAX_SNAPSHOT_BYTES) throw new Error(`snapshot too large (${text.length} bytes)`);
   await writeAtomic(SNAPSHOT, text);
   await publishEvent("basespace.snapshot.updated", { bytes: text.length });
+  // What the operator did in BaseSpace since (ticked a todo, edited a note) is brought back into the overlay.
+  await reconcileFromSnapshot(body as Record<string, any>).catch(() => undefined);
   return { savedAt: new Date().toISOString(), bytes: text.length };
 }
 
@@ -104,7 +106,15 @@ export async function readSnapshotSection(section: string, opts: { query?: strin
     if (!src) return have;
     const live = new Map(src.map((i) => [i.id, i]));
     const haveIds = new Set(have.map((i) => i.id));
-    const kept = have.filter((i) => !String(i.id).startsWith("agent-") || live.has(i.id)).map((i) => live.get(i.id) ?? i);
+    const pick = (snapItem: any): any => {
+      const mine = live.get(snapItem.id);
+      if (!mine) return snapItem;
+      // A note the operator edited in BaseSpace after the agent wrote it is newer than the overlay's copy: theirs is read.
+      if (key === "notes") return Date.parse(String(snapItem.updated ?? "")) > Date.parse(String(mine.updated ?? "")) && typeof snapItem.body === "string" ? { ...mine, ...snapItem } : mine;
+      // A todo done on either side (ticked in BaseSpace, or completed through the gateway) is done.
+      return snapItem.status === "done" && mine.status !== "done" ? { ...mine, status: "done" } : mine;
+    };
+    const kept = have.filter((i) => !String(i.id).startsWith("agent-") || live.has(i.id)).map(pick);
     return [...kept, ...src.filter((i) => !haveIds.has(i.id))];
   };
 
@@ -375,6 +385,8 @@ export async function addOverlayItem(kind: OverlayKind, args: Record<string, unk
       ...(due ? { due } : {}),
       ...(hours(args.time) != null ? { dueTime: hours(args.time), notify: true } : {}),
       notes: `${str("notes")}${str("notes") ? " " : ""}(added by ${cap1(agentId)})`,
+      // Completes itself when the operator updates a note: it is done once `doneWhenGone` no longer appears in the note `doneWhenNote`.
+      ...(str("doneWhenNote") && str("doneWhenGone") ? { doneWhen: { note: str("doneWhenNote"), gone: str("doneWhenGone"), armed: false } } : {}),
       ...((str("projectId") || links.projectId) ? { projectId: str("projectId") || links.projectId } : {}),
       ...((str("goalId") || links.goalId) ? { goalId: str("goalId") || links.goalId } : {}),
     });
@@ -395,6 +407,87 @@ export async function addOverlayItem(kind: OverlayKind, args: Record<string, unk
     return { ok: true, output: `Posted an update on project ${projectId}.` };
   }
   return { ok: false, output: "", error: `unknown kind "${kind}" — use note, todo or project-update` };
+}
+
+/** The operator completes an agent's todo (POST /basespace/overlay/tasks/:id/complete). `answer` is what they decided, when the todo
+ *  was a question: it is kept on the todo, so the agents that read it later know the answer, not only that it is done. */
+export async function completeOverlayTodo(id: string, opts: { answer?: string; auto?: boolean; reason?: string } = {}): Promise<{ ok: boolean; todo?: Record<string, unknown>; error?: string }> {
+  const o = await loadOverlay();
+  const todo = o.tasks.find((t) => t.id === id);
+  if (!todo) return { ok: false, error: `no todo ${id}` };
+  const answer = (opts.answer ?? "").trim().slice(0, 4000);
+  Object.assign(todo, {
+    status: "done",
+    completedAt: new Date().toISOString(),
+    completedBy: opts.auto ? "auto" : "operator",
+    ...(answer ? { answer } : {}),
+    ...(opts.reason ? { completedBecause: opts.reason } : {}),
+  });
+  if (todo.doneWhen) delete todo.doneWhen;
+  await saveOverlay(o);
+  await publishEvent("basespace.todo.completed", { id, title: todo.title, ...(answer ? { answer } : {}), auto: !!opts.auto, ...(opts.reason ? { reason: opts.reason } : {}) });
+  return { ok: true, todo };
+}
+
+export async function reopenOverlayTodo(id: string): Promise<boolean> {
+  const o = await loadOverlay();
+  const todo = o.tasks.find((t) => t.id === id);
+  if (!todo) return false;
+  Object.assign(todo, { status: "todo" });
+  for (const k of ["completedAt", "completedBy", "answer", "completedBecause"]) delete todo[k];
+  await saveOverlay(o);
+  return true;
+}
+
+/** Brings the operator's changes in BaseSpace back into the overlay: a todo they ticked there is done here too, and a todo that
+ *  completes when a note changes is completed (with a notification event) once the text it waits on is gone from that note. */
+export async function reconcileFromSnapshot(snap: Record<string, any>): Promise<void> {
+  const o = await loadOverlay();
+  const snapTodos: any[] = Array.isArray(snap.todos) ? snap.todos : [];
+  const snapNotes: any[] = Array.isArray(snap.notes) ? snap.notes : [];
+  const pending: { id: string; reason?: string; auto: boolean }[] = [];
+  for (const t of o.tasks) {
+    if (t.status === "done") continue;
+    const ticked = snapTodos.find((s) => s.id === t.id && s.status === "done");
+    if (ticked) {
+      pending.push({ id: String(t.id), auto: false });
+      continue;
+    }
+    const w = t.doneWhen as { note: string; gone: string; armed?: boolean } | undefined;
+    if (!w) continue;
+    const body = currentNoteBody(w.note, snapNotes, o.notes);
+    if (body === undefined) continue; // the note is not there (yet): nothing to judge
+    if (!w.armed) {
+      // Armed only once the text has been seen in the note, so a todo can't complete before the note ever held it.
+      if (body.includes(w.gone)) {
+        w.armed = true;
+        await saveOverlay(o);
+      }
+    } else if (!body.includes(w.gone)) pending.push({ id: String(t.id), auto: true, reason: `"${w.gone}" is no longer in the note "${w.note}"` });
+  }
+  for (const p of pending) {
+    if (p.auto) await completeOverlayTodo(p.id, { auto: true, reason: p.reason });
+    else {
+      // Ticked in BaseSpace: record it, without announcing it back to the person who did it.
+      const fresh = await loadOverlay();
+      const t = fresh.tasks.find((x) => x.id === p.id);
+      if (t && t.status !== "done") {
+        Object.assign(t, { status: "done", completedAt: new Date().toISOString(), completedBy: "operator" });
+        delete t.doneWhen;
+        await saveOverlay(fresh);
+      }
+    }
+  }
+}
+
+/** The newest text of a note by title: the operator's edit in BaseSpace if it is newer than the agent's version. */
+function currentNoteBody(title: string, snapNotes: any[], overlayNotes: Record<string, unknown>[]): string | undefined {
+  const a = snapNotes.find((n) => n.title === title && typeof n.body === "string");
+  const b = overlayNotes.find((n) => n.title === title);
+  if (a && b) return Date.parse(String(a.updated ?? "")) > Date.parse(String(b.updated ?? "")) ? String(a.body) : String(b.body ?? "");
+  if (a) return String(a.body);
+  if (b) return String(b.body ?? "");
+  return undefined;
 }
 
 /** Removes one agent-added item (DELETE /basespace/overlay/:kind/:id). */
