@@ -50,6 +50,7 @@
 
 import { createFlow, getFlow, getTask, reopenFlow, updateFlowStep, createTask, transitionTask } from "./tasks.js";
 import { flowStepExecutions, runTurn } from "./agent-loop.js";
+import { checkAgentNotesSince } from "./pack-check.js";
 import { createSession, linkSessionWork } from "./session.js";
 import type { SessionFocus } from "./types.js";
 import { createModelForAgent } from "./models/real.js";
@@ -76,6 +77,8 @@ export interface FlowStepDefinition {
    *  dependents). Default 0 — fail fast, matching every other primitive
    *  in this codebase's "don't retry silently unless asked" posture. */
   retries?: number;
+  /** A check run by code after the step: "pack-facts" compares the counts in the notes the agent wrote to the latest built pack (pack-check.ts). Up to 2 correction rounds, then the step fails with the list. */
+  check?: "pack-facts";
 }
 
 export interface DriveFlowOptions {
@@ -241,21 +244,44 @@ async function runStepOnce(
     // is linked to the step's task so stale-work detection sees its activity.
     const session = await createSession({ agentId: step.agentId, title: `Flow step: ${step.id}`, ...(focus ? { focus } : {}) });
     await linkSessionWork(session.id, { taskId: task.id, flowId });
-    const result = await runTurn({
-      sessionId: session.id,
-      agentId: step.agentId,
-      userMessage: step.goal + retryNote + (await upstreamResults(flowId, step)),
-      model,
-      worker: opts.worker,
-      skills: opts.skills,
-      maxToolHops: opts.maxToolHopsPerStep,
-      maxToolExecutions: opts.maxToolExecutionsPerStep ?? flowStepExecutions(),
-      enableSubagents: opts.enableSubagents,
-      enableMemoryNominations: opts.enableMemoryNominations,
-      enableArtifacts: opts.enableArtifacts,
-      enableBaseSpace: opts.enableBaseSpace,
-      sandboxPolicy: opts.sandboxPolicy,
-    });
+    const turn = (userMessage: string) =>
+      runTurn({
+        sessionId: session.id,
+        agentId: step.agentId,
+        userMessage,
+        model,
+        worker: opts.worker,
+        skills: opts.skills,
+        maxToolHops: opts.maxToolHopsPerStep,
+        maxToolExecutions: opts.maxToolExecutionsPerStep ?? flowStepExecutions(),
+        enableSubagents: opts.enableSubagents,
+        enableMemoryNominations: opts.enableMemoryNominations,
+        enableArtifacts: opts.enableArtifacts,
+        enableBaseSpace: opts.enableBaseSpace,
+        sandboxPolicy: opts.sandboxPolicy,
+      });
+    const startedAt = new Date().toISOString();
+    let result = await turn(step.goal + retryNote + (await upstreamResults(flowId, step)));
+    // A check done by code: what the agent saved is compared to the facts. Wrong numbers go back to the agent as an exact list
+    // (up to 2 rounds); if they are still wrong the step FAILS with the list, whatever the agent's report says.
+    if (step.check === "pack-facts" && result.stopReason === "answered") {
+      let bad = await checkAgentNotesSince(step.agentId, startedAt);
+      for (let round = 0; round < 2 && bad.length; round++) {
+        const list = bad.map((b) => `Note "${b.note}":\n${b.problems.map((p) => `  - ${p}`).join("\n")}`).join("\n");
+        result = await turn(
+          `A check run by code (not an opinion) compared the notes you just saved to the pack and found:\n${list}\n` +
+            "Fix exactly these: use basespace-add with the note's title and edit [{find, replace}], changing only the wrong text. Do not rewrite whole notes. Then say which lines you changed.",
+        );
+        if (result.stopReason !== "answered") break;
+        bad = await checkAgentNotesSince(step.agentId, startedAt);
+      }
+      if (bad.length) {
+        const error = `the fact check still fails: ${bad.map((b) => `${b.note}: ${b.problems.join("; ")}`).join(" | ")}`;
+        await transitionTask(task.id, "failed", { output: { error, finalContent: result.finalContent, sessionId: session.id } });
+        await publishEvent("flow.step.completed", { flowId, stepId: step.id, agentId: step.agentId, taskId: task.id, status: "failed", error });
+        return { status: "failed", taskId: task.id, finalContent: result.finalContent };
+      }
+    }
     // A step that ran out of tool steps didn't finish its work: say so instead of reporting success.
     if (result.stopReason === "max-hops") {
       const error = "the agent ran out of tool steps before finishing (raise AGENT_OS_FLOW_STEP_HOPS, or split the step)";

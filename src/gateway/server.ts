@@ -233,11 +233,12 @@ function parseFlowSteps(raw: unknown): FlowStepDefinition[] | undefined {
   const steps: FlowStepDefinition[] = [];
   for (const s of raw) {
     if (typeof s !== "object" || s === null) return undefined;
-    const { id, agentId, goal, dependsOn, retries } = s as Record<string, unknown>;
+    const { id, agentId, goal, dependsOn, retries, check } = s as Record<string, unknown>;
     if (typeof id !== "string" || typeof agentId !== "string" || typeof goal !== "string") return undefined;
     if (dependsOn !== undefined && !(Array.isArray(dependsOn) && dependsOn.every((d) => typeof d === "string"))) return undefined;
     if (retries !== undefined && typeof retries !== "number") return undefined;
-    steps.push({ id, agentId, goal, dependsOn: dependsOn as string[] | undefined, retries: retries as number | undefined });
+    if (check !== undefined && check !== "pack-facts") return undefined;
+    steps.push({ id, agentId, goal, dependsOn: dependsOn as string[] | undefined, retries: retries as number | undefined, ...(check ? { check: "pack-facts" as const } : {}) });
   }
   return steps;
 }

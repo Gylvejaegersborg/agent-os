@@ -72,6 +72,7 @@
     "test-connectors": "tsc -b && node dist/test-connectors.js",
     "test-flow-resume": "tsc -b && node dist/test-flow-resume.js",
     "test-note-edit": "tsc -b && node dist/test-note-edit.js",
+    "test-pack-check": "tsc -b && node dist/test-pack-check.js",
     "test-multicall": "tsc -b && node dist/test-multicall.js",
     "test-terminal-shell": "tsc -b && node dist/test-terminal-shell.js"
   },
