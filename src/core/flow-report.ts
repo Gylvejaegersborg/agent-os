@@ -7,6 +7,7 @@ import { getFlowDefinition } from "./flow-proposals.js";
 import { getSessionUsage } from "./agent-loop.js";
 import { readStream } from "./eventlog.js";
 import { verifierId } from "./watchdog.js";
+import { loadOverlay } from "./basespace.js";
 import type { Task } from "./types.js";
 
 export interface FlowReportAttempt {
@@ -45,7 +46,24 @@ export interface FlowVerdict {
   error?: string;
 }
 
+/** The direct summary of a flow: what each agent did, and what is left to do. Built by code from the records (not written by a model),
+ *  and checked against the live BaseSpace overlay, so a note or todo that has since been deleted is not listed. */
+export interface FlowOutcome {
+  headline: string;
+  byAgent: {
+    agentId: string;
+    steps: { id: string; status: string }[];
+    notes: { title: string; folder?: string; edited: boolean }[];
+    todos: { title: string; open: boolean }[];
+    /** The start of what the agent reported, in its own words (not verified). */
+    said?: string;
+  }[];
+  /** What still needs doing: steps that stopped or never ran, a missing verification, and the open todos this flow created. */
+  toDo: { kind: "step" | "review" | "todo"; text: string; detail?: string }[];
+}
+
 export interface FlowReport {
+  outcome: FlowOutcome;
   verdict: FlowVerdict;
   flowId: string;
   title?: string;
@@ -92,6 +110,63 @@ async function attemptOf(task: Task): Promise<FlowReportAttempt> {
   return attempt;
 }
 
+const oneLine = (text: string, n = 260) => {
+  const t = text.replace(/\s+/g, " ").trim();
+  return t.length > n ? `${t.slice(0, n)}…` : t;
+};
+
+async function buildOutcome(steps: FlowReportStep[], verdict: FlowVerdict): Promise<FlowOutcome> {
+  const overlay = await loadOverlay();
+  const liveNotes = new Map(overlay.notes.map((n) => [String(n.title ?? ""), n]));
+  const liveTodos = new Map(overlay.tasks.map((t) => [String(t.title ?? ""), t]));
+  const agents = new Map<string, FlowOutcome["byAgent"][number]>();
+  const toDo: FlowOutcome["toDo"] = [];
+
+  for (const st of steps) {
+    const agentId = st.agentId ?? "?";
+    const entry = agents.get(agentId) ?? { agentId, steps: [], notes: [], todos: [] };
+    agents.set(agentId, entry);
+    entry.steps.push({ id: st.id, status: st.status });
+    for (const a of st.attempts) {
+      for (const x of a.added) {
+        if (x.kind === "note" && liveNotes.has(x.title) && !entry.notes.some((n) => n.title === x.title)) entry.notes.push({ title: x.title, ...(x.folder ? { folder: x.folder } : {}), edited: false });
+        if (x.kind === "todo" && liveTodos.has(x.title) && !entry.todos.some((t) => t.title === x.title)) entry.todos.push({ title: x.title, open: String(liveTodos.get(x.title)!.status) !== "done" });
+      }
+      for (const e of a.edited) {
+        const existing = entry.notes.find((n) => n.title === e.note);
+        if (existing) existing.edited = true;
+        else if (liveNotes.has(e.note)) entry.notes.push({ title: e.note, edited: true });
+      }
+    }
+    const last = [...st.attempts].reverse().find((a) => a.status === "succeeded") ?? st.attempts.at(-1);
+    if (last?.result && st.status === "succeeded") entry.said = [entry.said, `${st.id}: ${oneLine(last.result)}`].filter(Boolean).join("  ·  ");
+
+    const err = st.attempts.at(-1)?.error;
+    if (["failed", "timed_out", "lost"].includes(st.status)) toDo.push({ kind: "step", text: `Step "${st.id}" (${agentId}) stopped before it finished`, ...(err ? { detail: err } : {}) });
+    else if (st.status === "cancelled") toDo.push({ kind: "step", text: `Step "${st.id}" (${agentId}) did not run`, detail: "a step it depends on did not finish, or the flow was cancelled" });
+    else if (st.status === "queued") toDo.push({ kind: "step", text: `Step "${st.id}" (${agentId}) has not started` });
+    else if (st.status === "running") toDo.push({ kind: "step", text: `Step "${st.id}" (${agentId}) is still running` });
+  }
+
+  if (verdict.status === "not-run") toDo.push({ kind: "review", text: "Nobody has verified this flow", detail: `it has no step for ${verdict.agentId}` });
+  else if (verdict.status === "waiting") toDo.push({ kind: "review", text: `${verdict.agentId}'s check is waiting for the steps before it` });
+  else if (verdict.status === "running") toDo.push({ kind: "review", text: `${verdict.agentId} is checking now` });
+  else if (verdict.status === "failed") toDo.push({ kind: "review", text: `${verdict.agentId}'s check stopped before it finished`, ...(verdict.error ? { detail: verdict.error } : {}) });
+
+  const all = [...agents.values()];
+  for (const a of all) for (const t of a.todos) if (t.open) toDo.push({ kind: "todo", text: t.title, detail: `added by ${a.agentId}` });
+
+  const done = steps.filter((x) => x.status === "succeeded").length;
+  const notes = all.reduce((n, a) => n + a.notes.length, 0);
+  const todos = all.reduce((n, a) => n + a.todos.length, 0);
+  const open = all.reduce((n, a) => n + a.todos.filter((t) => t.open).length, 0);
+  return {
+    headline: `${done} of ${steps.length} steps done · ${notes} note${notes === 1 ? "" : "s"} written or changed · ${todos} todo${todos === 1 ? "" : "s"} created (${open} still open)`,
+    byAgent: all,
+    toDo,
+  };
+}
+
 export async function buildFlowReport(flowId: string): Promise<FlowReport | undefined> {
   const flow = await getFlow(flowId);
   if (!flow) return undefined;
@@ -134,6 +209,7 @@ export async function buildFlowReport(flowId: string): Promise<FlowReport | unde
           : { agentId: verifier, stepId: vStep.id, status: "failed", ...(vAttempt?.error ? { error: vAttempt.error } : {}), ...(vAttempt?.result ? { text: vAttempt.result } : {}) };
   return {
     flowId,
+    outcome: await buildOutcome(steps, verdict),
     verdict,
     ...(flow.title ? { title: flow.title } : {}),
     status: flow.status,

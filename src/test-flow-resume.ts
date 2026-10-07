@@ -8,7 +8,7 @@
 // Run with: node dist/test-flow-resume.js
 
 import "./test-helpers/isolate.js";
-import { markStepDone, flowStepExecutions, storeFlowDefinition, buildFlowReport, createArtifact, recordFileRevision, subscribeToEvent, cancelFlow, createFlow, createStubWorker, getFlow, reopenFlow, resumeFlow, runFlow, seedDefaultAgents, type ModelAdapter, type ModelResponse } from "./core/index.js";
+import { addOverlayItem, markStepDone, flowStepExecutions, storeFlowDefinition, buildFlowReport, createArtifact, recordFileRevision, subscribeToEvent, cancelFlow, createFlow, createStubWorker, getFlow, reopenFlow, resumeFlow, runFlow, seedDefaultAgents, type ModelAdapter, type ModelResponse } from "./core/index.js";
 
 let failed = false;
 function assert(cond: boolean, msg: string): void {
@@ -135,6 +135,20 @@ assert((await getFlow(mf.flowId))!.status === "succeeded" && goals.length === 1 
 busy = true;
 const mf2 = await runFlow(ms, opts);
 assert(await markStepDone(mf2.flowId, ["p", "nope"], ms, opts).then(() => false, () => true) && (await getFlow(mf2.flowId))!.status === "failed", "one unknown step in the list changes nothing");
+
+// the outcome: what each agent did, and what is left
+await storeFlowDefinition({ flowId: mf2.flowId, proposedBy: "hemera", summary: "m", steps: ms });
+const oc = (await buildFlowReport(mf2.flowId))!.outcome;
+assert(/1 of 4 steps done/.test(oc.headline) && oc.byAgent.map((a) => a.agentId).sort().join() === "aether,argus,hermes,nyx", "the outcome says how many steps are done and lists every agent");
+assert(oc.toDo.some((t) => /Step "p" \(nyx\) stopped/.test(t.text) && /tool steps/.test(t.detail ?? "")) && oc.toDo.some((t) => /Step "check" \(argus\) did not run/.test(t.text)), "what is left: the stopped steps with the reason, and the step that never ran");
+assert(oc.toDo.some((t) => t.kind === "review" && /waiting/.test(t.text)), "…and that the verifier is still waiting");
+const oFlow = await runFlow([{ id: "w", agentId: "hermes", goal: "WRITE: note and todo" }], { model: { id: "w", async complete(msgs): Promise<ModelResponse> { return msgs[msgs.length - 1]!.role === "tool" ? { content: "wrote them" } : { content: "", toolCalls: [{ name: "basespace-add", args: { kind: "note", title: "Outcome note", body: "x" } }, { name: "basespace-add", args: { kind: "todo", title: "Outcome todo" } }], toolCall: { name: "basespace-add", args: { kind: "note", title: "Outcome note", body: "x" } } }; } }, worker: createStubWorker(), enableBaseSpace: true, maxToolHopsPerStep: 4 });
+const ow = (await buildFlowReport(oFlow.flowId))!.outcome.byAgent.find((a) => a.agentId === "hermes")!;
+assert(ow.notes.some((n) => n.title === "Outcome note") && ow.todos.some((t) => t.title === "Outcome todo" && t.open) && (await buildFlowReport(oFlow.flowId))!.outcome.toDo.some((t) => t.kind === "todo" && t.text === "Outcome todo"), "notes and todos an agent wrote are listed, and an open todo is something still to do");
+const { removeOverlayItem } = await import("./core/index.js");
+const todoId = (await (await import("./core/index.js")).loadOverlay()).tasks.find((t) => t.title === "Outcome todo")!.id as string;
+await removeOverlayItem("todo", todoId);
+assert(!(await buildFlowReport(oFlow.flowId))!.outcome.toDo.some((t) => t.text === "Outcome todo"), "a todo deleted since is no longer listed");
 
 console.log(failed ? "\nSome flow-resume tests FAILED." : "\nAll flow-resume tests passed.");
 process.exit(failed ? 1 : 0);
