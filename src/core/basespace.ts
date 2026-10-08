@@ -211,7 +211,7 @@ function renderFocus(snap: Record<string, any>, focus: SessionFocus): string {
     const p = list("projects").find((x) => x.id === focus.id);
     if (!p) return `# What this work serves\nThis conversation is about project "${focus.id}", which isn't in BaseSpace's latest snapshot.`;
     const tagline = p.tagline ? ` — ${String(p.tagline).replace(/[.!?]+$/, "")}` : "";
-    lines.push(`This conversation is about the project "${p.name}" (${p.status}, ${p.progress}%)${tagline}.`);
+    lines.push(`This conversation is about the project "${p.name}" (${p.status})${tagline}.`);
     if (p.nextMoves?.length) lines.push(`Next moves:\n${p.nextMoves.slice(0, 5).map((m: string) => `- ${m}`).join("\n")}`);
     if (p.recent?.length) lines.push(`Recently:\n${p.recent.slice(0, 3).map((r: any) => `- ${String(r.date).slice(0, 10)}: ${r.text}`).join("\n")}`);
     const serves = (p.goalIds ?? []) as string[];
@@ -232,7 +232,7 @@ function renderFocus(snap: Record<string, any>, focus: SessionFocus): string {
     const projects = list("projects").filter((p) => (g.projectIds ?? []).includes(p.id));
     if (projects.length) {
       lines.push(
-        `Its projects:\n${projects.map((p) => `- "${p.name}" (${p.status}, ${p.progress}%, id ${p.id})${p.nextMoves?.length ? ` — next: ${p.nextMoves.slice(0, 3).join("; ")}` : ""}`).join("\n")}`,
+        `Its projects:\n${projects.map((p) => `- "${p.name}" (${p.status}, id ${p.id})${p.nextMoves?.length ? ` — next: ${p.nextMoves.slice(0, 3).join("; ")}` : ""}`).join("\n")}`,
       );
     } else lines.push("No projects are linked to it yet.");
     const subGoals = list("goals").filter((x) => x.parentId === g.id);

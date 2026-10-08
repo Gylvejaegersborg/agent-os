@@ -90,14 +90,14 @@ async function testReading(): Promise<void> {
 
 async function testFocusContext(): Promise<void> {
   const p = await focusContext({ kind: "project", id: "p-switch" });
-  assert(p.includes('the project "Switch release" (active, 60%)') && p.includes("- Master the single"), "project focus: name, status and next moves");
-  assert(p.includes('It serves the goal "Release Switch in October", target 2026-10-30, 60% across its projects — why: First single of the new era'), "project focus: the goal it serves, with why and target");
+  assert(p.includes('the project "Switch release" (active)') && p.includes("- Master the single"), "project focus: name, status and next moves");
+  assert(p.includes('It serves the goal "Release Switch in October", target 2026-10-30 — why: First single of the new era'), "project focus: the goal it serves, with why and target");
   assert(p.includes('which serves "Grow ISΛRK as an artist"'), "project focus: up the chain to the top goal");
   assert(p.includes('"Mixing checklist" (id n-mix)'), "project focus: linked notes with ids");
   assert(p.includes("Send stems to mastering") && !p.includes("Old done thing") && !p.includes("Unrelated chore"), "project focus: only its open todos");
 
   const g = await focusContext({ kind: "goal", id: "g-switch" });
-  assert(g.includes('the goal "Release Switch in October"') && g.includes('"Switch release" (active, 60%, id p-switch) — next: Master the single'), "goal focus: its projects and their next moves");
+  assert(g.includes('the goal "Release Switch in October"') && g.includes('"Switch release" (active, id p-switch) — next: Master the single'), "goal focus: its projects and their next moves");
   assert(g.includes("Pick a release date") && g.includes("in progress") && g.includes("Send stems to mastering"), "goal focus: its own todos and its projects' todos");
   const top = await focusContext({ kind: "goal", id: "g-grow" });
   assert(top.includes("Sub-goals:") && top.includes("Release Switch in October") && top.includes('"Artist vision"'), "top goal: sub-goals and linked notes");
