@@ -174,7 +174,7 @@ async function problems(dir: string | undefined): Promise<OpsProblem[]> {
       // "2026-10-08T00:50:11 gateway exited (code ) - restarting": local time, as the supervisor wrote it.
       const m = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\s+(.*(?:exited|restarting|failed|stopped).*)$/i.exec(l);
       const when = m ? new Date(m[1]!).toISOString() : undefined;
-      if (m && recent(when)) out.push({ id: `sup:${l}`, kind: "supervisor", severity: "warn", when: when!, source: "supervisor", text: m[2]! });
+      if (m && recent(when)) out.push({ id: `sup:${l}`, kind: "supervisor", severity: "info", when: when!, source: "supervisor", text: m[2]! });
     }
     const errFile = path.join(dir, "gateway.err.log");
     const st = await fs.stat(errFile).catch(() => undefined);
