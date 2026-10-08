@@ -134,11 +134,11 @@ export async function readSnapshotSection(section: string, opts: { query?: strin
       },
       overdueOrDueThisWeek: openTodos.filter((t) => t.due && t.due.slice(0, 10) <= soon).map((t) => ({ id: t.id, title: t.title, due: t.due, priority: t.priority })),
       eventsThisWeek: list("events").filter((e) => e.date >= today && e.date <= soon).map((e) => ({ title: e.title, date: e.date, start: e.start })),
-      activeProjects: list("projects").filter((p) => p.status === "active").map((p) => ({ id: p.id, name: p.name, progress: p.progress, nextMoves: p.nextMoves })),
+      activeProjects: list("projects").filter((p) => p.status === "active").map((p) => ({ id: p.id, name: p.name, nextMoves: p.nextMoves })),
       teams: list("teams"),
       activeGoals: list("goals")
         .filter((g) => g.status === "active")
-        .map((g) => ({ id: g.id, title: g.title, why: g.why, target: g.target, progress: g.progress, projects: (g.projectIds ?? []).map((id: string) => nameOf(snap, "project", id)) })),
+        .map((g) => ({ id: g.id, title: g.title, why: g.why, target: g.target, projects: (g.projectIds ?? []).map((id: string) => nameOf(snap, "project", id)) })),
     };
     return { ok: true, output: cap(`${header}\n${JSON.stringify(out)}`) };
   }
@@ -198,7 +198,7 @@ function goalChainOf(snap: Record<string, any>, goalId: string | undefined): any
 }
 
 const goalLine = (g: any) =>
-  `"${g.title}"${g.status && g.status !== "active" ? ` (${g.status})` : ""}${g.target ? `, target ${g.target}` : ""}${typeof g.progress === "number" ? `, ${g.progress}% across its projects` : ""}${g.why ? ` — why: ${g.why}` : ""}`;
+  `"${g.title}"${g.status && g.status !== "active" ? ` (${g.status})` : ""}${g.target ? `, target ${g.target}` : ""}${g.why ? ` — why: ${g.why}` : ""}`;
 
 function renderFocus(snap: Record<string, any>, focus: SessionFocus): string {
   const list = (k: string): any[] => (Array.isArray(snap[k]) ? snap[k] : []);

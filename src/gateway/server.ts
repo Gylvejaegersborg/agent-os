@@ -157,6 +157,7 @@ import type { ConfiguredHook } from "../core/configured-hooks.js";
 import { handleMcp, type McpDeps } from "./mcp.js";
 import { handleLibrary } from "./library-routes.js";
 import { handleSoundlab } from "./soundlab-routes.js";
+import { buildOps } from "./ops.js";
 import { listSongAssets } from "../core/library.js";
 import type { SessionFocus } from "../core/types.js";
 import { closeAllTerminals, closeTerminal, setTerminalGatewayUrl, createTerminal, listTerminals, ptyBackend, resizeTerminal, streamTerminal, terminalsEnabled, writeTerminal } from "./terminal.js";
@@ -1239,6 +1240,12 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
   }
 
   // ---- Flows ----
+  // ---- Ops: the machine, the services, devices, problems and logs, all real (ops.ts) ----
+  if (segments[0] === "ops" && method === "GET" && segments.length === 1) {
+    sendJson(res, 200, await buildOps());
+    return;
+  }
+
   if (segments[0] === "flows") {
     if (method === "GET" && segments.length === 1) {
       sendJson(res, 200, { flows: await listFlows() });
