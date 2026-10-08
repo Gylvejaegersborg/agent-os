@@ -95,6 +95,7 @@ import {
   flowStepHops,
   completeOverlayTodo,
   reopenOverlayTodo,
+  openAgentTodos,
   generateFlowBriefing,
   getFlowBriefing,
   listApprovals,
@@ -690,6 +691,21 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         else sendJson(res, 200, snap);
         return;
       }
+    }
+    // GET /basespace/needs-you: everything waiting on the operator, in one answer: pending approvals and the open todos agents created (with the flow each came from).
+    if (segments[1] === "needs-you" && method === "GET" && segments.length === 2) {
+      const approvals = (await listApprovals({ status: "pending" })).map((a) => ({ id: a.id, agentId: a.agentId, toolName: a.toolName, requestedAt: a.requestedAt, summary: JSON.stringify(a.args).slice(0, 140) }));
+      const todos = await openAgentTodos();
+      const flowTitles = new Map<string, string>();
+      for (const t of todos) {
+        if (t.flowId && !flowTitles.has(t.flowId)) flowTitles.set(t.flowId, (await getFlow(t.flowId))?.title ?? (await getFlowDefinition(t.flowId))?.title ?? t.flowId.slice(0, 8));
+      }
+      sendJson(res, 200, {
+        total: approvals.length + todos.length,
+        approvals,
+        todos: todos.map((t) => ({ ...t, ...(t.flowId ? { flowTitle: flowTitles.get(t.flowId) } : {}) })),
+      });
+      return;
     }
     if (segments[1] === "overlay") {
       if (method === "GET" && segments.length === 2) {

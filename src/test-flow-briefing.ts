@@ -115,6 +115,10 @@ setPackFactsSource(undefined);
 const small = await runFlow([{ id: "only", agentId: "nyx", goal: "B: one small thing" }], { model: doing, worker: createStubWorker(), enableBaseSpace: true, maxToolHopsPerStep: 3 });
 assert((await worthBriefing(small.flowId)) === false && (await worthBriefing(flow.flowId)) === true, "a small clean flow does not get a briefing; one with 4 steps and a todo left does");
 
+// --- 4b. the flow that made a todo is recorded, and "needs you" lists it ------------------------------------------
+const mine = (await loadOverlay()).tasks.find((t) => /Final pack name/.test(String(t.title)))!;
+assert(mine.flowId === flow.flowId && typeof mine.createdAt === "string", "a todo made inside a flow step records the flow it came from");
+
 // --- 5. routes -------------------------------------------------------------------------------------------------
 const gateway = await startGateway({ model: createStubModel(), worker: createStubWorker() });
 const base = `http://127.0.0.1:${gateway.port}`;
@@ -123,6 +127,12 @@ try {
   assert(r.status === 200 && typeof ((await r.json()) as { text?: string }).text === "string", "POST /flows/:id/briefing writes one");
   const rep = (await (await fetch(`${base}/flows/${flow.flowId}/report`)).json()) as { briefing?: { text?: string; by?: string } };
   assert(typeof rep.briefing?.text === "string" && rep.briefing.by === "hemera", "GET /flows/:id/report carries it");
+  const ny = (await (await fetch(`${base}/basespace/needs-you`)).json()) as { total: number; approvals: unknown[]; todos: { title: string; flowId?: string; flowTitle?: string; priority: string }[] };
+  const nt = ny.todos.find((t) => /Final pack name/.test(t.title));
+  assert(!!nt && nt.flowId === flow.flowId && nt.flowTitle === "Salient launch prep" && ny.total === ny.approvals.length + ny.todos.length, "GET /basespace/needs-you lists the open todos with the flow (and its title) they came from");
+  await completeOverlayTodo(mine.id as string, { answer: "x" });
+  const ny2 = (await (await fetch(`${base}/basespace/needs-you`)).json()) as { todos: { title: string }[] };
+  assert(!ny2.todos.some((t) => /Final pack name/.test(t.title)), "…and a completed one is no longer listed");
   assert((await fetch(`${base}/flows/nope/briefing`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).status === 404, "an unknown flow is a 404");
 } finally {
   await gateway.stop();

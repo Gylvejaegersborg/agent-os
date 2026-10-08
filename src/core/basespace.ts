@@ -337,7 +337,7 @@ async function editOwnNote(o: Overlay, args: Record<string, unknown>, agentId: s
 }
 
 /** What the `basespace-add` tool does. */
-export async function addOverlayItem(kind: OverlayKind, args: Record<string, unknown>, agentId: string, focus?: SessionFocus): Promise<ToolResult> {
+export async function addOverlayItem(kind: OverlayKind, args: Record<string, unknown>, agentId: string, focus?: SessionFocus, flowId?: string): Promise<ToolResult> {
   const str = (k: string) => (typeof args[k] === "string" ? (args[k] as string).trim() : "");
   // Items added while working on a goal/project link back to it — notes with
   // a [[wikilink]] (so they show under it in BaseSpace), todos by id.
@@ -367,7 +367,7 @@ export async function addOverlayItem(kind: OverlayKind, args: Record<string, unk
       await saveOverlay(o);
       return { ok: true, output: `Updated your note "${title}" (${folder}), id ${recent.id} — same title as one you added earlier, so it was replaced, not duplicated.` };
     }
-    o.notes.push({ id, title, folder, tags: [agentId], updated: now, created: now, body });
+    o.notes.push({ id, title, folder, tags: [agentId], updated: now, created: now, body, ...(flowId ? { flowId } : {}) });
     await saveOverlay(o);
     return { ok: true, output: `Added note "${title}" to BaseSpace (${folder}), id ${id}${links.wikiName ? `, linked to "${links.wikiName}"` : ""}.` };
   }
@@ -385,6 +385,9 @@ export async function addOverlayItem(kind: OverlayKind, args: Record<string, unk
       ...(due ? { due } : {}),
       ...(hours(args.time) != null ? { dueTime: hours(args.time), notify: true } : {}),
       notes: `${str("notes")}${str("notes") ? " " : ""}(added by ${cap1(agentId)})`,
+      createdAt: now,
+      // Which flow made it, so "what needs me" can take the operator to that flow's results.
+      ...(flowId ? { flowId } : {}),
       // Completes itself when the operator updates a note: it is done once `doneWhenGone` no longer appears in the note `doneWhenNote`.
       ...(str("doneWhenNote") && str("doneWhenGone") ? { doneWhen: { note: str("doneWhenNote"), gone: str("doneWhenGone"), armed: false } } : {}),
       ...((str("projectId") || links.projectId) ? { projectId: str("projectId") || links.projectId } : {}),
@@ -407,6 +410,23 @@ export async function addOverlayItem(kind: OverlayKind, args: Record<string, unk
     return { ok: true, output: `Posted an update on project ${projectId}.` };
   }
   return { ok: false, output: "", error: `unknown kind "${kind}" — use note, todo or project-update` };
+}
+
+/** What is waiting on the operator, from the live overlay: the open todos agents created (those not done), newest first within priority. */
+export async function openAgentTodos(): Promise<{ id: string; title: string; priority: string; agent: string; flowId?: string; createdAt?: string }[]> {
+  const o = await loadOverlay();
+  const rank: Record<string, number> = { high: 0, med: 1, low: 2 };
+  return o.tasks
+    .filter((t) => t.status !== "done" && String(t.id).startsWith("agent-"))
+    .map((t) => ({
+      id: String(t.id),
+      title: String(t.title ?? ""),
+      priority: String(t.priority ?? "med"),
+      agent: String(t.id).split("-")[1] ?? "agent",
+      ...(typeof t.flowId === "string" ? { flowId: t.flowId } : {}),
+      ...(typeof t.createdAt === "string" ? { createdAt: t.createdAt } : {}),
+    }))
+    .sort((a, b) => (rank[a.priority] ?? 1) - (rank[b.priority] ?? 1));
 }
 
 /** The operator completes an agent's todo (POST /basespace/overlay/tasks/:id/complete). `answer` is what they decided, when the todo

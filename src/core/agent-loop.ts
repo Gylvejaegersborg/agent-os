@@ -708,7 +708,8 @@ async function dispatchTool(
   if (toolCall.name === "basespace-add") {
     const kind = String(toolCall.args.kind ?? "") as OverlayKind;
     // Linked back to whatever this session's work serves (its focus).
-    return addOverlayItem(kind, toolCall.args, ctx.agentId, (await getSession(ctx.sessionId))?.focus);
+    const session = await getSession(ctx.sessionId);
+    return addOverlayItem(kind, toolCall.args, ctx.agentId, session?.focus, session?.flowId);
   }
   return { ok: false, output: "", error: `unknown tool: ${toolCall.name}` };
 }
