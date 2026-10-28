@@ -113,6 +113,14 @@ async function main(): Promise<void> {
   if (reconciled.lost.length) {
     console.log(`[gateway] reconciliation found ${reconciled.lost.length} orphaned task(s) from a previous run: ${reconciled.lost.join(", ")}`);
   }
+  // A quick restart finds the previous run's tasks still inside the 45 s liveness window, so the pass above
+  // leaves them 'running'. Nothing renews them now, so one more pass once the window has passed catches them
+  // (and the flow steps they belonged to).
+  setTimeout(() => {
+    reconcileLostTasks()
+      .then((r) => r.lost.length && console.log(`[gateway] second reconciliation found ${r.lost.length} orphaned task(s): ${r.lost.join(", ")}`))
+      .catch((err) => console.error("[gateway] second reconciliation failed:", err instanceof Error ? err.message : err));
+  }, 50_000).unref();
   // Keeps enforcing Task timeouts and renewing this process's OWN running
   // Tasks' durable liveness for as long as the gateway is up — see each
   // function's doc comment in tasks.ts for why a real deployment needs

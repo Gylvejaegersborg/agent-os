@@ -71,6 +71,7 @@
     "test-flow-honesty": "tsc -b && node dist/test-flow-honesty.js",
     "test-connectors": "tsc -b && node dist/test-connectors.js",
     "test-flow-resume": "tsc -b && node dist/test-flow-resume.js",
+    "test-flow-fixes": "tsc -b && node dist/test-flow-fixes.js",
     "test-note-edit": "tsc -b && node dist/test-note-edit.js",
     "test-pack-check": "tsc -b && node dist/test-pack-check.js",
     "test-todo-complete": "tsc -b && node dist/test-todo-complete.js",
