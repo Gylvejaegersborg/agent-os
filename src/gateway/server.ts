@@ -148,6 +148,8 @@ import {
   refreshConnectors,
   setConnectorEnabled,
   localDay,
+  transitionTask,
+  flowStepExecutions,
 } from "../core/index.js";
 import { checkPathSandbox } from "../core/permissions.js";
 import { runReview } from "./review-loop.js";
@@ -387,7 +389,8 @@ async function resumeAfterDecision(deps: GatewayDeps, approval: ApprovalRequest)
     } else {
       userMessage = `[Approvals] Rejected ${approval.id}: ${call}. Don't run it. Say what you'd do instead, or ask what the operator wants.`;
     }
-    await runTurn({
+    const inFlowStep = !!(session.flowId && session.taskId);
+    const result = await runTurn({
       sessionId: session.id,
       agentId: session.agentId,
       userMessage,
@@ -399,11 +402,42 @@ async function resumeAfterDecision(deps: GatewayDeps, approval: ApprovalRequest)
       enableArtifacts: deps.enableArtifacts,
       enableBaseSpace: deps.enableBaseSpace,
       sandboxPolicy: deps.sandboxPolicy,
-      maxToolHops: deps.maxToolHops,
+      maxToolHops: inFlowStep ? flowStepHops() : deps.maxToolHops,
+      ...(inFlowStep ? { maxToolExecutions: flowStepExecutions() } : {}),
     });
+    if (approval.status === "approved" && inFlowStep && result.stopReason === "answered") {
+      await continueFlowAfterApproval(deps, session.flowId!, session.taskId!, session.id, result.finalContent);
+    }
   } catch (err) {
     console.error(`[gateway] resuming session ${approval.sessionId} after approval ${approval.id} failed:`, err instanceof Error ? err.message : err);
   }
+}
+
+/** A flow step that stopped waiting on an approval (flow-engine.ts records it as failed, "waiting on approval")
+ *  has now finished its work in the follow-up turn: the step is recorded as done with that turn's answer, and
+ *  the rest of the flow runs. Only when this step is the flow's one stopped step — otherwise accepting it would
+ *  also re-run other failed steps the operator hasn't looked at (they stay for the operator to Resume). */
+async function continueFlowAfterApproval(deps: GatewayDeps, flowId: string, taskId: string, sessionId: string, finalContent: string | undefined): Promise<void> {
+  const flow = await getFlow(flowId);
+  const step = flow?.steps.find((s) => s.taskId === taskId);
+  if (!flow || !step || flow.status !== "failed" || step.status !== "failed") return;
+  if (flow.steps.some((s) => s !== step && ["failed", "timed_out", "lost"].includes(s.status))) return;
+  const task = await getTask(taskId);
+  if (typeof task?.output?.approvalId !== "string") return; // stopped for some other reason: the operator decides
+  const def = await getFlowDefinition(flowId);
+  if (!def) return;
+  await transitionTask(taskId, "succeeded", { output: { finalContent, sessionId }, reason: "finished after its approval was decided" });
+  await markStepDone(flowId, step.id, def.steps, {
+    model: deps.model,
+    worker: deps.worker,
+    skills: deps.skills,
+    maxToolHopsPerStep: flowStepHops(),
+    enableSubagents: deps.enableSubagents,
+    enableMemoryNominations: deps.enableMemoryNominations,
+    enableArtifacts: deps.enableArtifacts,
+    enableBaseSpace: deps.enableBaseSpace,
+    sandboxPolicy: deps.sandboxPolicy,
+  });
 }
 
 async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDeps): Promise<void> {
@@ -1484,6 +1518,8 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         if (segments[2] === "approve" && (body.always === "tool" || body.always === "exact")) {
           const pending = await getApproval(segments[1]!);
           if (!pending) throw new Error(`no such approval request: ${segments[1]}`);
+          // Checked before the rule is added: an already rejected (or approved) request must not leave a standing rule behind.
+          if (pending.status !== "pending") throw new Error(`approval request ${pending.id} is already resolved ("${pending.status}") and cannot be resolved again`);
           await addAllowRule({
             agentId: pending.agentId,
             toolName: pending.toolName,
