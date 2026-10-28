@@ -163,12 +163,16 @@ import { buildOps } from "./ops.js";
 import { listSongAssets } from "../core/library.js";
 import type { SessionFocus } from "../core/types.js";
 import { closeAllTerminals, closeTerminal, setTerminalGatewayUrl, createTerminal, listTerminals, ptyBackend, resizeTerminal, streamTerminal, terminalsEnabled, writeTerminal } from "./terminal.js";
+import { hasGatewayToken } from "./auth.js";
 import type { ArtifactType } from "../core/artifacts.js";
 import type { FlowStepDefinition } from "../core/flow-engine.js";
 
 export interface GatewayDeps {
   model: ModelAdapter;
   worker: Worker;
+  /** When set, every request but GET /health must carry `Authorization: Bearer <token>` (auth.ts). The gateway
+   *  CLI always sets it; tests that start a gateway without it get the old open behaviour. */
+  token?: string;
   skills?: SkillRegistry;
   /** Root directory writeSkill()/deleteSkill() persist to — separate from
    *  `skills` (the in-memory catalog) because the registry itself doesn't
@@ -264,7 +268,7 @@ function parseFlowSteps(raw: unknown): FlowStepDefinition[] | undefined {
 function withCors(req: IncomingMessage, res: ServerResponse): boolean {
   res.setHeader("access-control-allow-origin", "*");
   res.setHeader("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.setHeader("access-control-allow-headers", "content-type");
+  res.setHeader("access-control-allow-headers", "content-type, authorization");
   if (req.method === "OPTIONS") {
     res.writeHead(204);
     res.end();
@@ -282,6 +286,11 @@ export function startGateway(deps: GatewayDeps, port = 0): Promise<GatewayHandle
   return new Promise((resolve) => {
     const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
       if (withCors(req, res)) return;
+      // Every route but GET /health needs the gateway token (auth.ts), when the gateway was given one.
+      if (deps.token && !(req.method === "GET" && req.url?.split("?")[0] === "/health") && !hasGatewayToken(req, deps.token)) {
+        sendJson(res, 401, { error: "missing or wrong gateway token (Authorization: Bearer <token>; see agent-os's README, \"Gateway auth\")" });
+        return;
+      }
       try {
         await route(req, res, deps);
       } catch (err) {
@@ -302,7 +311,7 @@ export function startGateway(deps: GatewayDeps, port = 0): Promise<GatewayHandle
     server.listen(port, "127.0.0.1", () => {
       const address = server.address();
       const actualPort = typeof address === "object" && address ? address.port : port;
-      setTerminalGatewayUrl(`http://127.0.0.1:${actualPort}`);
+      setTerminalGatewayUrl(`http://127.0.0.1:${actualPort}`, deps.token);
       resolve({
         server,
         port: actualPort,

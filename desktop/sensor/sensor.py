@@ -228,17 +228,19 @@ class Sender:
     """Posts spans; anything that couldn't be sent waits in spool.jsonl and
     goes with the next successful flush (span ids make resends harmless)."""
 
-    def __init__(self, gateway: str, spool: Path, post: Optional[Callable[[str, dict], dict]] = None, device: str = "") -> None:
+    def __init__(self, gateway: str, spool: Path, post: Optional[Callable[[str, dict], dict]] = None, device: str = "", token: str = "") -> None:
         self.url = gateway.rstrip("/") + "/desktop/spans"
         self.spool = spool
         self.post = post or self._http_post
         self.device = device
+        self.token = token
 
-    @staticmethod
-    def _http_post(url: str, body: dict) -> dict:
+    def _http_post(self, url: str, body: dict) -> dict:
+        headers = {"content-type": "application/json"}
+        if self.token:
+            headers["authorization"] = f"Bearer {self.token}"
         req = urllib.request.Request(
-            url, data=json.dumps(body).encode("utf-8"),
-            headers={"content-type": "application/json"}, method="POST",
+            url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST",
         )
         with urllib.request.urlopen(req, timeout=5) as r:
             return json.loads(r.read().decode("utf-8"))
@@ -275,6 +277,17 @@ class Sender:
         return True
 
 
+def read_token(token_file: str) -> str:
+    """The gateway token: AGENT_OS_GATEWAY_TOKEN, else the file the gateway wrote; empty when neither exists."""
+    env = os.environ.get("AGENT_OS_GATEWAY_TOKEN", "").strip()
+    if env:
+        return env
+    try:
+        return Path(token_file).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="agent-os desktop sensor")
     ap.add_argument("--gateway", default=os.environ.get("AGENT_OS_GATEWAY_URL", "http://127.0.0.1:8787"))
@@ -282,6 +295,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="name of this computer in the activity log (default: its hostname)")
     ap.add_argument("--privacy", default=str(HERE / "privacy.json"))
     ap.add_argument("--spool", default=str(HERE / "spool.jsonl"))
+    ap.add_argument("--token-file", default=str(HERE.parent.parent / "data" / "gateway-token"),
+                    help="the gateway token (default: the one the gateway keeps in agent-os/data); AGENT_OS_GATEWAY_TOKEN wins")
     ap.add_argument("--dry-run", action="store_true", help="print spans instead of posting")
     args = ap.parse_args(argv)
 
@@ -291,7 +306,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     platform = WindowsPlatform()
     tracker = Tracker(Privacy.load(Path(args.privacy)))
-    sender = Sender(args.gateway, Path(args.spool), device=args.device)
+    sender = Sender(args.gateway, Path(args.spool), device=args.device, token=read_token(args.token_file))
     last_flush = time.time()
     was_down = False
     print(f"[sensor] {args.device}: watching → {sender.url}{' (dry run)' if args.dry_run else ''}")
