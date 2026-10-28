@@ -35,6 +35,7 @@ import {
   type SandboxPolicy,
 } from "../core/index.js";
 import { startGateway } from "./server.js";
+import { loadGatewayToken } from "./auth.js";
 import { startBaseSpaceCronRunner } from "./basespace-crons.js";
 import { startWorkRunner } from "./work-runner.js";
 import { startReviewLoop } from "./review-loop.js";
@@ -255,8 +256,15 @@ async function main(): Promise<void> {
   // for the live gateway; every agent's own persona/capabilities already
   // claims some of these (e.g. "subagent-delegation"), so leaving them
   // off made that claim false in practice.
+  // Gateway auth (auth.ts): the env var, else data/gateway-token (made on first start).
+  const auth = loadGatewayToken();
+  console.log(
+    auth
+      ? `[gateway] auth on: requests need the token from ${auth.source}`
+      : "[gateway] WARNING: auth is OFF (AGENT_OS_GATEWAY_AUTH=off) — anything that can reach this port, including web pages in a browser on this machine, can drive the OS",
+  );
   const handle = await startGateway(
-    { model, worker, skills, skillsDir, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true, enableBaseSpace: true, maxToolHops: 8, sandboxPolicy, configuredHooks },
+    { token: auth?.token, model, worker, skills, skillsDir, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true, enableBaseSpace: true, maxToolHops: 8, sandboxPolicy, configuredHooks },
     port,
   );
   console.log(`[gateway] listening on http://127.0.0.1:${handle.port}`);

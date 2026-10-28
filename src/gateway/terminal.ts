@@ -153,10 +153,12 @@ async function spawnPty(file: string, args: string[], cols: number, rows: number
 // ---- Claude Code wired into the OS ----
 
 let gatewayUrl: string | undefined;
+let gatewayToken: string | undefined;
 /** Set by startGateway() once it's listening, so Claude Code sessions can
- *  reach this gateway's /mcp (mcp.ts). */
-export function setTerminalGatewayUrl(url: string): void {
+ *  reach this gateway's /mcp (mcp.ts) — with the gateway token when it has one. */
+export function setTerminalGatewayUrl(url: string, token?: string): void {
   gatewayUrl = url;
+  gatewayToken = token;
 }
 
 /** Claude Code started from the OS gets the OS as MCP tools (BaseSpace,
@@ -165,7 +167,9 @@ export function setTerminalGatewayUrl(url: string): void {
  *  normal Claude Code, plus the OS. */
 function claudeArgs(): string[] {
   if (!gatewayUrl) return [];
-  const mcpConfig = { mcpServers: { "agent-os": { type: "http", url: `${gatewayUrl}/mcp` } } };
+  const mcpConfig = {
+    mcpServers: { "agent-os": { type: "http", url: `${gatewayUrl}/mcp`, ...(gatewayToken ? { headers: { Authorization: `Bearer ${gatewayToken}` } } : {}) } },
+  };
   return [
     "--mcp-config", JSON.stringify(mcpConfig),
     "--append-system-prompt",

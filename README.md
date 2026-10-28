@@ -383,14 +383,45 @@ that same login is what the `claude-cli:` model provider uses.
   `script` provides the PTY and everything works except live resizing.
   `AGENT_OS_TERMINAL_BACKEND=script` forces the fallback.
 - **Off by default, and it's a full shell as the gateway's user.** The
-  gateway has no auth, so only enable it where the gateway is reachable by
-  you alone. BaseOStest's Codespace turns it on because forwarded ports are
+  gateway token (see "Gateway auth" below) keeps out anything that doesn't
+  have it, but BaseSpace's proxy adds the token for whoever can open
+  BaseSpace, so only enable it where BaseSpace is reachable by you alone. BaseOStest's Codespace turns it on because forwarded ports are
   private to your GitHub login by default; never make them public while it's
   on. (Anyone who can reach the gateway could already approve the `claude`
   agent's shell commands, so this widens less than it sounds, but it skips
   approvals entirely.)
 
 `npm run test-terminal` covers both PTY backends through the real routes.
+
+## Gateway auth
+
+Every request except `GET /health` needs `Authorization: Bearer <token>`
+(`src/gateway/auth.ts`); without it the gateway answers 401. Before this,
+anything that could reach `127.0.0.1:8787` could drive the OS, and because
+the gateway answers every origin, so could any web page open in a browser on
+the same machine.
+
+- **The token** is `AGENT_OS_GATEWAY_TOKEN` when set (16+ characters),
+  otherwise one the gateway generates on first start and keeps in
+  `data/gateway-token` (git-ignored). The startup log says which; it never
+  prints the token.
+- **BaseSpace** reaches the gateway through its Vite proxy, which adds the
+  header, so the browser never holds the token. The proxy reads
+  `AGENT_OS_GATEWAY_TOKEN`, else `AGENT_OS_GATEWAY_TOKEN_FILE`, else
+  `agent-os/data/gateway-token` beside the BaseOStest checkout or in the
+  home folder. It rereads the token on every request, so a new one needs no
+  Vite restart.
+- **Claude Code** started from the Terminal gets the header in its MCP config.
+- **The desktop sensor** reads `AGENT_OS_GATEWAY_TOKEN` or the token file
+  (`--token-file`).
+- **Your own scripts**: send the header, with the token from the file.
+- `AGENT_OS_GATEWAY_AUTH=off` turns the check off and logs a warning.
+
+What it doesn't cover: whoever can open BaseSpace gets the gateway through its
+proxy. Keep BaseSpace itself private (Tailscale on the always-on machine, a
+private forwarded port in a Codespace).
+
+`npm run test-gateway-auth` covers the check and where the token comes from.
 
 ## The OS over MCP — for Claude Code and other MCP clients
 
