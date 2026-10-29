@@ -493,6 +493,12 @@ memory gate as everything else.
       session focused on the goal matched from `desktop.focus`. **[UI]**
 - [ ] Push-to-talk in the HUD: local faster-whisper on the operator's
       machine (the mic is there), text sent as a normal turn. **[UI]**
+      Voice service phase 1 is in `voice/` (Silero VAD, NB-Whisper, optional
+      Kokoro speech back, off by default; 127.0.0.1:8765). Measured on the
+      operator's PC: ~2 s to transcribe a 3.5 s clip, 670 MB RAM with
+      everything loaded. Next: English routing (phase 2; NB-Whisper set to
+      Norwegian translates English instead of transcribing it), then
+      Ctrl+Alt+B push-to-talk in the HUD.
 - [ ] "This": on demand, screenshot → OCR text for small local models;
       the image itself only when the agent is routed to `claude-cli`
       (depends on multimodal input above). **[core]** **[UI]**

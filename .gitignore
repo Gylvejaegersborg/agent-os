@@ -11,3 +11,9 @@ desktop/sensor/privacy.json
 desktop/sensor/spool.jsonl
 desktop/sensor/spool.tmp
 desktop/sensor/__pycache__/
+
+# voice service: downloaded models, local config, virtualenv
+voice/models/
+voice/voice.yaml
+voice/.venv/
+voice/**/__pycache__/
