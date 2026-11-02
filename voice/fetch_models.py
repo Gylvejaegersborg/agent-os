@@ -4,24 +4,31 @@
                                        RAM), whisper-tiny for language ID (~75 MB) and Phonon-2 int8 for English
                                        (~690 MB)
   python fetch_models.py --bark        also Bark 3.0 Plus int8 (~685 MB), the English engine to A/B against Phonon-2
-  python fetch_models.py --tts         also Kokoro int8 (~90 MB) + its voices (~27 MB), for speech back
+  python fetch_models.py --tts         also speech back: Gradium's Phonon 31M for English (~65 MB, into the Hugging
+                                       Face cache, where its ptts runtime looks), Piper's Norwegian voice
+                                       no_NO-talesyntese-medium (~63 MB), and fastText's lid.176.ftz (~1 MB)
+  python fetch_models.py --kokoro      also Kokoro int8 (~90 MB) + its voices (~27 MB), the other English voice
 
 Sources: Silero's v5.1.2 tag, NbAiLab/nb-whisper-small's ct2/ folder, Systran/faster-whisper-tiny,
 Avifenesh/Phonon-2-ONNX (an ONNX export of FermionResearch/Phonon-2), velddev/Underdog-Bark-3.0-Plus-sherpa-onnx
-(of ConwayResearch/Underdog-Bark-3.0-Plus), and the kokoro-onnx model-files-v1.0 release. Phonon-2 and Bark are
-CC BY 4.0; each folder keeps its NOTICE/LICENSE.
+(of ConwayResearch/Underdog-Bark-3.0-Plus), gradium/phonon-31m-en and gradium/phonon-voices (pinned by ptts),
+the kokoro-onnx model-files-v1.0 release, rhasspy/piper-voices, and fastText's published lid.176.ftz.
+Phonon-2 and Bark are CC BY 4.0, Phonon 31M Apache 2.0; each folder keeps its NOTICE/LICENSE.
 """
 
 from __future__ import annotations
 
 import argparse
 import shutil
+import time
 import urllib.request
 from pathlib import Path
 
 MODELS = Path(__file__).resolve().parent / "models"
 SILERO = "https://github.com/snakers4/silero-vad/raw/v5.1.2/src/silero_vad/data/silero_vad.onnx"
 KOKORO = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
+FASTTEXT_LID = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz"
+PIPER_NO = "no/no_NO/talesyntese/medium/no_NO-talesyntese-medium"
 
 
 def fetch(url: str, dest: Path) -> None:
@@ -30,8 +37,16 @@ def fetch(url: str, dest: Path) -> None:
         return
     print(f"downloading {url}")
     tmp = dest.with_suffix(dest.suffix + ".part")
-    with urllib.request.urlopen(url, timeout=60) as r, open(tmp, "wb") as f:
-        shutil.copyfileobj(r, f, length=1 << 20)
+    for attempt in range(5):  # connections get reset now and then; start the file again
+        try:
+            with urllib.request.urlopen(url, timeout=60) as r, open(tmp, "wb") as f:
+                shutil.copyfileobj(r, f, length=1 << 20)
+            break
+        except OSError as err:
+            if attempt == 4:
+                raise
+            print(f"  retrying ({err})")
+            time.sleep(3)
     tmp.replace(dest)
     print(f"  → {dest} ({dest.stat().st_size / 2**20:.1f} MB)")
 
@@ -82,7 +97,8 @@ def main() -> None:
     use_windows_certificates()
     ap = argparse.ArgumentParser()
     ap.add_argument("--bark", action="store_true", help="also fetch Bark 3.0 Plus, to A/B against Phonon-2 (stt.en: bark-plus)")
-    ap.add_argument("--tts", action="store_true", help="also fetch Kokoro (only needed with tts.enabled)")
+    ap.add_argument("--tts", action="store_true", help="also fetch speech back's voices (only needed with tts.enabled)")
+    ap.add_argument("--kokoro", action="store_true", help="also fetch Kokoro (tts.en.engine: kokoro)")
     args = ap.parse_args()
     MODELS.mkdir(exist_ok=True)
     fetch(SILERO, MODELS / "silero_vad.onnx")
@@ -99,9 +115,16 @@ def main() -> None:
             "bark-3.0-plus",
             ["tokens.txt", "LICENSE", "NOTICE", "encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx"],
         )
-    if args.tts:
+    if args.kokoro:
         fetch(KOKORO + "kokoro-v1.0.int8.onnx", MODELS / "kokoro-v1.0.int8.onnx")
         fetch(KOKORO + "voices-v1.0.bin", MODELS / "voices-v1.0.bin")
+    if args.tts:
+        import ptts
+
+        ptts.TTS(lang="en", quant="q8")  # downloads Phonon 31M (and its voice catalog) at ptts's pinned revision
+        print("  → Phonon 31M (Hugging Face cache)")
+        fetch_hf("rhasspy/piper-voices", "piper", [f"{PIPER_NO}.onnx", f"{PIPER_NO}.onnx.json", f"{PIPER_NO.rsplit('/', 1)[0]}/MODEL_CARD"])
+        fetch(FASTTEXT_LID, MODELS / "lid.176.ftz")
 
 
 if __name__ == "__main__":

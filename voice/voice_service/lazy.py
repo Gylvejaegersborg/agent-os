@@ -17,8 +17,9 @@ T = TypeVar("T")
 
 
 class Lazy(Generic[T]):
-    def __init__(self, name: str, factory: Callable[[], T], idle_s: float = 0, log: Callable[[str], None] = print) -> None:
+    def __init__(self, name: str, factory: Callable[[], T], idle_s: float = 0, log: Callable[[str], None] = print, streams: bool = False) -> None:
         self.name = name
+        self.streams = streams  # the model has stream(): speech back plays it as it's made
         self._factory = factory
         self.idle_s = idle_s  # 0 = never unload
         self._log = log

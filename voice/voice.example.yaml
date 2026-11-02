@@ -34,13 +34,18 @@ hotkey: ctrl+alt+l       # cycles the mode; null = no hotkey
 
 tts:
   enabled: false         # speech back; off by default. Needs: python fetch_models.py --tts
-  en: {engine: kokoro, voice: af_heart}
+  en: {engine: phonon-31m, voice: null}      # English; null = Phonon's default. Others: Harper, Hadley, Easton, …
+                                             # or engine: kokoro (voice null = af_heart; fetch_models.py --kokoro)
+  no: {engine: piper}                        # Norwegian: no_NO-talesyntese-medium
   sample_rate: 24000
+  playback: true         # /v1/speak plays on this PC's speakers; false = wav files from /v1/audio/speech only
+  output_device: null    # null = Windows' default output; or a name/index from: python -m sounddevice
+  barge_in_open_mic: false   # push-to-talk always cuts speech off; with the open mic, speech could too (echo risk)
 
 resources:
   threads: 4
   priority: below_normal
-  idle_unload_min: 15    # drop NB-Whisper / Phonon-2 / Kokoro after this long unused; reloaded when you speak
+  idle_unload_min: 15    # drop the transcribers and voices after this long unused; reloaded when you speak
 
 mic:
   enabled: true          # false = HTTP routes only, no mic

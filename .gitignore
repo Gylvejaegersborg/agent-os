@@ -17,3 +17,4 @@ voice/models/
 voice/voice.yaml
 voice/.venv/
 voice/**/__pycache__/
+voice/testset/
