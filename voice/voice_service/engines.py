@@ -6,7 +6,9 @@ warms up once at load so the first real request isn't the slow one.
   guess towards Norwegian.
 - EnglishStt: English only (phase 2), Phonon-2 through onnx-asr or Bark 3.0 Plus through sherpa-onnx. Both are
   fine-tunes of NVIDIA's Parakeet TDT 0.6B v3, so they share one slot and are A/B'd on the same clips.
-- KokoroTts: English speech back. Piper (Norwegian) comes in phase 3."""
+- KokoroTts: English speech back. PiperTts: Norwegian speech back (phase 3); Kokoro has no Norwegian voice.
+  Both resample to tts.sample_rate (24 kHz) and are loudness-matched (normalize), so a mixed reply can switch
+  engines between sentences on one open output device."""
 
 from __future__ import annotations
 
@@ -235,6 +237,49 @@ class KokoroTts:
             audio = resample(audio, rate, self._rate)
         self.last_ms = round((time.perf_counter() - started) * 1000)
         return audio
+
+
+class PiperTts:
+    name = "piper"
+
+    def __init__(self, model: Path, sample_rate: int = 24000) -> None:
+        from piper import PiperVoice
+
+        if not model.exists():
+            raise FileNotFoundError(f"{model} not found — run: python fetch_models.py --tts")
+        self._voice = PiperVoice.load(str(model))
+        self._rate = sample_rate
+        self._lock = threading.Lock()
+        self.last_ms: int | None = None
+        self.synthesize("Klar.")  # warm-up: the first call is ~10x slower
+        self.last_ms = None
+
+    def synthesize(self, text: str, voice: str | None = None, speed: float = 1.0) -> np.ndarray:
+        from piper import SynthesisConfig
+
+        started = time.perf_counter()
+        with self._lock:
+            chunks = list(self._voice.synthesize(text, syn_config=SynthesisConfig(length_scale=1.0 / max(speed, 0.25))))
+        audio = np.concatenate([c.audio_float_array for c in chunks]) if chunks else np.zeros(0, np.float32)
+        rate = chunks[0].sample_rate if chunks else self._rate
+        if rate != self._rate:
+            audio = resample(audio, rate, self._rate)
+        self.last_ms = round((time.perf_counter() - started) * 1000)
+        return audio.astype(np.float32)
+
+
+def normalize(audio: np.ndarray, target_db: float = -20.0) -> np.ndarray:
+    """Loudness match between engines: RMS of the voiced part to target_db dBFS (a stand-in for the spec's
+    −20 LUFS; same idea without a K-weighting filter), peaks kept under 0.98."""
+    if audio.size == 0:
+        return audio
+    voiced = audio[np.abs(audio) > 0.01]
+    rms = float(np.sqrt(np.mean(np.square(voiced)))) if voiced.size else 0.0
+    if rms < 1e-5:
+        return audio
+    out = audio * (10 ** (target_db / 20) / rms)
+    peak = float(np.abs(out).max())
+    return (out * (0.98 / peak) if peak > 0.98 else out).astype(np.float32)
 
 
 def resample(audio: np.ndarray, src: int, dst: int) -> np.ndarray:

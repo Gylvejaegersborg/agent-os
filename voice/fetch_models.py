@@ -4,11 +4,14 @@
                                        RAM), whisper-tiny for language ID (~75 MB) and Phonon-2 int8 for English
                                        (~690 MB)
   python fetch_models.py --bark        also Bark 3.0 Plus int8 (~685 MB), the English engine to A/B against Phonon-2
-  python fetch_models.py --tts         also Kokoro int8 (~90 MB) + its voices (~27 MB), for speech back
+  python fetch_models.py --tts         also speech back: Kokoro int8 (~90 MB) + its voices (~27 MB) for English, Piper's
+                                       Norwegian voice no_NO-talesyntese-medium (~63 MB), and fastText's language ID
+                                       for text, lid.176.ftz (~1 MB)
 
 Sources: Silero's v5.1.2 tag, NbAiLab/nb-whisper-small's ct2/ folder, Systran/faster-whisper-tiny,
 Avifenesh/Phonon-2-ONNX (an ONNX export of FermionResearch/Phonon-2), velddev/Underdog-Bark-3.0-Plus-sherpa-onnx
-(of ConwayResearch/Underdog-Bark-3.0-Plus), and the kokoro-onnx model-files-v1.0 release. Phonon-2 and Bark are
+(of ConwayResearch/Underdog-Bark-3.0-Plus), the kokoro-onnx model-files-v1.0 release, rhasspy/piper-voices, and
+fastText's published lid.176.ftz. Phonon-2 and Bark are
 CC BY 4.0; each folder keeps its NOTICE/LICENSE.
 """
 
@@ -16,12 +19,15 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import time
 import urllib.request
 from pathlib import Path
 
 MODELS = Path(__file__).resolve().parent / "models"
 SILERO = "https://github.com/snakers4/silero-vad/raw/v5.1.2/src/silero_vad/data/silero_vad.onnx"
 KOKORO = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
+FASTTEXT_LID = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz"
+PIPER_NO = "no/no_NO/talesyntese/medium/no_NO-talesyntese-medium"
 
 
 def fetch(url: str, dest: Path) -> None:
@@ -30,8 +36,16 @@ def fetch(url: str, dest: Path) -> None:
         return
     print(f"downloading {url}")
     tmp = dest.with_suffix(dest.suffix + ".part")
-    with urllib.request.urlopen(url, timeout=60) as r, open(tmp, "wb") as f:
-        shutil.copyfileobj(r, f, length=1 << 20)
+    for attempt in range(5):  # connections get reset now and then; start the file again
+        try:
+            with urllib.request.urlopen(url, timeout=60) as r, open(tmp, "wb") as f:
+                shutil.copyfileobj(r, f, length=1 << 20)
+            break
+        except OSError as err:
+            if attempt == 4:
+                raise
+            print(f"  retrying ({err})")
+            time.sleep(3)
     tmp.replace(dest)
     print(f"  → {dest} ({dest.stat().st_size / 2**20:.1f} MB)")
 
@@ -102,6 +116,8 @@ def main() -> None:
     if args.tts:
         fetch(KOKORO + "kokoro-v1.0.int8.onnx", MODELS / "kokoro-v1.0.int8.onnx")
         fetch(KOKORO + "voices-v1.0.bin", MODELS / "voices-v1.0.bin")
+        fetch_hf("rhasspy/piper-voices", "piper", [f"{PIPER_NO}.onnx", f"{PIPER_NO}.onnx.json", f"{PIPER_NO.rsplit('/', 1)[0]}/MODEL_CARD"])
+        fetch(FASTTEXT_LID, MODELS / "lid.176.ftz")
 
 
 if __name__ == "__main__":

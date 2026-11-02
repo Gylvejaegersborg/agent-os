@@ -34,8 +34,12 @@ hotkey: ctrl+alt+l       # cycles the mode; null = no hotkey
 
 tts:
   enabled: false         # speech back; off by default. Needs: python fetch_models.py --tts
-  en: {engine: kokoro, voice: af_heart}
+  en: {engine: kokoro, voice: af_heart}      # English; other voices: am_michael, am_adam, bm_george, bm_lewis, …
+  no: {engine: piper}                        # Norwegian: no_NO-talesyntese-medium
   sample_rate: 24000
+  playback: true         # /v1/speak plays on this PC's speakers; false = wav files from /v1/audio/speech only
+  output_device: null    # null = Windows' default output; or a name/index from: python -m sounddevice
+  barge_in_open_mic: false   # push-to-talk always cuts speech off; with the open mic, speech could too (echo risk)
 
 resources:
   threads: 4

@@ -1,4 +1,4 @@
-# Local voice service (HUD mode, part 6) — phases 1, 2, 4, 5 and 6
+# Local voice service (HUD mode, part 6) — phases 1–6
 
 One local Python process for speech in and, optionally, speech back. It runs on the machine with the mic,
 keeps its models loaded, and serves OpenAI-compatible routes on `127.0.0.1:8765` only. Nothing leaves the
@@ -9,7 +9,8 @@ Ctrl+Alt+B held ─▶ mic 16 kHz ─▶ Silero VAD ─▶ hold recorder ─┬�
                                                               └─▶ en ≥ 0.80 ? Phonon-2 : NB-Whisper ─▶ WS /v1/listen  {type: final, …}
                                                                                                   POST /v1/audio/transcriptions
 BaseSpace (Vite proxy /voice/*, adds the token) ◀── WS /v1/listen: dictation lands in the launcher (Alt+B)
-text ─▶ Kokoro (en) ─▶ wav/pcm        POST /v1/audio/speech   (only with tts.enabled — off by default)
+text ─▶ sentences ─▶ fastText per sentence ─▶ Kokoro (en) | Piper (no) ─▶ one queue ─▶ speakers   POST/WS /v1/speak
+                                                       (only with tts.enabled — off by default; Ctrl+Alt+B cuts it off)
 ```
 
 **Phase 1:** the service and config, Silero VAD on the live mic, NB-Whisper small (Norwegian; it copes
@@ -43,8 +44,8 @@ with English words in Norwegian speech), Kokoro for English speech back, `/healt
 - *Phonon-2 vs Bark 3.0 Plus:* both are Parakeet TDT 0.6B v3 fine-tunes and fit the `stt.en` slot (Phonon-2
   int8 ONNX through onnx-asr, Bark through sherpa-onnx). On 8 synthetic English clips both got the same words;
   Phonon-2 transcribed in 45–170 ms vs Bark's 56–270 ms, and this Bark export sometimes drops case and
-  punctuation. **Phonon-2 is the default.** Bark wasn't tried on the operator's voice:
-  `python fetch_models.py --bark` and `stt.en: bark-plus` to try it.
+  punctuation. **Phonon-2 is the default**, and stayed it on the operator's voice (the test set, below).
+  `python fetch_models.py --bark` and `stt.en: bark-plus` to try Bark.
 - `final` events now carry `route` (detected / forced / sticky / no-english-engine) and `detected`
   (language, probability, ms); `/health` has the mode, hotkey, English routing status and per-route counts.
 
@@ -70,7 +71,29 @@ these numbers. Phase 1's mic test (operator, Norwegian): ~2.7 s, text right in 5
   all three ("Legg til…", "Hva står…", "…kulpen?").
 - **RAM: ~1.24 GB** with NB-Whisper, whisper-tiny, Phonon-2 and the VAD loaded (Phonon-2 int8 alone is
   ~0.9 GB per its export's card). Over the spec's 1 GB; idle unload is phase 5's job.
-- The spec's 60-clip test set (≥ 95% routing) isn't recorded; this is 8 synthetic + 8 live.
+
+**The 60-clip test set** (operator's voice, `record_testset.py` → `benchmark.py`, push-to-talk pipeline):
+
+| | routed right | word error rate | release → text (median) |
+|---|---|---|---|
+| English (20) | 15 (75%) | 0.28 (0.04 on the 15 routed right) | 214 ms |
+| Norwegian (20) | 20 (100%) | 0.21 (dialect words count as errors) | 594 ms |
+| Norwegian with English words (20) | 19 (95%) | 0.37 | 636 ms |
+| **all 60** | **54 (90%)** — the spec's bar is ≥ 95% | | |
+
+- *What misses:* five English commands, mostly short ("Pause.", "Mute the mic.", "How many tasks are waiting for
+  approval?"), came back from whisper-tiny at 0.29–0.79 English, under 0.80, so NB-Whisper got them (and
+  translated them). One mixed one, "Send stems til mastering." (3 of 4 words English), went to Phonon-2.
+- *Why lowering the bar doesn't help:* the operator's Norwegian clips often come back "English 0.3–0.66" too.
+- *Tried and not kept:* whisper-base instead of tiny (53/60 by the same rule); NB-Whisper's own language token
+  (calls nearly everything Norwegian, English included); and reading the audio as both languages with whisper-base
+  and comparing the two log probs. That one reached 57/60 offline with thresholds picked on these same 60 clips,
+  but only 54/60 in the real pipeline (several clips sit on the threshold) and made English 3x slower (613 ms) by
+  running three models at once. A fresh recording would be needed to tune anything without fitting to noise.
+- *Phonon-2 vs Bark 3.0 Plus* on the 20 English clips: same routing, the same word error rate on the 15 routed
+  right (0.04 each; each wins a few clips), Bark slower (340 vs 214 ms median). **Phonon-2 stays** — the spec's
+  A/B is decided.
+- Until routing gets better, Ctrl+Alt+L (mode no/en) is the sure way: a forced mode skips language ID.
 
 **Phase 5 (resources), measured on this PC:**
 
@@ -113,8 +136,41 @@ these numbers. Phase 1's mic test (operator, Norwegian): ~2.7 s, text right in 5
   mode, which hud/core wires up.
 - `/v1/listen` never worked before this: uvicorn needs the `websockets` package, which wasn't in requirements.
 
-**Not yet:** English partials, the 60-clip routing test set, Piper Norwegian speech, sentence routing and
-barge-in (phase 3), dictation reaching an agent and replies spoken (with hud/core's launcher AI mode / HUD).
+**Phase 3 (bilingual speech back), only with `tts.enabled: true` (off by default):**
+- *Sentences:* replies are split as each sentence ends (`speech.py`), so a streamed reply starts speaking at its
+  first sentence; fragments under 4 words join the next one. A reply's first sentence starts with its first
+  clause when it has one (see below).
+- *A voice per sentence:* fastText lid.176 per sentence → Kokoro (`af_heart`, the operator's pick by ear) for
+  English, Piper `no_NO-talesyntese-medium` for everything else. Norwegian, Danish and Swedish count together:
+  fastText spreads a Norwegian sentence over all three, and with only the top one, "Jeg har lagt inn en
+  påminnelse…" stayed under 0.6 and was read by the English voice. Sentences under 5 words or under 0.6 keep the
+  previous sentence's voice; `language` in a request forces one. The spec's voice match (same gender and pitch)
+  was tried and passed on: the operator preferred `af_heart` to the four male Kokoro voices.
+- *One playback queue on this machine's speakers:* sentence N+1 is made while N plays; both voices are resampled
+  to 24 kHz and loudness-matched (RMS to −20 dBFS, a stand-in for −20 LUFS) on one output stream that stays open.
+- *Barge-in:* pressing push-to-talk while it talks stops the sound; the next 20 ms block is already silent. Live,
+  twice: 4 ms from the press reaching the service to `speak_end`. Open-mic barge-in (`tts.barge_in_open_mic`) is
+  off: the mic hears the speakers.
+- Routes: `POST /v1/speak` (play here), `POST /v1/speak/stop`, `WS /v1/speak` (stream text in; each sentence is
+  spoken as soon as it ends), and `/v1/audio/speech` now picks the voice per sentence too. Events on
+  `/v1/listen`: `speak_start`, `sentence` (text, language, engine, synth ms), `speak_end` (why), `barge_in`.
+
+**Phase 3, measured on this PC** (mixed replies, real voices, played at real-time pace):
+
+| | |
+|---|---|
+| gaps between sentences | 0 ms, once 60 ms (spec: none over 150 ms), engine switches included |
+| first sound, reply starting in Norwegian | ~0.1 s (Piper: ~85 ms for a sentence) |
+| first sound, reply starting in English | ~0.86 s with the first-clause split; ~2.4 s without |
+| Kokoro int8 / fp32 on this CPU | 1.3 / 1.5 s for 3.7 s of speech: int8 isn't the slow part |
+| RAM with speech back on | ~1.46 GB loaded (Kokoro and Piper unload with the rest when idle) |
+
+The spec's "first audio within ~500 ms" holds for Norwegian, not for English with Kokoro on this CPU. The spec's
+alternative, Gradium's Phonon 31M (`ptts` package), wasn't tried: installing an unvetted package needs the
+operator's go-ahead.
+
+**Not yet:** ≥ 95% routing (90% on the test set), English partials, Kokoro vs Phonon 31M, dictation reaching an
+agent and replies spoken by the HUD (hud/core's launcher AI mode; `speak()` in BaseSpace is ready for it).
 
 ## Set up (Windows)
 
@@ -125,7 +181,7 @@ uv venv --python 3.11
 uv pip install -r requirements.txt
 python fetch_models.py            # Silero VAD, NB-Whisper small, whisper-tiny, Phonon-2 (~1.7 GB download)
 python fetch_models.py --bark     # also Bark 3.0 Plus, only to A/B it against Phonon-2
-python fetch_models.py --tts      # also Kokoro, only if you turn speech back on
+python fetch_models.py --tts      # also Kokoro, Piper (Norwegian) and fastText, only if you turn speech back on
 copy voice.example.yaml voice.yaml   # optional: pick the mic, tune the VAD, turn speech back on
 python run.py
 ```
@@ -136,9 +192,10 @@ Pick the mic: `python -m sounddevice` lists devices; put the name or index in `a
 
 - Speak Norwegian: the console prints `[voice] final (no, nb-whisper-small, … ms): …`, and a client on
   `ws://127.0.0.1:8765/v1/listen` gets `speech_start`, `speech_end` and `final` events.
-- With `tts.enabled: true`:
-  `curl -X POST http://127.0.0.1:8765/v1/audio/speech -H "content-type: application/json" -d "{\"input\":\"Hello from the OS.\"}" -o hello.wav`
-  gives playable English audio. With it off, the route answers 409 and says how to turn it on.
+- With `tts.enabled: true` (and the token header): `POST /v1/speak` with
+  `{"input": "Hei! The masters are ready on Thursday."}` speaks on this PC's speakers, the first sentence in
+  Norwegian and the second in English; holding Ctrl+Alt+B while it talks cuts it off. `/v1/audio/speech` gives
+  the same as a wav. With speech back off, both answer 409 and say how to turn it on.
 - `curl http://127.0.0.1:8765/health`: loaded models, mic device, RAM, last latencies.
 - File transcription: `curl -F file=@clip.wav http://127.0.0.1:8765/v1/audio/transcriptions` (add
   `-F language=en` or `no` to skip language ID).
@@ -148,14 +205,21 @@ Pick the mic: `python -m sounddevice` lists devices; put the name or index in `a
 - With BaseSpace open: hold Ctrl+Alt+B, speak, let go: the launcher opens and the text is in its input.
 
 `python test_voice.py` tests the segmenter, speculation events, push-to-talk holds, routing, idle unload,
-the token check, hotkey parsing and config without models or a mic. `python replay.py a.wav b.wav …` plays clips through the real pipeline at real-time pace and
-prints each one's engine, route and end of speech → final latency (`--no-speculation`, `--window 0`,
-`--en bark-plus|none`, `--mode no|en`, `--ptt` to compare).
+the token check, hotkey parsing, config, and speech back's sentences, voice choice and playback queue (fake
+voices) without models, mic or speakers. `python replay.py a.wav b.wav …` plays clips through the real pipeline
+at real-time pace and prints each one's engine, route and end of speech → final latency (`--no-speculation`,
+`--window 0`, `--en bark-plus|none`, `--mode no|en`, `--ptt` to compare).
+
+**The test set:** `python record_testset.py` has you read the 60 prompts in `testset_prompts.tsv` (20 English,
+20 Norwegian, 20 Norwegian with English words; 1-word commands to 30 s dictation) into `testset/` (git-ignored,
+stays on this PC). `python benchmark.py [--en bark-plus] [--only en|no|mx]` plays them through the real
+push-to-talk pipeline and reports routing, word error rate and release → text latency per clip and group.
 
 ## Rules it keeps
 
-- Audio goes from the mic to the transcriber and nowhere else; nothing is stored. Only the text leaves,
-  and only to whoever is connected to `/v1/listen` with the token.
+- Audio goes from the mic to the transcriber and nowhere else; the service stores nothing. Only the text
+  leaves, and only to whoever is connected to `/v1/listen` with the token. (`record_testset.py` is the one thing
+  that saves your voice, because you run it, into `testset/`.)
 - Push-to-talk by default: nothing is transcribed unless the key is held.
 - Binds 127.0.0.1; `run.py` refuses any other host.
 - Speech back is off unless `tts.enabled: true`; with it off, no TTS model is loaded.

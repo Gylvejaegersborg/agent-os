@@ -50,7 +50,14 @@ DEFAULTS: dict[str, Any] = {
         # Speech back is an option, off by default: with it off, no TTS model is loaded.
         "enabled": False,
         "en": {"engine": "kokoro", "model": "models/kokoro-v1.0.int8.onnx", "voices": "models/voices-v1.0.bin", "voice": "af_heart"},
-        "sample_rate": 24000,
+        # Norwegian: Piper's one Norwegian voice (Kokoro has none).
+        "no": {"engine": "piper", "model": "models/piper/no/no_NO/talesyntese/medium/no_NO-talesyntese-medium.onnx"},
+        "lang_model": "models/lid.176.ftz",  # fastText language ID, per sentence
+        "sample_rate": 24000,  # both voices are resampled to this, so the output device never reopens
+        "playback": True,  # /v1/speak plays on this machine's speakers; false = files from /v1/audio/speech only
+        "output_device": None,  # null = Windows' default output; or a name/index from: python -m sounddevice
+        # Push-to-talk always interrupts speech. With the open mic, speech could too, but the mic hears the speakers.
+        "barge_in_open_mic": False,
     },
     # idle_unload_min: NB-Whisper, the English engine and Kokoro are dropped after this long unused (0 = never) and
     # reloaded when speech starts; the VAD and language ID stay loaded.

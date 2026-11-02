@@ -1,0 +1,61 @@
+id	expect	text
+en01	en	Pause.
+en02	en	Next track.
+en03	en	Open my calendar.
+en04	en	Mute the mic.
+en05	en	What time is it?
+en06	en	Add a task to fix the mix before Friday.
+en07	en	Remind me to send the stems to the mastering engineer.
+en08	en	What's on my schedule tomorrow morning?
+en09	en	How many tasks are waiting for approval?
+en10	en	Move the release date to the end of the month.
+en11	en	Create a note called ideas for the next single.
+en12	en	Show me everything I worked on last week.
+en13	en	Ask Hemera to plan the week around the album deadline.
+en14	en	Turn the volume down and play something quiet.
+en15	en	Can you check whether the gateway is running and tell me how many agents are idle?
+en16	en	Summarize the notes from yesterday's session and list anything that is still open.
+en17	en	Draft a short message to the label saying the masters will be ready on Thursday.
+en18	en	I want to spend the morning on the vocal edits, then the afternoon on mixing, and keep the evening free. Block that out in the calendar, and move anything that clashes to next week if it isn't urgent.
+en19	en	Here's the plan for the release. The single goes out first, two weeks before the album. We need the cover art finished by the tenth, the stems delivered to the mastering engineer by the twelfth, and a short teaser video for every platform.
+en20	en	Write this down as a note. The bridge works better at a slower tempo, the second verse needs fewer layers, and the vocal in the chorus is too far forward. Try a darker reverb and check it on the small speakers before the next bounce.
+no01	no	Stopp.
+no02	no	Neste låt.
+no03	no	Åpne kalenderen.
+no04	no	Hva er klokka?
+no05	no	Legg til en oppgave om å fikse miksen.
+no06	no	Hva står på kalenderen min i morgen?
+no07	no	Hvordan finner jeg fram til kvulpen?
+no08	no	Minn meg på å ringe studioet før lunsj.
+no09	no	Flytt møtet med labelen til neste uke.
+no10	no	Lag et notat som heter ideer til neste singel.
+no11	no	Vis meg alt jeg jobbet med i går.
+no12	no	Hvor mange oppgaver venter på godkjenning?
+no13	no	Skru ned lyden og spill noe rolig.
+no14	no	Be Hemera planlegge uka rundt albumfristen.
+no15	no	Kan du sjekke om alt er klart før vi slipper singelen på fredag?
+no16	no	Skriv ned at refrenget trenger mer luft og at basslinja er for høy.
+no17	no	Oppsummer det vi gjorde i går og si hva som fortsatt er åpent.
+no18	no	I morgen vil jeg bruke formiddagen på vokalen og ettermiddagen på miksen. Sett av tid til det i kalenderen, og flytt det som kolliderer til neste uke hvis det ikke haster.
+no19	no	Planen for utgivelsen er slik. Singelen kommer først, to uker før albumet. Coveret må være ferdig til den tiende, og vi trenger en kort video til hver plattform. Spør meg hvis noe av dette ikke går.
+no20	no	Skriv dette som et notat. Broen fungerer bedre i et roligere tempo, andre vers trenger færre lag, og vokalen i refrenget ligger for langt fram. Prøv en mørkere romklang og sjekk det på de små høyttalerne.
+mx01	no	Send stems til mastering.
+mx02	no	Sjekk feedbacken.
+mx03	no	Åpne playlisten.
+mx04	no	Kan du sende stems til mastering engineeren i morgen?
+mx05	no	Jeg trenger en reminder om deadline på fredag.
+mx06	no	Legg til en task om å fikse sidechain på kicken.
+mx07	no	Hvor mange streams fikk singelen den første uka?
+mx08	no	Bounce miksen og last den opp til Dropbox.
+mx09	no	Sett release date til første fredag i neste måned.
+mx10	no	Lag en to do om å oppdatere bioen på Spotify.
+mx11	no	Spør Hermes om pitchen til playlistene er sendt.
+mx12	no	Gi meg feedback på hooken i refrenget.
+mx13	no	Minn meg på mastering sessionen klokka to.
+mx14	no	Har labelen svart på mailen om artworken?
+mx15	no	Flytt studio sessionen og send en heads up til produsenten.
+mx16	no	Skriv et notat om at drop'et trenger mer punch og at hi-hatsene er for skarpe.
+mx17	no	Kan du lage en tracklist for albumet og sjekke at alle ISRC-kodene er på plass?
+mx18	no	Planen er å droppe teaseren på TikTok og Instagram på mandag, så kommer full release på fredag. Sørg for at pre-save linken er klar og at alle assets er lastet opp før helga.
+mx19	no	Skriv et notat. Kicken og bassen clasher rundt seksti hertz, så prøv en dynamisk EQ på bassen. Vokalen trenger litt mer presence, og reverben på snaren er for lang i breakdownen.
+mx20	no	I dag har jeg jobbet med vocal edits og comping, og i morgen vil jeg gjøre ferdig mixen. Sett av tid til en listening session på fredag, og send en reminder til alle som skal være med.

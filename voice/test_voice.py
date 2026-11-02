@@ -1,5 +1,6 @@
-"""Tests that need no models or mic: config merging, the utterance segmenter, routing and hotkey parsing.
-Run: python test_voice.py   (stdlib only)"""
+"""Tests that need no models, mic or speakers: config merging, the utterance segmenter, push-to-talk, routing,
+idle unload, the token, hotkey parsing, and speech back's sentence splitting, per-sentence language and playback
+queue (with fake voices). Run with the service's venv: python test_voice.py"""
 
 from __future__ import annotations
 
@@ -17,6 +18,9 @@ from voice_service.hotkey import parse as parse_hotkey  # noqa: E402
 from voice_service.lazy import Lazy  # noqa: E402
 from voice_service.router import Router  # noqa: E402
 from voice_service.segmenter import HoldRecorder, Segmenter  # noqa: E402
+from voice_service.speech import SentenceLanguage, SentenceSplitter, Speaker, first_clause, split_sentences  # noqa: E402
+
+import numpy as np  # noqa: E402
 
 failed = False
 
@@ -219,6 +223,80 @@ with tempfile.TemporaryDirectory() as d:
         os.environ.pop("AGENT_OS_GATEWAY_TOKEN", None)
         if saved is not None:
             os.environ["AGENT_OS_GATEWAY_TOKEN"] = saved
+
+print("-- speech back: sentences --")
+check(split_sentences("Hello there, how are you? I'm fine. Thanks.") == ["Hello there, how are you?", "I'm fine. Thanks."], "split at sentence ends; a fragment under 4 words at the end joins the one before")
+check(split_sentences("Ok. The masters are ready on Thursday.") == ["Ok. The masters are ready on Thursday."], "a short fragment waits and joins the next sentence")
+check(split_sentences("Version 2.5 is out now, finally!") == ["Version 2.5 is out now, finally!"], "no split inside a number")
+check(split_sentences("Første linje kommer her\nAndre linje kommer etterpå") == ["Første linje kommer her", "Andre linje kommer etterpå"], "a newline ends a sentence")
+check(first_clause("The mastering engineer says, after a long talk, that Thursday works.") == ["The mastering engineer says,", "after a long talk, that Thursday works."], "a reply's first sentence starts with its first clause")
+check(first_clause("Ok, that works for me.") == ["Ok, that works for me."] and first_clause("No comma in this one at all") == ["No comma in this one at all"], "…only when the clause is 4+ words and 3+ follow")
+sp = SentenceSplitter()
+got = sp.feed("Singelen kommer fø") + sp.feed("rst, to uker før albumet. Cove")
+check(got == ["Singelen kommer først, to uker før albumet."], "streamed: a sentence comes out as soon as it ends")
+check(sp.feed("ret må være ferdig") == [] and sp.flush() == ["Coveret må være ferdig"], "…and the rest at the end")
+
+fake = {"The masters will be ready on Thursday.": ("en", 0.99), "Kan du sjekke at alt er klart?": ("no", 0.7), "Dette er kanskje dansk tekst her.": ("da", 0.9), "Something unsure but long enough.": ("en", 0.4)}
+lang = SentenceLanguage(lambda s: fake.get(s, ("en", 0.99)))
+check(lang("Kan du sjekke at alt er klart?") == "no", "Norwegian sentence → no")
+check(lang("The masters will be ready on Thursday.") == "en", "English sentence → en")
+check(lang("Ok, takk.") == "en", "under 5 words: keeps the previous sentence's language")
+check(lang("Something unsure but long enough.") == "en", "unsure (< 0.6): keeps the previous language")
+check(lang("Dette er kanskje dansk tekst her.") == "no", "Danish/Swedish/other → the Norwegian voice")
+check(lang("The masters will be ready on Thursday.", forced="no") == "no", "a forced language wins")
+check(SentenceLanguage(None)("Whatever this says, it is long.") == "no", "no language ID: the default (no)")
+
+print("-- speech back: playback queue --")
+
+
+class FakeVoice:
+    def __init__(self, name, seconds, delay=0.0):
+        self.name, self.seconds, self.delay, self.said = name, seconds, delay, []
+
+    def run(self, fn):
+        return fn(self)
+
+    def synthesize(self, text):
+        time.sleep(self.delay)
+        self.said.append(text)
+        return np.full(int(24000 * self.seconds), 0.3, np.float32)
+
+
+events = []
+en, no = FakeVoice("kokoro", 0.2), FakeVoice("piper", 0.3)
+spk = Speaker({"en": en, "no": no}, SentenceLanguage(lambda s: ("en", 0.99) if "English" in s else ("no", 0.99)), emit=events.append, play=False)
+spk.say(["This one is English, clearly.", "Denne er norsk, helt klart.", "And English once more here."])
+time.sleep(0.3)  # synthesis runs ahead of playback
+played = np.concatenate([spk.next_block(480) for _ in range(60)])  # 1.2 s, 20 ms blocks
+voiced = np.flatnonzero(played)
+check(en.said == ["This one is English, clearly.", "And English once more here."] and no.said == ["Denne er norsk, helt klart."], "each sentence goes to its language's voice")
+check(voiced.size > 0 and voiced[-1] - voiced[0] + 1 == voiced.size, "no gap between sentences (or engines) once they're made ahead")
+kinds = [e["type"] for e in events]
+check(kinds[0] == "speak_start" and kinds.count("sentence") == 3 and kinds[-1] == "speak_end" and not spk.speaking, "speak_start, a sentence event each, speak_end when done")
+check([e["engine"] for e in events if e["type"] == "sentence"] == ["kokoro", "piper", "kokoro"], "sentence events name the engine")
+
+events.clear()
+spk.say(["Denne setningen er lang nok til å stoppes."] * 3)
+time.sleep(0.2)
+spk.next_block(480)
+check(spk.speaking, "speaking again")
+check(spk.stop("barge_in") and not np.any(spk.next_block(480)), "stop(): the very next 20 ms block is silent")
+time.sleep(0.2)
+check(not np.any(np.concatenate([spk.next_block(480) for _ in range(20)])), "…and nothing queued plays after it")
+check(events[-1]["type"] == "speak_end" and events[-1]["reason"] == "barge_in", "speak_end says why (barge_in)")
+
+slow = FakeVoice("piper", 0.2, delay=0.05)
+events.clear()
+spk2 = Speaker({"no": slow}, SentenceLanguage(None), emit=events.append, play=False)
+spk2.say(["En setning som tar tid å lage.", "Og en til som også tar tid."])
+time.sleep(0.08)
+for _ in range(30):
+    spk2.next_block(480)
+time.sleep(0.1)
+for _ in range(30):
+    spk2.next_block(480)
+check([e["type"] for e in events].count("speak_end") == 1, "a sentence still being made doesn't end the speech early")
+check(Speaker({"no": slow}, SentenceLanguage(None), play=False).engine_for("en") is slow, "no English voice: the Norwegian one speaks it")
 
 print("-- config --")
 cfg = load_config(Path(tempfile.gettempdir()) / "does-not-exist.yaml")

@@ -3,11 +3,18 @@
 Routes:
   GET  /health                     loaded models, mode, mic, routing counts, RAM, last latencies
   POST /v1/audio/transcriptions    file upload → text; language "no"/"en", or auto (language ID picks the engine)
-  POST /v1/audio/speech            text → wav/pcm (Kokoro) — only when tts.enabled; off by default
-  WS   /v1/listen                  live mic events: speech_start, speech_end, final, mode
+  POST /v1/audio/speech            text → wav/pcm, a voice per sentence (Kokoro en, Piper no) — tts.enabled only
+  POST /v1/speak                   text → spoken on this machine's speakers, sentence by sentence — tts.enabled only
+  POST /v1/speak/stop              stop speaking now and drop the rest
+  WS   /v1/speak                   stream text in ({"type": "text", "text": …}, then "end" or "cancel"), spoken as
+                                   each sentence completes; sentence/speak events come back
+  WS   /v1/listen                  live events: ptt_start/ptt_end, speech_start/speech_end, final, mode,
+                                   speak_start/sentence/speak_end, barge_in
   POST /v1/control                 {"mute": true|false, "mode": "auto"|"no"|"en"|"next", "ptt": true|false}
 
 Every route but GET /health needs `Authorization: Bearer <the gateway token>` (auth.py).
+Barge-in: pressing push-to-talk while it speaks stops the sound and drops the rest (tts.barge_in_open_mic also
+lets plain speech do it with the open mic; off, because the mic hears the speakers).
 """
 
 from __future__ import annotations
@@ -16,19 +23,41 @@ import asyncio
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
+import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
-from .config import load_config, model_path
-from .engines import KokoroTts, to_pcm16, to_wav
 from .auth import has_token, load_token
+from .config import load_config, model_path
+from .engines import KokoroTts, PiperTts, to_pcm16, to_wav
 from .hotkey import Hotkey
 from .lazy import Lazy, start_idle_watch
 from .router import MODES
+from .speech import SentenceLanguage, SentenceSplitter, Speaker, fasttext_detector, split_sentences
 from .stt import SpeechToText
+
+SENTENCE_PAUSE_S = 0.12  # between sentences in a /v1/audio/speech file
+
+
+class Bus:
+    """Every event the service has (mic and speech) to every /v1/listen subscriber."""
+
+    def __init__(self) -> None:
+        self._listeners: list[Callable[[dict[str, Any]], None]] = []
+
+    def subscribe(self, fn: Callable[[dict[str, Any]], None]) -> Callable[[], None]:
+        self._listeners.append(fn)
+        return lambda: self._listeners.remove(fn) if fn in self._listeners else None
+
+    def emit(self, event: dict[str, Any]) -> None:
+        for fn in list(self._listeners):
+            try:
+                fn(event)
+            except Exception as err:
+                print(f"[voice] listener failed: {err}")
 
 
 class State:
@@ -39,11 +68,14 @@ class State:
     ptt_key: Optional[Hotkey] = None
     ptt_error: Optional[str] = None
     token: Optional[str] = None
-    tts: Optional[Lazy[KokoroTts]] = None
+    tts: dict[str, Lazy] = {}  # "en" → Kokoro, "no" → Piper
+    tts_errors: dict[str, str] = {}
+    speaker: Optional[Speaker] = None
     idle_watch: Any = None
     mic: Any = None
     mic_error: Optional[str] = None
     started: float = 0.0
+    bus: Bus = Bus()
 
 
 state = State()
@@ -61,8 +93,55 @@ def set_priority(level: str) -> None:
         print(f"[voice] could not lower priority: {err}")
 
 
+def load_speech_back(cfg: dict[str, Any], idle_s: float) -> None:
+    t = cfg["tts"]
+    rate = t["sample_rate"]
+    factories = {
+        "en": (KokoroTts.name, lambda: KokoroTts(model_path(t["en"]["model"]), model_path(t["en"]["voices"]), t["en"]["voice"], sample_rate=rate)),
+        "no": (PiperTts.name, lambda: PiperTts(model_path(t["no"]["model"]), sample_rate=rate)),
+    }
+    state.tts, state.tts_errors = {}, {}
+    for lang, (name, make) in factories.items():
+        t0 = time.perf_counter()
+        lazy = Lazy(name, make, idle_s)
+        try:
+            lazy.load()
+            state.tts[lang] = lazy
+            print(f"[voice] {name} ({lang}) loaded in {time.perf_counter() - t0:.1f}s")
+        except Exception as err:  # the other voice still speaks
+            state.tts_errors[lang] = str(err)
+            print(f"[voice] no {lang} voice: {err}")
+    if not state.tts:
+        return
+    try:
+        detect = fasttext_detector(model_path(t["lang_model"]))
+    except Exception as err:
+        detect = None
+        print(f"[voice] no text language ID ({err}): every sentence keeps the request's or the last language")
+    try:
+        state.speaker = Speaker(
+            state.tts, SentenceLanguage(detect), sample_rate=rate, device=t.get("output_device"), emit=state.bus.emit, play=t.get("playback", True)
+        )
+    except Exception as err:  # no output device: files from /v1/audio/speech still work
+        state.speaker = Speaker(state.tts, SentenceLanguage(detect), sample_rate=rate, emit=state.bus.emit, play=False)
+        state.tts_errors["playback"] = str(err)
+        print(f"[voice] no speakers ({err}); /v1/audio/speech still works")
+
+
+def barge_in(event: dict[str, Any]) -> None:
+    """Pressing push-to-talk (or, with tts.barge_in_open_mic, speech on the open mic) while speaking stops it."""
+    sp = state.speaker
+    if sp is None or not sp.speaking:
+        return
+    kind = event.get("type")
+    if kind == "ptt_start" or (kind == "speech_start" and state.cfg["tts"].get("barge_in_open_mic")):
+        sp.stop("barge_in")
+        state.bus.emit({"type": "barge_in", "t": time.time()})
+
+
 def load(cfg: dict[str, Any]) -> None:
     r = cfg["resources"]
+    idle_s = 60 * (r.get("idle_unload_min") or 0)
     set_priority(r["priority"])
     state.cfg = cfg
     state.started = time.time()
@@ -72,21 +151,12 @@ def load(cfg: dict[str, Any]) -> None:
     else:
         print("[voice] auth OFF (auth.enabled: false): any program on this machine, any web page included, can read your dictation")
     state.stt = SpeechToText(cfg)
-    t = cfg["tts"]
-    if t["enabled"]:
-        t0 = time.perf_counter()
-        en = t["en"]
-        state.tts = Lazy(
-            KokoroTts.name,
-            lambda: KokoroTts(model_path(en["model"]), model_path(en["voices"]), en["voice"], sample_rate=t["sample_rate"]),
-            60 * (r.get("idle_unload_min") or 0),
-        )
-        state.tts.load()
-        print(f"[voice] Kokoro loaded in {time.perf_counter() - t0:.1f}s")
+    if cfg["tts"]["enabled"]:
+        load_speech_back(cfg, idle_s)
     else:
         print("[voice] speech back is off (tts.enabled: false) — no TTS model loaded")
-    lazy = state.stt.lazy_models + ([state.tts] if state.tts else [])
-    if r.get("idle_unload_min"):
+    lazy = state.stt.lazy_models + list(state.tts.values())
+    if idle_s:
         state.idle_watch = start_idle_watch(lazy)
         print(f"[voice] {', '.join(m.name for m in lazy)} unload after {r['idle_unload_min']} min idle; speech reloads them")
     if cfg["mic"]["enabled"]:
@@ -96,6 +166,8 @@ def load(cfg: dict[str, Any]) -> None:
 
             vad = SileroVad(model_path(cfg["vad"]["model"]), sample_rate=cfg["audio"]["sample_rate"])
             state.mic = MicListener(cfg, vad, state.stt)
+            state.mic.subscribe(barge_in)  # first, so the sound stops before anyone else hears of the press
+            state.mic.subscribe(state.bus.emit)
             state.mic.start()
             print(f"[voice] listening on: {state.mic.device_name}")
         except Exception as err:  # the HTTP routes still work without a mic
@@ -147,6 +219,8 @@ async def lifespan(_app: FastAPI):
             key.stop()
     if state.mic is not None:
         state.mic.stop()
+    if state.speaker is not None:
+        state.speaker.close()
 
 
 app = FastAPI(title="agent-os voice", lifespan=lifespan)
@@ -168,6 +242,7 @@ def health() -> dict[str, Any]:
         rss = round(psutil.Process(os.getpid()).memory_info().rss / 2**20)
     except Exception:
         pass
+    lazy = (state.stt.lazy_models if state.stt else []) + list(state.tts.values())
     return {
         "ok": state.stt is not None,
         "uptime_s": round(time.time() - state.started),
@@ -175,11 +250,12 @@ def health() -> dict[str, Any]:
             "stt.no": state.stt.no.name if state.stt else None,
             "stt.en": state.stt.en.name if state.stt and state.stt.en else None,
             "lang_id": state.stt.langid.name if state.stt and state.stt.langid else None,
-            "tts.en": state.tts.name if state.tts else None,
+            "tts.en": state.tts["en"].name if "en" in state.tts else None,
+            "tts.no": state.tts["no"].name if "no" in state.tts else None,
             "vad": "silero-v5" if state.mic else None,
         },
         # Lazy models: loaded now, or dropped after resources.idle_unload_min idle (reloaded on speech).
-        "loaded": {m.name: m.loaded for m in (state.stt.lazy_models if state.stt else []) + ([state.tts] if state.tts else [])},
+        "loaded": {m.name: m.loaded for m in lazy},
         "english_routing": {"on": bool(state.stt and state.stt.en), "error": state.stt.en_error if state.stt else None},
         "mode": state.stt.router.mode if state.stt else None,
         "hotkey": {"combo": state.hotkey.combo if state.hotkey else None, "error": state.hotkey_error},
@@ -190,7 +266,12 @@ def health() -> dict[str, Any]:
             "held": bool(state.mic and state.mic.held),
         },
         "auth": bool(state.token),
-        "speech_back": bool(state.tts),
+        "speech_back": {
+            "on": bool(state.tts),
+            "voices": {lang: lz.name for lang, lz in state.tts.items()},
+            "speaking": bool(state.speaker and state.speaker.speaking),
+            "errors": state.tts_errors,
+        },
         "mic": {
             "listening": state.mic is not None and not state.mic.muted,
             "device": state.mic.device_name if state.mic else None,
@@ -204,7 +285,7 @@ def health() -> dict[str, Any]:
             "stt.no": state.stt.no.last_ms if state.stt else None,
             "stt.en": state.stt.en.last_ms if state.stt and state.stt.en else None,
             "lang_id": state.stt.langid.last_ms if state.stt and state.stt.langid else None,
-            "tts": state.tts.last_ms if state.tts else None,
+            **{f"tts.{lang}": lz.last_ms for lang, lz in state.tts.items()},
         },
     }
 
@@ -236,30 +317,122 @@ async def transcriptions(file: UploadFile = File(...), model: str = Form("auto")
     }
 
 
+def _need_speech_back() -> Speaker:
+    if state.speaker is None:
+        raise HTTPException(409, "speech back is off — set tts.enabled: true in voice/voice.yaml (python fetch_models.py --tts) and restart")
+    return state.speaker
+
+
+def _language(value: Optional[str]) -> Optional[str]:
+    if value in (None, "", "auto"):
+        return None
+    if value in ("no", "nb", "nn"):
+        return "no"
+    if value == "en":
+        return "en"
+    raise HTTPException(400, "language must be no, en or auto")
+
+
 class SpeechRequest(BaseModel):
     input: str
     model: str = "auto"
     voice: Optional[str] = None
     response_format: str = "wav"
     speed: float = 1.0
-    language: Optional[str] = None
+    language: Optional[str] = None  # no | en | auto (default: per sentence)
 
 
 @app.post("/v1/audio/speech")
 async def speech(req: SpeechRequest) -> Response:
-    if state.tts is None:
-        raise HTTPException(409, "speech back is off — set tts.enabled: true in voice/voice.yaml and restart")
+    sp = _need_speech_back()
     if not req.input.strip():
         raise HTTPException(400, "input is empty")
-    if req.language not in (None, "", "en"):
-        raise HTTPException(400, "phase 1 speaks English only (Norwegian via Piper comes in phase 3)")
     if req.response_format not in ("wav", "pcm"):
         raise HTTPException(400, "response_format must be wav or pcm")
-    audio = await asyncio.to_thread(state.tts.run, lambda k: k.synthesize(req.input, req.voice, req.speed))
+    forced = _language(req.language)
     rate = state.cfg["tts"]["sample_rate"]
+
+    def make() -> np.ndarray:
+        decide = SentenceLanguage(sp._language._detect)  # its own memory: a file is judged on its own sentences
+        parts: list[np.ndarray] = []
+        for s in split_sentences(req.input):
+            audio, _engine = sp.synthesize(s, decide(s, forced))
+            parts += [audio, np.zeros(int(SENTENCE_PAUSE_S * rate), np.float32)]
+        return np.concatenate(parts[:-1]) if parts else np.zeros(0, np.float32)
+
+    audio = await asyncio.to_thread(make)
     if req.response_format == "pcm":
         return Response(to_pcm16(audio), media_type="audio/pcm", headers={"x-sample-rate": str(rate)})
     return Response(to_wav(audio, rate), media_type="audio/wav")
+
+
+class SpeakRequest(BaseModel):
+    input: str
+    language: Optional[str] = None  # no | en | auto (default: per sentence)
+    interrupt: bool = True  # stop whatever is being said first; false queues after it
+
+
+@app.post("/v1/speak")
+def speak(req: SpeakRequest) -> dict[str, Any]:
+    sp = _need_speech_back()
+    forced = _language(req.language)
+    if req.interrupt:
+        sp.stop("replaced")
+    sentences = split_sentences(req.input)
+    sp.say(sentences, forced)
+    return {"sentences": len(sentences)}
+
+
+@app.post("/v1/speak/stop")
+def speak_stop() -> dict[str, Any]:
+    sp = _need_speech_back()
+    return {"stopped": sp.stop("stop")}
+
+
+@app.websocket("/v1/speak")
+async def speak_stream(ws: WebSocket) -> None:
+    """For a reply streamed from a model: speaks each sentence as soon as it's complete."""
+    if state.token and not has_token(ws.headers.get("authorization"), state.token):
+        await ws.close(code=4401)
+        return
+    await ws.accept()
+    sp = state.speaker
+    if sp is None:
+        await ws.send_json({"type": "error", "error": "speech back is off (tts.enabled: false)"})
+        await ws.close()
+        return
+    loop = asyncio.get_running_loop()
+    out: asyncio.Queue = asyncio.Queue(maxsize=100)
+    unsubscribe = state.bus.subscribe(
+        lambda e: e.get("type") in ("speak_start", "sentence", "speak_end", "barge_in") and loop.call_soon_threadsafe(lambda: out.full() or out.put_nowait(e))
+    )
+    splitter = SentenceSplitter()
+    forced: Optional[str] = None
+
+    async def pump() -> None:
+        while True:
+            await ws.send_json(await out.get())
+
+    sender = asyncio.create_task(pump())
+    try:
+        sp.stop("replaced")
+        while True:
+            msg = await ws.receive_json()
+            kind = msg.get("type")
+            if "language" in msg:
+                forced = _language(msg.get("language"))
+            if kind == "text":
+                sp.say(splitter.feed(str(msg.get("text", ""))), forced)
+            elif kind == "end":
+                sp.say(splitter.flush(), forced)
+            elif kind == "cancel":
+                splitter = SentenceSplitter()
+                sp.stop("cancel")
+    except (WebSocketDisconnect, RuntimeError, HTTPException):
+        pass
+    finally:
+        sender.cancel()
+        unsubscribe()
 
 
 class ControlRequest(BaseModel):
@@ -295,7 +468,7 @@ async def listen(ws: WebSocket) -> None:
         await ws.close(code=4401)  # before accept: a page that can't send the token learns nothing
         return
     await ws.accept()
-    if state.mic is None:
+    if state.mic is None and state.speaker is None:
         await ws.send_json({"type": "error", "error": f"the mic isn't running ({state.mic_error or 'mic.enabled is false'})"})
         await ws.close()
         return
@@ -305,7 +478,7 @@ async def listen(ws: WebSocket) -> None:
     def push(event: dict[str, Any]) -> None:
         loop.call_soon_threadsafe(lambda: events.full() or events.put_nowait(event))
 
-    unsubscribe = state.mic.subscribe(push)
+    unsubscribe = state.bus.subscribe(push)
     try:
         while True:
             await ws.send_json(await events.get())
