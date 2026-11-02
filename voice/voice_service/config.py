@@ -26,7 +26,26 @@ DEFAULTS: dict[str, Any] = {
         "min_chars": 2,
         # Encode only as much of Whisper's 30 s window as the clip needs, at least this much (0 = full 30 s).
         "min_window_s": 10,
+        # English goes here when language ID is sure (phase 2); null = everything to NB-Whisper.
+        "en": "phonon-2",
+        "en_engines": {
+            "phonon-2": {"runtime": "onnx-asr", "path": "models/phonon-2"},
+            "bark-plus": {"runtime": "sherpa-onnx", "path": "models/bark-3.0-plus"},
+        },
     },
+    "lang_id": {
+        "model": "models/whisper-tiny",
+        "en_threshold": 0.80,  # English at least this sure → the English engine; anything else → NB-Whisper
+        "sticky_conf": 0.90,  # a detection this sure is reused for the next utterances…
+        # …for this long after it. Off: live, it sent a Norwegian/English mix to the English-only engine and an
+        # English command to NB-Whisper (which translated it), while language ID alone got every one right.
+        # Language ID runs while you talk, so skipping it saves no time you'd notice.
+        "sticky_window_s": 0,
+        "after_ms": 1000,  # run language ID once this much speech is in, while you're still talking
+        "max_s": 3.0,  # look at no more than this much of the start
+    },
+    "mode": "auto",  # auto | no | en; the hotkey and POST /v1/control change it while running
+    "hotkey": "ctrl+alt+l",  # cycles auto → no → en; null = no hotkey
     "tts": {
         # Speech back is an option, off by default: with it off, no TTS model is loaded.
         "enabled": False,

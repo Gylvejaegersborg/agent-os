@@ -1,11 +1,11 @@
 """The voice service: one process, models loaded once, OpenAI-compatible routes on 127.0.0.1 only.
 
-Phase 1 routes:
-  GET  /health                     loaded models, mic, RAM, last latencies
-  POST /v1/audio/transcriptions    file upload → text (NB-Whisper, Norwegian)
+Routes:
+  GET  /health                     loaded models, mode, mic, routing counts, RAM, last latencies
+  POST /v1/audio/transcriptions    file upload → text; language "no"/"en", or auto (language ID picks the engine)
   POST /v1/audio/speech            text → wav/pcm (Kokoro) — only when tts.enabled; off by default
-  WS   /v1/listen                  live mic events: speech_start, speech_end, final
-  POST /v1/control                 {"mute": true|false}
+  WS   /v1/listen                  live mic events: speech_start, speech_end, final, mode
+  POST /v1/control                 {"mute": true|false, "mode": "auto"|"no"|"en"|"next"}
 """
 
 from __future__ import annotations
@@ -21,12 +21,17 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from .config import load_config, model_path
-from .engines import KokoroTts, NbWhisper, to_pcm16, to_wav
+from .engines import KokoroTts, to_pcm16, to_wav
+from .hotkey import Hotkey
+from .router import MODES
+from .stt import SpeechToText
 
 
 class State:
     cfg: dict[str, Any]
-    stt: Optional[NbWhisper] = None
+    stt: Optional[SpeechToText] = None
+    hotkey: Optional[Hotkey] = None
+    hotkey_error: Optional[str] = None
     tts: Optional[KokoroTts] = None
     mic: Any = None
     mic_error: Optional[str] = None
@@ -53,9 +58,7 @@ def load(cfg: dict[str, Any]) -> None:
     set_priority(r["priority"])
     state.cfg = cfg
     state.started = time.time()
-    t0 = time.perf_counter()
-    state.stt = NbWhisper(model_path(cfg["stt"]["no"]), threads=r["threads"], beam=cfg["stt"]["no_beam"], min_chars=cfg["stt"]["min_chars"], min_window_s=cfg["stt"]["min_window_s"])
-    print(f"[voice] NB-Whisper loaded in {time.perf_counter() - t0:.1f}s")
+    state.stt = SpeechToText(cfg)
     t = cfg["tts"]
     if t["enabled"]:
         t0 = time.perf_counter()
@@ -77,6 +80,25 @@ def load(cfg: dict[str, Any]) -> None:
             state.mic = None
             state.mic_error = str(err)
             print(f"[voice] mic not started: {err}")
+    if cfg.get("hotkey"):
+        try:
+            state.hotkey = Hotkey(cfg["hotkey"], lambda: set_mode("next"))
+            if state.hotkey.start():
+                print(f"[voice] {cfg['hotkey']} cycles the mode (auto → no → en); now {state.stt.router.mode}")
+            else:
+                state.hotkey_error, state.hotkey = state.hotkey.error, None
+        except ValueError as err:
+            state.hotkey_error = str(err)
+        if state.hotkey_error:
+            print(f"[voice] no mode hotkey: {state.hotkey_error}")
+
+
+def set_mode(mode: str) -> str:
+    if state.mic is not None:
+        return state.mic.set_mode(mode)  # also tells /v1/listen subscribers
+    m = state.stt.router.next_mode() if mode == "next" else state.stt.router.set_mode(mode)
+    print(f"[voice] mode: {m}")
+    return m
 
 
 @asynccontextmanager
@@ -84,6 +106,8 @@ async def lifespan(_app: FastAPI):
     if not getattr(state, "cfg", None):
         load(load_config())
     yield
+    if state.hotkey is not None:
+        state.hotkey.stop()
     if state.mic is not None:
         state.mic.stop()
 
@@ -104,10 +128,15 @@ def health() -> dict[str, Any]:
         "ok": state.stt is not None,
         "uptime_s": round(time.time() - state.started),
         "models": {
-            "stt.no": state.stt.name if state.stt else None,
+            "stt.no": state.stt.no.name if state.stt else None,
+            "stt.en": state.stt.en.name if state.stt and state.stt.en else None,
+            "lang_id": state.stt.langid.name if state.stt and state.stt.langid else None,
             "tts.en": state.tts.name if state.tts else None,
             "vad": "silero-v5" if state.mic else None,
         },
+        "english_routing": {"on": bool(state.stt and state.stt.en), "error": state.stt.en_error if state.stt else None},
+        "mode": state.stt.router.mode if state.stt else None,
+        "hotkey": {"combo": state.hotkey.combo if state.hotkey else None, "error": state.hotkey_error},
         "speech_back": bool(state.tts),
         "mic": {
             "listening": state.mic is not None and not state.mic.muted,
@@ -115,9 +144,15 @@ def health() -> dict[str, Any]:
             "error": state.mic_error,
             "dropped_frames": state.mic.dropped_frames if state.mic else 0,
             "speculation": state.mic.stats if state.mic else None,
+            "routes": state.mic.routes if state.mic else None,
         },
         "ram_mb": rss,
-        "last_ms": {"stt": state.stt.last_ms if state.stt else None, "tts": state.tts.last_ms if state.tts else None},
+        "last_ms": {
+            "stt.no": state.stt.no.last_ms if state.stt else None,
+            "stt.en": state.stt.en.last_ms if state.stt and state.stt.en else None,
+            "lang_id": state.stt.langid.last_ms if state.stt and state.stt.langid else None,
+            "tts": state.tts.last_ms if state.tts else None,
+        },
     }
 
 
@@ -125,13 +160,27 @@ def health() -> dict[str, Any]:
 async def transcriptions(file: UploadFile = File(...), model: str = Form("auto"), language: Optional[str] = Form(None)) -> dict[str, Any]:
     if state.stt is None:
         raise HTTPException(503, "speech-to-text is not loaded")
-    if language not in (None, "", "no", "nb", "nn"):
-        raise HTTPException(400, "phase 1 transcribes Norwegian only (English routing comes in phase 2)")
+    if language not in (None, "", "auto", "no", "nb", "nn", "en"):
+        raise HTTPException(400, "language must be no, en or auto (Norwegian or English)")
     import io
 
-    data = io.BytesIO(await file.read())
-    t = await asyncio.to_thread(state.stt.transcribe, data)
-    return {"text": t.text, "language": t.language, "engine": t.engine, "confidence": t.confidence, "duration": t.duration_s, "took_ms": t.took_ms}
+    from faster_whisper.audio import decode_audio
+
+    audio = await asyncio.to_thread(decode_audio, io.BytesIO(await file.read()), 16000)
+    try:
+        t, r = await asyncio.to_thread(state.stt.transcribe_file, audio, language or None if language != "auto" else None)
+    except LookupError as err:
+        raise HTTPException(409, str(err))
+    return {
+        "text": t.text,
+        "language": t.language,
+        "engine": t.engine,
+        "route": r.reason,
+        "detected": {"language": r.language, "prob": round(r.prob, 3)} if r.language else None,
+        "confidence": t.confidence,
+        "duration": t.duration_s,
+        "took_ms": t.took_ms,
+    }
 
 
 class SpeechRequest(BaseModel):
@@ -162,6 +211,7 @@ async def speech(req: SpeechRequest) -> Response:
 
 class ControlRequest(BaseModel):
     mute: Optional[bool] = None
+    mode: Optional[str] = None  # auto | no | en | next
 
 
 @app.post("/v1/control")
@@ -170,7 +220,11 @@ def control(req: ControlRequest) -> dict[str, Any]:
         if state.mic is None:
             raise HTTPException(409, f"the mic isn't running ({state.mic_error or 'mic.enabled is false'})")
         state.mic.muted = req.mute
-    return {"muted": bool(state.mic and state.mic.muted)}
+    if req.mode is not None:
+        if req.mode not in (*MODES, "next"):
+            raise HTTPException(400, f"mode must be one of {', '.join(MODES)} or next")
+        set_mode(req.mode)
+    return {"muted": bool(state.mic and state.mic.muted), "mode": state.stt.router.mode if state.stt else None}
 
 
 @app.websocket("/v1/listen")

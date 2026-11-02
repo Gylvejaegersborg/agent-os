@@ -1,10 +1,15 @@
-"""Download the phase 1 models into voice/models (git-ignored).
+"""Download the models into voice/models (git-ignored).
 
-  python fetch_models.py          Silero VAD (~2 MB) + NB-Whisper small, CTranslate2 (~1 GB on disk, int8 in RAM)
-  python fetch_models.py --tts    also Kokoro int8 (~90 MB) + its voices (~27 MB), for speech back
+  python fetch_models.py               Silero VAD (~2 MB), NB-Whisper small, CTranslate2 (~1 GB on disk, int8 in
+                                       RAM), whisper-tiny for language ID (~75 MB) and Phonon-2 int8 for English
+                                       (~690 MB)
+  python fetch_models.py --bark        also Bark 3.0 Plus int8 (~685 MB), the English engine to A/B against Phonon-2
+  python fetch_models.py --tts         also Kokoro int8 (~90 MB) + its voices (~27 MB), for speech back
 
-Sources are pinned: Silero's v5.1.2 tag, NbAiLab/nb-whisper-small's ct2/ folder on Hugging Face, and the
-kokoro-onnx model-files-v1.0 release.
+Sources: Silero's v5.1.2 tag, NbAiLab/nb-whisper-small's ct2/ folder, Systran/faster-whisper-tiny,
+Avifenesh/Phonon-2-ONNX (an ONNX export of FermionResearch/Phonon-2), velddev/Underdog-Bark-3.0-Plus-sherpa-onnx
+(of ConwayResearch/Underdog-Bark-3.0-Plus), and the kokoro-onnx model-files-v1.0 release. Phonon-2 and Bark are
+CC BY 4.0; each folder keeps its NOTICE/LICENSE.
 """
 
 from __future__ import annotations
@@ -43,6 +48,25 @@ def fetch_nb_whisper() -> None:
     print(f"  → {ct2}")
 
 
+def fetch_hf(repo: str, folder: str, files: list[str]) -> None:
+    """Only the listed files of a Hugging Face repo, retried: the big int8 encoders are the only weights used."""
+    import time
+
+    from huggingface_hub import snapshot_download
+
+    target = MODELS / folder
+    for attempt in range(5):
+        try:
+            snapshot_download(repo, allow_patterns=files, local_dir=target)
+            print(f"  → {target}")
+            return
+        except Exception as err:  # Hugging Face resets connections now and then; downloads resume
+            if attempt == 4:
+                raise
+            print(f"  retrying {repo} ({err})")
+            time.sleep(3)
+
+
 def use_windows_certificates() -> None:
     """Verify HTTPS with the operating system's certificate store (as curl and browsers do). A standalone
     Python's OpenSSL can fail to build the chain on Windows ("unable to get issuer certificate")."""
@@ -57,11 +81,24 @@ def use_windows_certificates() -> None:
 def main() -> None:
     use_windows_certificates()
     ap = argparse.ArgumentParser()
+    ap.add_argument("--bark", action="store_true", help="also fetch Bark 3.0 Plus, to A/B against Phonon-2 (stt.en: bark-plus)")
     ap.add_argument("--tts", action="store_true", help="also fetch Kokoro (only needed with tts.enabled)")
     args = ap.parse_args()
     MODELS.mkdir(exist_ok=True)
     fetch(SILERO, MODELS / "silero_vad.onnx")
     fetch_nb_whisper()
+    fetch_hf("Systran/faster-whisper-tiny", "whisper-tiny", ["config.json", "model.bin", "tokenizer.json", "vocabulary.txt"])
+    fetch_hf(
+        "Avifenesh/Phonon-2-ONNX",
+        "phonon-2",
+        ["config.json", "vocab.txt", "NOTICE", "encoder-model.int8.onnx", "decoder_joint-model.int8.onnx"],
+    )
+    if args.bark:
+        fetch_hf(
+            "velddev/Underdog-Bark-3.0-Plus-sherpa-onnx",
+            "bark-3.0-plus",
+            ["tokens.txt", "LICENSE", "NOTICE", "encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx"],
+        )
     if args.tts:
         fetch(KOKORO + "kokoro-v1.0.int8.onnx", MODELS / "kokoro-v1.0.int8.onnx")
         fetch(KOKORO + "voices-v1.0.bin", MODELS / "voices-v1.0.bin")

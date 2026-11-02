@@ -8,6 +8,10 @@ transcription. If the silence lasts to `min_silence_ms`, that same utterance is 
 ready already; if speech comes back, the result is thrown away. A job already running can't be stopped, so a
 stale one finishes and is dropped; a stale one still waiting is removed. Utterances that are final are never
 dropped from the queue.
+
+Routing (phase 2): once `lang_id.after_ms` of speech is in, language ID runs on its own thread while you're
+still talking, so its answer is usually there before the utterance ends. The transcription job then goes to
+the engine the router picks (stt.py). A forced mode or a sticky language skips language ID altogether.
 """
 
 from __future__ import annotations
@@ -21,8 +25,10 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 
-from .engines import NbWhisper, Transcript
+from .engines import Transcript
+from .router import Route
 from .segmenter import Segmenter, Utterance
+from .stt import Detection, SpeechToText
 from .vad import SileroVad
 
 Listener = Callable[[dict[str, Any]], None]
@@ -39,12 +45,25 @@ class Job:
     done: bool = False
     emitted: bool = False
     transcript: Optional[Transcript] = None
+    route: Optional[Route] = None
+    detection: Optional[Detection] = None
+    early: bool = False  # the detection came from early language ID
     error: Optional[str] = None
     created: float = field(default_factory=time.time)
 
 
+@dataclass
+class LangJob:
+    """Early language ID for one utterance (by its start frame)."""
+
+    start: int
+    audio: np.ndarray
+    ready: threading.Event = field(default_factory=threading.Event)
+    detection: Optional[Detection] = None
+
+
 class MicListener:
-    def __init__(self, cfg: dict[str, Any], vad: SileroVad, stt: NbWhisper) -> None:
+    def __init__(self, cfg: dict[str, Any], vad: SileroVad, stt: SpeechToText) -> None:
         a, v = cfg["audio"], cfg["vad"]
         self._rate = a["sample_rate"]
         self._frame = a["frame_samples"]
@@ -62,6 +81,9 @@ class MicListener:
         )
         self._frames: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=200)
         self._jobs: deque[Job] = deque()
+        self._lang_after_ms = cfg["lang_id"]["after_ms"]
+        self._lang: Optional[LangJob] = None  # the current utterance's early language ID
+        self._lang_queue: "queue.Queue[LangJob]" = queue.Queue(maxsize=1)
         self._lock = threading.Lock()
         self._wake = threading.Condition(self._lock)
         self._spec: Optional[Job] = None
@@ -72,6 +94,7 @@ class MicListener:
         self.device_name: str | None = None
         self.dropped_frames = 0
         self.stats = {"finals": 0, "speculative_used": 0, "speculative_wasted": 0}
+        self.routes = {"no": 0, "en": 0, "early_lang_id": 0, "late_lang_id": 0, "sticky": 0, "forced": 0}
 
     def subscribe(self, fn: Listener) -> Callable[[], None]:
         self._listeners.append(fn)
@@ -107,6 +130,7 @@ class MicListener:
             self._stream.start()
         threading.Thread(target=self._vad_loop, name="voice-vad", daemon=True).start()
         threading.Thread(target=self._stt_loop, name="voice-stt", daemon=True).start()
+        threading.Thread(target=self._lang_loop, name="voice-langid", daemon=True).start()
 
     def stop(self) -> None:
         self._stop.set()
@@ -130,6 +154,7 @@ class MicListener:
                 continue
             event, utt = self._seg.push(frame, self._vad(frame))
             now = time.time()
+            self._maybe_detect_early(now)
             if event == "speech_start":
                 self._emit({"type": "speech_start", "t": now})
             elif event == "pause":
@@ -144,6 +169,57 @@ class MicListener:
                 else:
                     self._finalize(utt, stopped=now - silence_s)
                 self._vad.reset()
+
+    # ── language ID side ───────────────────────────────────────────────────
+
+    def _maybe_detect_early(self, now: float) -> None:
+        """Once enough speech is in, hand the utterance so far to language ID (once per utterance)."""
+        seg = self._seg
+        if not seg.in_speech or seg.speech_ms < self._lang_after_ms:
+            return
+        if self._lang is not None and self._lang.start == seg.start_frame:
+            return
+        if self._stt.router.before_detection(now) is not None:
+            return  # forced, sticky, or no English engine: nothing to detect
+        job = LangJob(start=seg.start_frame, audio=np.concatenate([np.asarray(f, dtype=np.float32) for f in seg.so_far()]))
+        self._lang = job
+        try:
+            self._lang_queue.get_nowait()  # an older utterance's job still waiting: this one replaces it
+        except queue.Empty:
+            pass
+        self._lang_queue.put_nowait(job)
+
+    def _lang_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                job = self._lang_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                job.detection = self._stt.detect(job.audio)
+            except Exception as err:
+                print(f"[voice] language ID failed: {err}")
+            job.ready.set()
+
+    def _route(self, job: Job) -> tuple[Route, Optional[Detection]]:
+        """The engine for a transcription job: the early language ID for its utterance when there is one (waiting
+        for it if it's still running; it takes ~60 ms), else forced/sticky, else language ID now."""
+        early = self._lang
+        detection = None
+        if early is not None and early.start == job.key[0] and early.ready.wait(timeout=2.0):
+            detection = early.detection
+            # ~1 s is often enough, but not always ("What's on my…" came back Malay 0.80): an unsure early guess is
+            # checked again on the whole utterance, if there is clearly more of it now.
+            if detection is not None and detection.prob < self._stt.router.sticky_conf and job.audio.size > early.audio.size + self._rate // 2:
+                detection = None
+        job.early = detection is not None
+        return self._stt.route(job.audio, detection)
+
+    def set_mode(self, mode: str) -> str:
+        m = self._stt.router.set_mode(mode) if mode != "next" else self._stt.router.next_mode()
+        print(f"[voice] mode: {m}")
+        self._emit({"type": "mode", "mode": m})
+        return m
 
     def _submit(self, job: Job) -> None:
         with self._wake:
@@ -192,7 +268,8 @@ class MicListener:
                 if job.stale:
                     continue
             try:
-                t = self._stt.transcribe(job.audio)
+                job.route, job.detection = self._route(job)
+                t = self._stt.transcribe(job.audio, job.route)
                 err = None
             except Exception as e:
                 t, err = None, str(e)
@@ -213,14 +290,24 @@ class MicListener:
         if t is None or not t.text:
             return
         self.stats["finals"] += 1
+        r, d = job.route, job.detection
+        self._stt.router.remember(r, time.time())
+        self.routes[r.engine] += 1
+        if r.reason == "detected":
+            self.routes["early_lang_id" if job.early else "late_lang_id"] += 1
+        elif r.reason in ("sticky", "forced"):
+            self.routes[r.reason] += 1
         latency = round((time.time() - job.stopped) * 1000)
-        print(f"[voice] final ({t.language}, {t.engine}, {latency} ms{', speculative' if job.speculative else ''}): {t.text}")
+        how = f"{r.reason}{f' {r.language} {r.prob:.2f}' if r.language else ''}"
+        print(f"[voice] final ({t.language}, {t.engine}, {how}, {latency} ms{', speculative' if job.speculative else ''}): {t.text}")
         self._emit(
             {
                 "type": "final",
                 "text": t.text,
                 "language": t.language,
                 "engine": t.engine,
+                "route": r.reason,  # detected | sticky | forced | no-english-engine
+                "detected": {"language": r.language, "prob": round(r.prob, 3), "lang_id_ms": d.took_ms if d else None} if r.language else None,
                 "confidence": t.confidence,
                 "audio_s": round(t.duration_s, 2),
                 "transcribe_ms": t.took_ms,
