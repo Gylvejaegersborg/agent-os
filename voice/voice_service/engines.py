@@ -185,7 +185,9 @@ class EnglishStt:
             )
         else:
             raise ValueError(f"unknown English runtime {runtime!r} (onnx-asr or sherpa-onnx)")
-        self._lock = threading.Lock()
+        # onnxruntime sessions take concurrent run() calls, so with onnx-asr a final doesn't wait behind an English
+        # partial still running (it did: +~1 s on a 12 s hold). sherpa-onnx's recognizer gets one call at a time.
+        self._lock = threading.Semaphore(2 if runtime == "onnx-asr" else 1)
         self.last_ms: int | None = None
         self.transcribe(np.zeros(16000, dtype=np.float32))  # warm-up
         self.last_ms = None

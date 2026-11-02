@@ -16,6 +16,12 @@ the engine the router picks (stt.py). A forced mode or a sticky language skips l
 Push-to-talk (phase 6, mic.trigger: push_to_talk, the default): only what you say while the key (Ctrl+Alt+B)
 is held is transcribed; between holds the VAD doesn't run and frames only fill the 300 ms pre-roll. Release
 ends the utterance at once (no silence window). mic.trigger: always is the open mic of phases 1–4.
+
+English partials (mic.partials): while push-to-talk is held and early language ID says English (or the mode is
+en), the hold so far is re-transcribed with the English engine every `partial_ms` and sent as `partial` events,
+so the HUD can show the words as they're spoken. One run at a time: a tick is skipped while the last one is
+still going, and they stop growing after `partial_max_s` (each run re-reads the whole hold). None for Norwegian:
+NB-Whisper is too slow to run twice a second. The final always replaces them.
 """
 
 from __future__ import annotations
@@ -98,6 +104,10 @@ class MicListener:
         )
         self._hold_max_ms = 1000 * m.get("ptt_max_s", 120)
         self.held = False
+        self._hold_id = 0  # bumped on every press, so a partial finishing after its release is dropped
+        self._partials = bool(m.get("partials", True))
+        self._partial_s = m.get("partial_ms", 500) / 1000
+        self._partial_max = int(m.get("partial_max_s", 10) * self._rate)
         self._frames: "queue.Queue[Any]" = queue.Queue(maxsize=200)
         self._jobs: deque[Job] = deque()
         self._lang_after_ms = cfg["lang_id"]["after_ms"]
@@ -114,6 +124,7 @@ class MicListener:
         self.dropped_frames = 0
         self.stats = {"finals": 0, "speculative_used": 0, "speculative_wasted": 0}
         self.routes = {"no": 0, "en": 0, "early_lang_id": 0, "late_lang_id": 0, "sticky": 0, "forced": 0}
+        self.partial_stats = {"sent": 0, "runs": 0, "skipped_busy": 0}
 
     def subscribe(self, fn: Listener) -> Callable[[], None]:
         self._listeners.append(fn)
@@ -160,6 +171,8 @@ class MicListener:
         threading.Thread(target=self._vad_loop, name="voice-vad", daemon=True).start()
         threading.Thread(target=self._stt_loop, name="voice-stt", daemon=True).start()
         threading.Thread(target=self._lang_loop, name="voice-langid", daemon=True).start()
+        if self._partials and self.trigger == "push_to_talk" and self._stt.en is not None:
+            threading.Thread(target=self._partial_loop, name="voice-partials", daemon=True).start()
 
     def stop(self) -> None:
         self._stop.set()
@@ -208,6 +221,7 @@ class MicListener:
         now = time.time()
         if isinstance(item, str):
             if item == PRESS and not self.muted:
+                self._hold_id += 1
                 self._vad.reset()
                 hold.set_preroll_probs([self._vad(f) for f in hold.press()])
                 self._stt.prefetch()  # after an idle unload, reload while the speaker talks
@@ -230,6 +244,47 @@ class MicListener:
         self._emit({"type": "ptt_end", "t": now, "kept": utt is not None})
         if utt is not None:
             self._submit(Job(key=_key(utt), audio=_audio(utt), stopped=now, speculative=False, final=True))
+
+    # ── English partials ───────────────────────────────────────────────────
+
+    def partials_on(self) -> bool:
+        """Partials for the current hold: mode en, or early language ID sure it's English. Never for Norwegian."""
+        r = self._stt.router
+        if r.mode != "auto" or not r.has_en:
+            return r.mode == "en" and r.has_en
+        early = self._lang
+        if early is None or early.start != self._hold.start_frame or not early.ready.is_set() or early.detection is None:
+            return False
+        return early.detection.language == "en" and early.detection.prob >= r.en_threshold
+
+    def _partial_loop(self) -> None:
+        last_text, last_hold, n = "", 0, 0
+        min_samples = self._rate // 2
+        while not self._stop.wait(self._partial_s):
+            hold_id = self._hold_id
+            if hold_id != last_hold:
+                last_text, last_hold, n = "", hold_id, 0
+            if not self._hold.in_speech or not self.partials_on():
+                continue
+            frames = self._hold.so_far()
+            if not min_samples <= len(frames) * self._frame <= self._partial_max:
+                continue  # too little yet, or past partial_max_s: each run re-reads the whole hold, so cost grows
+            audio = np.concatenate([np.asarray(f, dtype=np.float32) for f in frames])
+            started = time.perf_counter()
+            try:
+                t = self._stt.en.run(lambda m: m.transcribe(audio))
+            except Exception as err:
+                print(f"[voice] partial failed: {err}")
+                continue
+            self.partial_stats["runs"] += 1
+            took = time.perf_counter() - started
+            if took > self._partial_s:
+                self.partial_stats["skipped_busy"] += int(took // self._partial_s)  # ticks that passed while it ran
+            if hold_id != self._hold_id or not self._hold.in_speech or not t.text or t.text == last_text:
+                continue  # released meanwhile (the final is coming), or nothing new
+            last_text, n = t.text, n + 1
+            self.partial_stats["sent"] += 1
+            self._emit({"type": "partial", "text": t.text, "n": n, "language": "en", "audio_s": round(audio.size / self._rate, 2), "transcribe_ms": round(took * 1000)})
 
     # ── language ID side ───────────────────────────────────────────────────
 

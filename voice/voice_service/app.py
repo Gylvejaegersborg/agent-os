@@ -285,6 +285,7 @@ def health() -> dict[str, Any]:
             "dropped_frames": state.mic.dropped_frames if state.mic else 0,
             "speculation": state.mic.stats if state.mic else None,
             "routes": state.mic.routes if state.mic else None,
+            "partials": state.mic.partial_stats if state.mic else None,
         },
         "ram_mb": rss,
         "last_ms": {
