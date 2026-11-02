@@ -1,6 +1,12 @@
-"""Speech-to-text (NB-Whisper through faster-whisper) and speech back (Kokoro). One inference at a time per
-engine, as the spec asks; both warm up once at load so the first real request isn't the slow one.
-Phase 1 has only these two: language ID, Phonon-2 and Piper come in phases 2 and 3."""
+"""Speech-to-text, language ID and speech back. One inference at a time per engine, as the spec asks; each
+warms up once at load so the first real request isn't the slow one.
+
+- NbWhisper: Norwegian (and mixed or unsure) speech, through faster-whisper.
+- WhisperLangId: vanilla whisper-tiny's language guess (phase 2). Not NB-Whisper: its fine-tune pulls every
+  guess towards Norwegian.
+- EnglishStt: English only (phase 2), Phonon-2 through onnx-asr or Bark 3.0 Plus through sherpa-onnx. Both are
+  fine-tunes of NVIDIA's Parakeet TDT 0.6B v3, so they share one slot and are A/B'd on the same clips.
+- KokoroTts: English speech back. Piper (Norwegian) comes in phase 3."""
 
 from __future__ import annotations
 
@@ -105,6 +111,100 @@ class NbWhisper:
         took = round((time.perf_counter() - started) * 1000)
         self.last_ms = took
         return Transcript(text=text, language="no", engine=self.name, confidence=conf, duration_s=float(info.duration), took_ms=took)
+
+
+class WhisperLangId:
+    """Language ID on the start of an utterance. Encodes a short window, as NbWhisper does: the language token
+    comes from the first decoder step, which only needs the audio there is."""
+
+    name = "whisper-tiny"
+
+    def __init__(self, model_dir: Path, threads: int = 2, max_s: float = 3.0, window_s: float = 10.0) -> None:
+        from faster_whisper import WhisperModel
+
+        if not model_dir.exists():
+            raise FileNotFoundError(f"{model_dir} not found — run: python fetch_models.py")
+        self._model = WhisperModel(str(model_dir), device="cpu", compute_type="int8", cpu_threads=threads)
+        self._max = int(max_s * 16000)
+        self._frames = int(window_s * 100)
+        self._lock = threading.Lock()
+        self.last_ms: int | None = None
+        self.detect(np.zeros(16000, dtype=np.float32))  # warm-up
+        self.last_ms = None
+
+    def detect(self, audio: np.ndarray) -> tuple[str, float, int]:
+        """(language code, probability, ms taken) for the first max_s seconds of audio."""
+        import ctranslate2
+
+        started = time.perf_counter()
+        feats = self._model.feature_extractor(audio[: self._max])[:, : self._frames]
+        if feats.shape[1] < self._frames:
+            feats = np.pad(feats, ((0, 0), (0, self._frames - feats.shape[1])))
+        with self._lock:
+            enc = self._model.model.encode(ctranslate2.StorageView.from_array(np.ascontiguousarray(feats[None], dtype=np.float32)), to_cpu=False)
+            token, prob = self._model.model.detect_language(enc)[0][0]
+        took = round((time.perf_counter() - started) * 1000)
+        self.last_ms = took
+        return token.strip("<|>"), float(prob), took
+
+
+class EnglishStt:
+    """Phonon-2 (onnx-asr, `nemo-conformer-tdt` layout) or Bark 3.0 Plus (sherpa-onnx `nemo_transducer`).
+    Both int8; both give punctuated, cased text. No confidence score: the transducer has none to give."""
+
+    def __init__(self, name: str, runtime: str, model_dir: Path, threads: int = 4, min_chars: int = 2) -> None:
+        if not model_dir.exists():
+            raise FileNotFoundError(f"{model_dir} not found — run: python fetch_models.py{' --bark' if runtime == 'sherpa-onnx' else ''}")
+        self.name = name
+        self._runtime = runtime
+        self._min_chars = min_chars
+        if runtime == "onnx-asr":
+            import onnx_asr
+            import onnxruntime as ort
+
+            opts = ort.SessionOptions()
+            opts.intra_op_num_threads = threads
+            opts.inter_op_num_threads = 1
+            self._model = onnx_asr.load_model("nemo-conformer-tdt", model_dir, quantization="int8", sess_options=opts)
+        elif runtime == "sherpa-onnx":
+            import sherpa_onnx
+
+            self._model = sherpa_onnx.OfflineRecognizer.from_transducer(
+                encoder=str(model_dir / "encoder.int8.onnx"),
+                decoder=str(model_dir / "decoder.int8.onnx"),
+                joiner=str(model_dir / "joiner.int8.onnx"),
+                tokens=str(model_dir / "tokens.txt"),
+                num_threads=threads,
+                model_type="nemo_transducer",
+                decoding_method="greedy_search",
+            )
+        else:
+            raise ValueError(f"unknown English runtime {runtime!r} (onnx-asr or sherpa-onnx)")
+        self._lock = threading.Lock()
+        self.last_ms: int | None = None
+        self.transcribe(np.zeros(16000, dtype=np.float32))  # warm-up
+        self.last_ms = None
+
+    def transcribe(self, audio: Union[np.ndarray, BinaryIO]) -> Transcript:
+        if not isinstance(audio, np.ndarray):
+            from faster_whisper.audio import decode_audio
+
+            audio = decode_audio(audio, sampling_rate=16000)
+        started = time.perf_counter()
+        with self._lock:
+            if self._runtime == "onnx-asr":
+                text = self._model.recognize(audio, sample_rate=16000)
+            else:
+                stream = self._model.create_stream()
+                stream.accept_waveform(16000, audio)
+                self._model.decode_stream(stream)
+                text = stream.result.text
+        text = (text or "").strip()
+        if len(text) < self._min_chars:
+            text = ""
+        took = round((time.perf_counter() - started) * 1000)
+        self.last_ms = took
+        return Transcript(text=text, language="en", engine=self.name, confidence=None, duration_s=round(audio.size / 16000, 2), took_ms=took)
 
 
 class KokoroTts:

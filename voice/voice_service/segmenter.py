@@ -9,6 +9,7 @@
 - Speculation (phase 4): after `speculative_ms` of silence, "pause" hands over the utterance so far (cut
   exactly as it would be if the silence lasted), so it can be transcribed while the silence window runs.
   Speech coming back is "resume": that pause's result is stale. 0 turns it off.
+- While speech goes on, speech_ms / start_frame / so_far() let the mic start language ID early (phase 2).
 """
 
 from __future__ import annotations
@@ -50,6 +51,20 @@ class Segmenter:
     @property
     def in_speech(self) -> bool:
         return self._in_speech
+
+    @property
+    def speech_ms(self) -> int:
+        """Speech so far in the current utterance (0 outside one)."""
+        return round(self._speech_frames * self.frame_ms) if self._in_speech else 0
+
+    @property
+    def start_frame(self) -> int:
+        """The current utterance's first frame: the same start_frame its pause and speech_end will carry."""
+        return self._start
+
+    def so_far(self) -> list:
+        """The current utterance's frames up to now, pre-roll included (for early language ID)."""
+        return list(self._frames)
 
     def push(self, frame: Sequence[float], prob: float) -> tuple[Optional[str], Optional[Utterance]]:
         """Feed one frame and its speech probability. Returns (event, utterance): event is "speech_start" when

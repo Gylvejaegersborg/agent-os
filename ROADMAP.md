@@ -497,9 +497,10 @@ memory gate as everything else.
       Kokoro speech back, off by default; 127.0.0.1:8765). Measured on the
       operator's PC: 670 MB RAM with everything loaded; after phase 4
       (short encoder window + speculative transcription) ~0.6 s from end
-      of speech to text, down from ~2 s. Next: English routing (phase 2; NB-Whisper set to
-      Norwegian translates English instead of transcribing it), then
-      Ctrl+Alt+B push-to-talk in the HUD.
+      of speech to text, down from ~2 s. Phase 2: whisper-tiny language ID
+      sends English to Phonon-2 (~0.6 s) and the rest to NB-Whisper;
+      Ctrl+Alt+L forces a language. RAM is now ~1.24 GB (phase 5: idle
+      unload). Next: Ctrl+Alt+B push-to-talk in the HUD.
 - [ ] "This": on demand, screenshot → OCR text for small local models;
       the image itself only when the agent is routed to `claude-cli`
       (depends on multimodal input above). **[core]** **[UI]**

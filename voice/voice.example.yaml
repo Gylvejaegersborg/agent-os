@@ -1,5 +1,6 @@
 # Copy to voice.yaml (git-ignored) and change what you need. Anything left out keeps its default
-# (voice_service/config.py). Phase 1: Norwegian speech-to-text (NB-Whisper) and optional English speech back.
+# (voice_service/config.py). Norwegian and English speech-to-text (NB-Whisper, Phonon-2, routed by whisper-tiny's
+# language ID) and optional English speech back.
 
 server:
   host: 127.0.0.1        # local only; run.py refuses anything else
@@ -20,6 +21,16 @@ stt:
   no: models/nb-whisper-small/ct2
   no_beam: 1
   min_window_s: 10       # encode only this much of Whisper's 30 s window for short clips; 0 = always 30 s
+  en: phonon-2           # English engine: phonon-2, bark-plus (fetch_models.py --bark), or null = all to NB-Whisper
+
+lang_id:
+  en_threshold: 0.80     # English at least this sure → the English engine; else NB-Whisper
+  after_ms: 1000         # start language ID after this much speech, while you're still talking
+  sticky_window_s: 0     # reuse a sure (≥ sticky_conf) language this long; off: it misrouted live (README)
+  sticky_conf: 0.90
+
+mode: auto               # auto | no | en
+hotkey: ctrl+alt+l       # cycles the mode; null = no hotkey
 
 tts:
   enabled: false         # speech back; off by default. Needs: python fetch_models.py --tts

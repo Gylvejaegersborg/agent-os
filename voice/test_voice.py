@@ -1,4 +1,4 @@
-"""Tests that need no models or mic: config merging and the utterance segmenter.
+"""Tests that need no models or mic: config merging, the utterance segmenter, routing and hotkey parsing.
 Run: python test_voice.py   (stdlib only)"""
 
 from __future__ import annotations
@@ -10,6 +10,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from voice_service.config import DEFAULTS, load_config  # noqa: E402
+from voice_service.hotkey import parse as parse_hotkey  # noqa: E402
+from voice_service.router import Router  # noqa: E402
 from voice_service.segmenter import Segmenter  # noqa: E402
 
 failed = False
@@ -92,6 +94,59 @@ check([e[1] for e in ev] == ["speech_start", "pause", "speech_end"] and ev[1][2]
 
 ev = run([0.9] * 20 + [0.1] * 25)
 check("pause" not in [e[1] for e in ev], "speculative_ms 0 (the default for the class): no pause events")
+
+seg = Segmenter(frame_ms=FRAME_MS)
+for i, p in enumerate([0.1] * 12 + [0.9] * 40):
+    seg.push([float(i)], p)
+check(seg.speech_ms == round(40 * FRAME_MS), "speech_ms counts the speech so far while it goes on")
+check(seg.start_frame == 12 - round(300 / FRAME_MS) and [int(f[0]) for f in seg.so_far()][0] == seg.start_frame, "so_far() starts at start_frame, pre-roll included")
+check(int(seg.so_far()[-1][0]) == 51, "…and runs to the latest frame")
+for p in [0.1] * 25:
+    seg.push([0.0], p)
+check(seg.speech_ms == 0, "speech_ms is 0 once the utterance has closed")
+
+print("-- routing --")
+r = Router()
+check(r.before_detection(0) is None, "auto with an English engine: language ID decides")
+check(r.decide("en", 0.95).engine == "en", "English at 0.95 → English engine")
+check(r.decide("en", 0.79).engine == "no", "English below 0.80 → NB-Whisper (unsure goes to NB)")
+check(r.decide("no", 0.99).engine == "no" and r.decide("nn", 0.6).engine == "no", "Norwegian → NB-Whisper")
+check(r.decide("da", 0.9).engine == "no" and r.decide("de", 0.5).engine == "no", "other languages → NB-Whisper")
+
+r.remember(r.decide("en", 0.95), now=100.0)
+s = r.before_detection(110.0)
+check(s is not None and s.engine == "en" and s.reason == "sticky", "within 20 s of a sure detection: reuse it, no language ID")
+r.remember(s, now=115.0)
+check(r.before_detection(121.0) is None, "a sticky reuse doesn't extend the window: 20 s from the detection, then detect again")
+r.remember(r.decide("en", 0.85), now=200.0)
+check(r.before_detection(201.0) is None, "a detection under 0.90 doesn't stick")
+r.remember(r.decide("no", 0.97), now=300.0)
+check(r.before_detection(301.0).engine == "no", "Norwegian sticks too")
+
+check(r.set_mode("en") == "en" and r.before_detection(0).reason == "forced" and r.before_detection(0).engine == "en", "mode en forces English")
+check(r.before_detection(305.0).reason == "forced", "a forced mode wins over sticky")
+check([r.next_mode(), r.next_mode(), r.next_mode()] == ["auto", "no", "en"], "the hotkey cycles en → auto → no → en")
+check(r.set_mode("auto") and r.before_detection(301.0) is None, "changing mode clears the sticky language")
+try:
+    r.set_mode("de")
+    check(False, "an unknown mode is refused")
+except ValueError:
+    check(True, "an unknown mode is refused")
+
+r = Router(has_en=False)
+check(r.before_detection(0).engine == "no" and r.before_detection(0).reason == "no-english-engine", "no English engine: everything to NB-Whisper")
+r.set_mode("en")
+check(r.before_detection(0).engine == "no", "…even with mode en")
+
+print("-- hotkey --")
+check(parse_hotkey("ctrl+alt+l") == (0x2 | 0x1, ord("L")), "ctrl+alt+l parses")
+check(parse_hotkey("Ctrl + Shift + F9") == (0x2 | 0x4, 0x78), "case, spaces and F-keys")
+for bad in ("l", "ctrl+alt+", "hyper+l", "ctrl+alt+space"):
+    try:
+        parse_hotkey(bad)
+        check(False, f"{bad!r} is refused")
+    except ValueError:
+        check(True, f"{bad!r} is refused")
 
 print("-- config --")
 cfg = load_config(Path(tempfile.gettempdir()) / "does-not-exist.yaml")

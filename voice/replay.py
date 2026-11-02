@@ -1,7 +1,9 @@
 """Measure end-of-speech → final latency without a mic: plays WAV files through the real pipeline (Silero VAD,
-segmenter, speculation, NB-Whisper) at real-time pace, as if they came from the sound card.
+segmenter, speculation, language ID, routing, NB-Whisper or the English engine) at real-time pace, as if they
+came from the sound card.
 
-  python replay.py clip1.wav [clip2.wav …] [--no-speculation] [--window 0]
+  python replay.py clip1.wav [clip2.wav …] [--no-speculation] [--window 0] [--en phonon-2|bark-plus|none]
+                   [--mode auto|no|en]
 
 Each clip is followed by 1.5 s of silence so its utterance closes. Prints each final with its latency, then
 the median. The clips are read, never written anywhere.
@@ -18,8 +20,8 @@ from pathlib import Path
 import numpy as np
 
 from voice_service.config import load_config, model_path
-from voice_service.engines import NbWhisper
 from voice_service.mic import MicListener
+from voice_service.stt import SpeechToText
 from voice_service.vad import SileroVad
 
 
@@ -28,6 +30,8 @@ def main() -> None:
     ap.add_argument("clips", nargs="+", type=Path)
     ap.add_argument("--no-speculation", action="store_true")
     ap.add_argument("--window", type=float, default=None, help="stt.min_window_s for this run (0 = full 30 s)")
+    ap.add_argument("--en", default=None, help="stt.en for this run: phonon-2, bark-plus or none")
+    ap.add_argument("--mode", default=None, choices=("auto", "no", "en"))
     args = ap.parse_args()
 
     from faster_whisper.audio import decode_audio
@@ -37,8 +41,12 @@ def main() -> None:
         cfg["vad"]["speculative_ms"] = 0
     if args.window is not None:
         cfg["stt"]["min_window_s"] = args.window
+    if args.en is not None:
+        cfg["stt"]["en"] = None if args.en == "none" else args.en
+    if args.mode:
+        cfg["mode"] = args.mode
     r = cfg["resources"]
-    stt = NbWhisper(model_path(cfg["stt"]["no"]), threads=r["threads"], beam=cfg["stt"]["no_beam"], min_chars=cfg["stt"]["min_chars"], min_window_s=cfg["stt"]["min_window_s"])
+    stt = SpeechToText(cfg)
     vad = SileroVad(model_path(cfg["vad"]["model"]), threads=r["vad_threads"])
     mic = MicListener(cfg, vad, stt)
     finals: list[dict] = []
@@ -68,14 +76,16 @@ def main() -> None:
                 time.sleep(delay)
         got.wait(timeout=10)
         for e in finals[before:]:
-            print(f"{clip.name}: {e['end_of_speech_to_final_ms']} ms (transcribe {e['transcribe_ms']} ms{', speculative' if e['speculative'] else ''}): {e['text']}")
+            d = e["detected"]
+            how = e["route"] + (f" {d['language']} {d['prob']:.2f}" if d else "")
+            print(f"{clip.name}: {e['engine']} ({how}), {e['end_of_speech_to_final_ms']} ms (transcribe {e['transcribe_ms']} ms{', speculative' if e['speculative'] else ''}): {e['text']}")
         if len(finals) == before:
             print(f"{clip.name}: no final (nothing heard?)")
 
     mic.stop()
     lat = [e["end_of_speech_to_final_ms"] for e in finals]
     if lat:
-        print(f"\nmedian end of speech → final: {statistics.median(lat):.0f} ms over {len(lat)} utterance(s); stats {mic.stats}")
+        print(f"\nmedian end of speech → final: {statistics.median(lat):.0f} ms over {len(lat)} utterance(s); stats {mic.stats}, routes {mic.routes}")
 
 
 if __name__ == "__main__":

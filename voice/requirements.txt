@@ -1,4 +1,4 @@
-# Phase 1. Python 3.11 (the spec's version; `uv venv --python 3.11`).
+# Python 3.11 (the spec's version; `uv venv --python 3.11`).
 fastapi>=0.115,<1
 uvicorn>=0.30,<1
 python-multipart>=0.0.9
@@ -7,6 +7,8 @@ numpy>=1.26,<3
 sounddevice>=0.4.7
 onnxruntime>=1.18,<2
 faster-whisper>=1.1,<2
+onnx-asr>=0.12,<1     # Phonon-2 (English, phase 2)
+sherpa-onnx>=2,<3     # Bark 3.0 Plus, only to A/B it (stt.en: bark-plus)
 huggingface_hub>=0.24
 psutil>=5.9
 truststore>=0.10   # fetch_models.py verifies HTTPS with Windows' certificate store
