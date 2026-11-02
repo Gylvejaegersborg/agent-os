@@ -14,7 +14,7 @@ CONTEXT = 64
 
 
 class SileroVad:
-    def __init__(self, model: Path, threads: int = 2, sample_rate: int = 16000) -> None:
+    def __init__(self, model: Path, threads: int = 1, sample_rate: int = 16000) -> None:
         import onnxruntime as ort
 
         if sample_rate != 16000:
@@ -22,6 +22,9 @@ class SileroVad:
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = threads
         opts.inter_op_num_threads = 1
+        # One thread, no spinning: the VAD runs 31 times a second, so a pool of 2 never stopped busy-waiting
+        # between frames and held a whole core in silence (101% of a core vs 1.2%, measured, phase 5).
+        opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
         self._session = ort.InferenceSession(str(model), sess_options=opts, providers=["CPUExecutionProvider"])
         self._sr = np.array(sample_rate, dtype=np.int64)
         self.reset()

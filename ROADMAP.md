@@ -499,8 +499,12 @@ memory gate as everything else.
       (short encoder window + speculative transcription) ~0.6 s from end
       of speech to text, down from ~2 s. Phase 2: whisper-tiny language ID
       sends English to Phonon-2 (~0.6 s) and the rest to NB-Whisper;
-      Ctrl+Alt+L forces a language. RAM is now ~1.24 GB (phase 5: idle
-      unload). Next: Ctrl+Alt+B push-to-talk in the HUD.
+      Ctrl+Alt+L forces a language. Phase 5: idle unload (181 MB idle,
+      ~1.2 GB loaded), idle CPU 0.04%. Phase 6: Ctrl+Alt+B push-to-talk
+      (~0.1–0.5 s release → text), gateway token on every route, and
+      BaseSpace's launcher takes the dictation (Vite proxy /voice/*).
+      Next: the launcher's AI mode / HUD sends it as a turn and speaks
+      replies (hud/core).
 - [ ] "This": on demand, screenshot → OCR text for small local models;
       the image itself only when the agent is routed to `claude-cli`
       (depends on multimodal input above). **[core]** **[UI]**

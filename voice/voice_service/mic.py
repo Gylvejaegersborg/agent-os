@@ -12,6 +12,10 @@ dropped from the queue.
 Routing (phase 2): once `lang_id.after_ms` of speech is in, language ID runs on its own thread while you're
 still talking, so its answer is usually there before the utterance ends. The transcription job then goes to
 the engine the router picks (stt.py). A forced mode or a sticky language skips language ID altogether.
+
+Push-to-talk (phase 6, mic.trigger: push_to_talk, the default): only what you say while the key (Ctrl+Alt+B)
+is held is transcribed; between holds the VAD doesn't run and frames only fill the 300 ms pre-roll. Release
+ends the utterance at once (no silence window). mic.trigger: always is the open mic of phases 1–4.
 """
 
 from __future__ import annotations
@@ -27,11 +31,13 @@ import numpy as np
 
 from .engines import Transcript
 from .router import Route
-from .segmenter import Segmenter, Utterance
+from .segmenter import HoldRecorder, Segmenter, Utterance
 from .stt import Detection, SpeechToText
 from .vad import SileroVad
 
 Listener = Callable[[dict[str, Any]], None]
+
+PRESS, RELEASE = "ptt-press", "ptt-release"  # markers in the frame queue, so a release is handled after its last frame
 
 
 @dataclass
@@ -79,7 +85,20 @@ class MicListener:
             min_speech_ms=v["min_speech_ms"],
             speculative_ms=v["speculative_ms"] if v["speculative_ms"] < v["min_silence_ms"] else 0,
         )
-        self._frames: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=200)
+        m = cfg["mic"]
+        self.trigger = m.get("trigger", "always")
+        if self.trigger not in ("always", "push_to_talk"):
+            raise ValueError(f"mic.trigger is {self.trigger!r}: always or push_to_talk")
+        self._hold = HoldRecorder(
+            frame_ms=1000 * self._frame / self._rate,
+            threshold=v["threshold"],
+            speech_pad_ms=v["speech_pad_ms"],
+            preroll_ms=v["preroll_ms"],
+            min_speech_ms=v["min_speech_ms"],
+        )
+        self._hold_max_ms = 1000 * m.get("ptt_max_s", 120)
+        self.held = False
+        self._frames: "queue.Queue[Any]" = queue.Queue(maxsize=200)
         self._jobs: deque[Job] = deque()
         self._lang_after_ms = cfg["lang_id"]["after_ms"]
         self._lang: Optional[LangJob] = None  # the current utterance's early language ID
@@ -111,6 +130,16 @@ class MicListener:
         """One frame of audio: from the sound card, or from replay.py."""
         try:
             self._frames.put_nowait(frame)
+        except queue.Full:
+            self.dropped_frames += 1
+
+    def ptt(self, down: bool) -> None:
+        """The push-to-talk key went down or up (the hotkey thread, or POST /v1/control)."""
+        if self.trigger != "push_to_talk" or down == self.held:
+            return
+        self.held = down
+        try:
+            self._frames.put(PRESS if down else RELEASE, timeout=1.0)
         except queue.Full:
             self.dropped_frames += 1
 
@@ -150,12 +179,16 @@ class MicListener:
                 frame = self._frames.get(timeout=0.5)
             except queue.Empty:
                 continue
+            if self.trigger == "push_to_talk":
+                self._hold_step(frame)
+                continue
             if self.muted:
                 continue
             event, utt = self._seg.push(frame, self._vad(frame))
             now = time.time()
-            self._maybe_detect_early(now)
+            self._maybe_detect_early(self._seg, now)
             if event == "speech_start":
+                self._stt.prefetch()  # after an idle unload, reload while the speaker talks
                 self._emit({"type": "speech_start", "t": now})
             elif event == "pause":
                 if utt is not None:
@@ -170,11 +203,38 @@ class MicListener:
                     self._finalize(utt, stopped=now - silence_s)
                 self._vad.reset()
 
+    def _hold_step(self, item: Any) -> None:
+        hold = self._hold
+        now = time.time()
+        if isinstance(item, str):
+            if item == PRESS and not self.muted:
+                self._vad.reset()
+                hold.set_preroll_probs([self._vad(f) for f in hold.press()])
+                self._stt.prefetch()  # after an idle unload, reload while the speaker talks
+                self._emit({"type": "ptt_start", "t": now})
+            elif item == RELEASE and hold.in_speech:
+                self._release_hold(now)
+            return
+        if not hold.in_speech:
+            hold.idle(item)
+            return
+        hold.push(item, self._vad(item))
+        self._maybe_detect_early(hold, now)
+        if hold.held_ms >= self._hold_max_ms:  # a key stuck down mustn't record forever
+            self.held = False
+            self._release_hold(now)
+
+    def _release_hold(self, now: float) -> None:
+        utt = self._hold.release()
+        self._vad.reset()
+        self._emit({"type": "ptt_end", "t": now, "kept": utt is not None})
+        if utt is not None:
+            self._submit(Job(key=_key(utt), audio=_audio(utt), stopped=now, speculative=False, final=True))
+
     # ── language ID side ───────────────────────────────────────────────────
 
-    def _maybe_detect_early(self, now: float) -> None:
+    def _maybe_detect_early(self, seg: Any, now: float) -> None:
         """Once enough speech is in, hand the utterance so far to language ID (once per utterance)."""
-        seg = self._seg
         if not seg.in_speech or seg.speech_ms < self._lang_after_ms:
             return
         if self._lang is not None and self._lang.start == seg.start_frame:
@@ -313,6 +373,7 @@ class MicListener:
                 "transcribe_ms": t.took_ms,
                 "end_of_speech_to_final_ms": latency,
                 "speculative": job.speculative,
+                "trigger": self.trigger,
             }
         )
 

@@ -52,8 +52,20 @@ DEFAULTS: dict[str, Any] = {
         "en": {"engine": "kokoro", "model": "models/kokoro-v1.0.int8.onnx", "voices": "models/voices-v1.0.bin", "voice": "af_heart"},
         "sample_rate": 24000,
     },
-    "resources": {"threads": 4, "vad_threads": 2, "priority": "below_normal"},
-    "mic": {"enabled": True},
+    # idle_unload_min: NB-Whisper, the English engine and Kokoro are dropped after this long unused (0 = never) and
+    # reloaded when speech starts; the VAD and language ID stay loaded.
+    # vad_threads is language ID's (the VAD itself always runs on one thread; vad.py says why).
+    "resources": {"threads": 4, "vad_threads": 2, "priority": "below_normal", "idle_unload_min": 15},
+    "mic": {
+        "enabled": True,
+        # push_to_talk: only what you say while ptt_key is held is transcribed (the VAD doesn't run between holds).
+        # always: the open mic of phases 1–4, every utterance in the room becomes text.
+        "trigger": "push_to_talk",
+        "ptt_key": "ctrl+alt+b",
+        "ptt_max_s": 120,  # a key stuck down stops recording after this
+    },
+    # Every route but GET /health needs the Agent-OS gateway's token (auth.py says why). Relative to voice/.
+    "auth": {"enabled": True, "token_file": "../data/gateway-token"},
 }
 
 

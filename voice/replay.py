@@ -3,7 +3,10 @@ segmenter, speculation, language ID, routing, NB-Whisper or the English engine) 
 came from the sound card.
 
   python replay.py clip1.wav [clip2.wav …] [--no-speculation] [--window 0] [--en phonon-2|bark-plus|none]
-                   [--mode auto|no|en]
+                   [--mode auto|no|en] [--ptt]
+
+--ptt holds push-to-talk for each clip and lets go 300 ms after its audio ends (latency then counts from the
+release); without it, the open mic (mic.trigger: always) decides where each utterance ends.
 
 Each clip is followed by 1.5 s of silence so its utterance closes. Prints each final with its latency, then
 the median. The clips are read, never written anywhere.
@@ -32,6 +35,7 @@ def main() -> None:
     ap.add_argument("--window", type=float, default=None, help="stt.min_window_s for this run (0 = full 30 s)")
     ap.add_argument("--en", default=None, help="stt.en for this run: phonon-2, bark-plus or none")
     ap.add_argument("--mode", default=None, choices=("auto", "no", "en"))
+    ap.add_argument("--ptt", action="store_true", help="push-to-talk: hold the key for each clip")
     args = ap.parse_args()
 
     from faster_whisper.audio import decode_audio
@@ -45,9 +49,10 @@ def main() -> None:
         cfg["stt"]["en"] = None if args.en == "none" else args.en
     if args.mode:
         cfg["mode"] = args.mode
+    cfg["mic"]["trigger"] = "push_to_talk" if args.ptt else "always"
     r = cfg["resources"]
     stt = SpeechToText(cfg)
-    vad = SileroVad(model_path(cfg["vad"]["model"]), threads=r["vad_threads"])
+    vad = SileroVad(model_path(cfg["vad"]["model"]))
     mic = MicListener(cfg, vad, stt)
     finals: list[dict] = []
     got = threading.Event()
@@ -64,11 +69,17 @@ def main() -> None:
     print(f"speculation {'off' if not cfg['vad']['speculative_ms'] else str(cfg['vad']['speculative_ms']) + ' ms'}, window {cfg['stt']['min_window_s'] or 30} s")
 
     for clip in args.clips:
-        audio = np.concatenate([np.zeros(8000, np.float32), decode_audio(str(clip), sampling_rate=16000), np.zeros(24000, np.float32)])
+        speech = decode_audio(str(clip), sampling_rate=16000)
+        audio = np.concatenate([np.zeros(8000, np.float32), speech, np.zeros(24000, np.float32)])
+        release_at = 8000 + speech.size + 4800  # 300 ms after the clip's audio
         got.clear()
         before = len(finals)
         start = time.perf_counter()
         for i in range(0, audio.size - n + 1, n):
+            if args.ptt and i <= 4800 < i + n:
+                mic.ptt(True)  # the key goes down 200 ms before the speech
+            if args.ptt and i <= release_at < i + n:
+                mic.ptt(False)
             mic.feed(audio[i : i + n])
             # real-time pace, so the latency is what a speaker would see
             delay = start + (i // n + 1) * frame_s - time.perf_counter()

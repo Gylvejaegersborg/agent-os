@@ -118,3 +118,85 @@ class Segmenter:
         frames = self._frames[: len(self._frames) - drop] if drop else list(self._frames)
         speech_ms = round(self._speech_frames * self.frame_ms)
         return Utterance(frames=frames, speech_ms=speech_ms, start_frame=self._start, end_frame=self._start + len(frames) - 1)
+
+
+@dataclass
+class HoldRecorder:
+    """Push-to-talk (phase 6): everything between press and release is one utterance, so the end needs no
+    silence window. Between holds, frames only fill the pre-roll (the VAD doesn't even run on them), so the
+    first syllable said a moment before the key went down is still kept.
+
+    On release the hold is trimmed to its speech: from preroll_ms before the first speech frame to speech_pad_ms
+    after the last one (Whisper invents words in long silence). A hold with less than min_speech_ms of speech
+    gives no utterance. The utterance's start_frame is the hold's first frame, so early language ID (keyed by
+    it while the key is still down) matches the final job.
+    """
+
+    frame_ms: float
+    threshold: float = 0.5
+    speech_pad_ms: int = 150
+    preroll_ms: int = 300
+    min_speech_ms: int = 250
+    _preroll: deque = field(init=False)
+    _frames: list = field(init=False, default_factory=list)
+    _probs: list = field(init=False, default_factory=list)
+    _held: bool = field(init=False, default=False)
+    _index: int = field(init=False, default=0)
+    _start: int = field(init=False, default=0)
+
+    def __post_init__(self) -> None:
+        self._preroll = deque(maxlen=max(0, round(self.preroll_ms / self.frame_ms)))
+
+    @property
+    def in_speech(self) -> bool:
+        return self._held
+
+    @property
+    def held_ms(self) -> int:
+        return round(len(self._frames) * self.frame_ms) if self._held else 0
+
+    @property
+    def speech_ms(self) -> int:
+        return round(sum(1 for p in self._probs if p >= self.threshold) * self.frame_ms) if self._held else 0
+
+    @property
+    def start_frame(self) -> int:
+        return self._start
+
+    def so_far(self) -> list:
+        return list(self._frames)
+
+    def idle(self, frame: Sequence[float]) -> None:
+        """A frame while the key is up: kept only as pre-roll."""
+        self._preroll.append(frame)
+        self._index += 1
+
+    def press(self) -> list:
+        """The key went down. Returns the pre-roll frames, which the caller scores with set_preroll_probs()."""
+        self._held = True
+        self._frames = list(self._preroll)
+        self._probs = [0.0] * len(self._frames)
+        self._start = self._index - len(self._frames)
+        self._preroll.clear()
+        return list(self._frames)
+
+    def set_preroll_probs(self, probs: Sequence[float]) -> None:
+        self._probs[: len(probs)] = list(probs)
+
+    def push(self, frame: Sequence[float], prob: float) -> None:
+        self._frames.append(frame)
+        self._probs.append(prob)
+        self._index += 1
+
+    def release(self) -> Optional[Utterance]:
+        held, frames, probs = self._held, self._frames, self._probs
+        self._held, self._frames, self._probs = False, [], []
+        if not held:
+            return None
+        speech = [i for i, p in enumerate(probs) if p >= self.threshold]
+        speech_ms = round(len(speech) * self.frame_ms)
+        if speech_ms < self.min_speech_ms:
+            return None
+        lo = max(0, speech[0] - round(self.preroll_ms / self.frame_ms))
+        hi = min(len(frames), speech[-1] + 1 + round(self.speech_pad_ms / self.frame_ms))
+        return Utterance(frames=frames[lo:hi], speech_ms=speech_ms, start_frame=self._start, end_frame=self._start + hi - 1)

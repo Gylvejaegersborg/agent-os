@@ -5,7 +5,9 @@ Routes:
   POST /v1/audio/transcriptions    file upload → text; language "no"/"en", or auto (language ID picks the engine)
   POST /v1/audio/speech            text → wav/pcm (Kokoro) — only when tts.enabled; off by default
   WS   /v1/listen                  live mic events: speech_start, speech_end, final, mode
-  POST /v1/control                 {"mute": true|false, "mode": "auto"|"no"|"en"|"next"}
+  POST /v1/control                 {"mute": true|false, "mode": "auto"|"no"|"en"|"next", "ptt": true|false}
+
+Every route but GET /health needs `Authorization: Bearer <the gateway token>` (auth.py).
 """
 
 from __future__ import annotations
@@ -16,13 +18,15 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from .config import load_config, model_path
 from .engines import KokoroTts, to_pcm16, to_wav
+from .auth import has_token, load_token
 from .hotkey import Hotkey
+from .lazy import Lazy, start_idle_watch
 from .router import MODES
 from .stt import SpeechToText
 
@@ -32,7 +36,11 @@ class State:
     stt: Optional[SpeechToText] = None
     hotkey: Optional[Hotkey] = None
     hotkey_error: Optional[str] = None
-    tts: Optional[KokoroTts] = None
+    ptt_key: Optional[Hotkey] = None
+    ptt_error: Optional[str] = None
+    token: Optional[str] = None
+    tts: Optional[Lazy[KokoroTts]] = None
+    idle_watch: Any = None
     mic: Any = None
     mic_error: Optional[str] = None
     started: float = 0.0
@@ -58,21 +66,35 @@ def load(cfg: dict[str, Any]) -> None:
     set_priority(r["priority"])
     state.cfg = cfg
     state.started = time.time()
+    if cfg["auth"]["enabled"]:
+        state.token, source = load_token(model_path(cfg["auth"]["token_file"]))
+        print(f"[voice] auth on: requests need the token from {source}")
+    else:
+        print("[voice] auth OFF (auth.enabled: false): any program on this machine, any web page included, can read your dictation")
     state.stt = SpeechToText(cfg)
     t = cfg["tts"]
     if t["enabled"]:
         t0 = time.perf_counter()
         en = t["en"]
-        state.tts = KokoroTts(model_path(en["model"]), model_path(en["voices"]), en["voice"], sample_rate=t["sample_rate"])
+        state.tts = Lazy(
+            KokoroTts.name,
+            lambda: KokoroTts(model_path(en["model"]), model_path(en["voices"]), en["voice"], sample_rate=t["sample_rate"]),
+            60 * (r.get("idle_unload_min") or 0),
+        )
+        state.tts.load()
         print(f"[voice] Kokoro loaded in {time.perf_counter() - t0:.1f}s")
     else:
         print("[voice] speech back is off (tts.enabled: false) — no TTS model loaded")
+    lazy = state.stt.lazy_models + ([state.tts] if state.tts else [])
+    if r.get("idle_unload_min"):
+        state.idle_watch = start_idle_watch(lazy)
+        print(f"[voice] {', '.join(m.name for m in lazy)} unload after {r['idle_unload_min']} min idle; speech reloads them")
     if cfg["mic"]["enabled"]:
         try:
             from .mic import MicListener
             from .vad import SileroVad
 
-            vad = SileroVad(model_path(cfg["vad"]["model"]), threads=r["vad_threads"], sample_rate=cfg["audio"]["sample_rate"])
+            vad = SileroVad(model_path(cfg["vad"]["model"]), sample_rate=cfg["audio"]["sample_rate"])
             state.mic = MicListener(cfg, vad, state.stt)
             state.mic.start()
             print(f"[voice] listening on: {state.mic.device_name}")
@@ -91,6 +113,18 @@ def load(cfg: dict[str, Any]) -> None:
             state.hotkey_error = str(err)
         if state.hotkey_error:
             print(f"[voice] no mode hotkey: {state.hotkey_error}")
+    m = cfg["mic"]
+    if state.mic is not None and state.mic.trigger == "push_to_talk":
+        try:
+            state.ptt_key = Hotkey(m["ptt_key"], lambda: state.mic.ptt(True), lambda: state.mic.ptt(False))
+            if state.ptt_key.start():
+                print(f"[voice] push-to-talk: hold {m['ptt_key']} and speak")
+            else:
+                state.ptt_error, state.ptt_key = state.ptt_key.error, None
+        except ValueError as err:
+            state.ptt_error = str(err)
+        if state.ptt_error:
+            print(f"[voice] no push-to-talk key ({state.ptt_error}); POST /v1/control {{\"ptt\": true|false}} still works")
 
 
 def set_mode(mode: str) -> str:
@@ -106,13 +140,23 @@ async def lifespan(_app: FastAPI):
     if not getattr(state, "cfg", None):
         load(load_config())
     yield
-    if state.hotkey is not None:
-        state.hotkey.stop()
+    if state.idle_watch is not None:
+        state.idle_watch.set()
+    for key in (state.hotkey, state.ptt_key):
+        if key is not None:
+            key.stop()
     if state.mic is not None:
         state.mic.stop()
 
 
 app = FastAPI(title="agent-os voice", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def require_token(request: Request, call_next):
+    if state.token and request.url.path != "/health" and not has_token(request.headers.get("authorization"), state.token):
+        return JSONResponse({"error": "missing or wrong token (Authorization: Bearer <agent-os/data/gateway-token>)"}, status_code=401)
+    return await call_next(request)
 
 
 @app.get("/health")
@@ -134,9 +178,18 @@ def health() -> dict[str, Any]:
             "tts.en": state.tts.name if state.tts else None,
             "vad": "silero-v5" if state.mic else None,
         },
+        # Lazy models: loaded now, or dropped after resources.idle_unload_min idle (reloaded on speech).
+        "loaded": {m.name: m.loaded for m in (state.stt.lazy_models if state.stt else []) + ([state.tts] if state.tts else [])},
         "english_routing": {"on": bool(state.stt and state.stt.en), "error": state.stt.en_error if state.stt else None},
         "mode": state.stt.router.mode if state.stt else None,
         "hotkey": {"combo": state.hotkey.combo if state.hotkey else None, "error": state.hotkey_error},
+        "push_to_talk": {
+            "on": bool(state.mic and state.mic.trigger == "push_to_talk"),
+            "key": state.ptt_key.combo if state.ptt_key else None,
+            "error": state.ptt_error,
+            "held": bool(state.mic and state.mic.held),
+        },
+        "auth": bool(state.token),
         "speech_back": bool(state.tts),
         "mic": {
             "listening": state.mic is not None and not state.mic.muted,
@@ -202,7 +255,7 @@ async def speech(req: SpeechRequest) -> Response:
         raise HTTPException(400, "phase 1 speaks English only (Norwegian via Piper comes in phase 3)")
     if req.response_format not in ("wav", "pcm"):
         raise HTTPException(400, "response_format must be wav or pcm")
-    audio = await asyncio.to_thread(state.tts.synthesize, req.input, req.voice, req.speed)
+    audio = await asyncio.to_thread(state.tts.run, lambda k: k.synthesize(req.input, req.voice, req.speed))
     rate = state.cfg["tts"]["sample_rate"]
     if req.response_format == "pcm":
         return Response(to_pcm16(audio), media_type="audio/pcm", headers={"x-sample-rate": str(rate)})
@@ -212,6 +265,7 @@ async def speech(req: SpeechRequest) -> Response:
 class ControlRequest(BaseModel):
     mute: Optional[bool] = None
     mode: Optional[str] = None  # auto | no | en | next
+    ptt: Optional[bool] = None  # push-to-talk down/up, for a button in place of the key
 
 
 @app.post("/v1/control")
@@ -224,11 +278,22 @@ def control(req: ControlRequest) -> dict[str, Any]:
         if req.mode not in (*MODES, "next"):
             raise HTTPException(400, f"mode must be one of {', '.join(MODES)} or next")
         set_mode(req.mode)
-    return {"muted": bool(state.mic and state.mic.muted), "mode": state.stt.router.mode if state.stt else None}
+    if req.ptt is not None:
+        if state.mic is None or state.mic.trigger != "push_to_talk":
+            raise HTTPException(409, "push-to-talk is off (mic.trigger is not push_to_talk, or the mic isn't running)")
+        state.mic.ptt(req.ptt)
+    return {
+        "muted": bool(state.mic and state.mic.muted),
+        "mode": state.stt.router.mode if state.stt else None,
+        "held": bool(state.mic and state.mic.held),
+    }
 
 
 @app.websocket("/v1/listen")
 async def listen(ws: WebSocket) -> None:
+    if state.token and not has_token(ws.headers.get("authorization"), state.token):
+        await ws.close(code=4401)  # before accept: a page that can't send the token learns nothing
+        return
     await ws.accept()
     if state.mic is None:
         await ws.send_json({"type": "error", "error": f"the mic isn't running ({state.mic_error or 'mic.enabled is false'})"})

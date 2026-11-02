@@ -3,16 +3,20 @@ Run: python test_voice.py   (stdlib only)"""
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from voice_service.auth import has_token, load_token  # noqa: E402
 from voice_service.config import DEFAULTS, load_config  # noqa: E402
 from voice_service.hotkey import parse as parse_hotkey  # noqa: E402
+from voice_service.lazy import Lazy  # noqa: E402
 from voice_service.router import Router  # noqa: E402
-from voice_service.segmenter import Segmenter  # noqa: E402
+from voice_service.segmenter import HoldRecorder, Segmenter  # noqa: E402
 
 failed = False
 
@@ -147,6 +151,74 @@ for bad in ("l", "ctrl+alt+", "hyper+l", "ctrl+alt+space"):
         check(False, f"{bad!r} is refused")
     except ValueError:
         check(True, f"{bad!r} is refused")
+
+print("-- idle unload --")
+made = []
+m = Lazy("fake", lambda: made.append(1) or {"n": len(made)}, idle_s=60, log=lambda _: None)
+check(not m.loaded and made == [], "nothing loads until asked")
+check(m.run(lambda o: o["n"]) == 1 and m.loaded, "first use loads it")
+check(not m.unload_if_idle(now=m.last_used + 59), "kept while used within idle_s")
+check(m.unload_if_idle(now=m.last_used + 61) and not m.loaded, "dropped after idle_s without use")
+check(m.run(lambda o: o["n"]) == 2 and m.loads == 2, "the next use loads it again")
+held = []
+m.run(lambda o: held.append(m.unload_if_idle(now=m.last_used + 10_000)))
+check(held == [False] and m.loaded, "never dropped while in use")
+check(not Lazy("never", dict, idle_s=0).unload_if_idle(now=1e12), "idle_s 0: never unloaded")
+m.unload_if_idle(now=m.last_used + 61)
+m.prefetch()
+for _ in range(100):
+    if m.loaded:
+        break
+    time.sleep(0.01)
+check(m.loaded and m.loads == 3, "prefetch() reloads in the background")
+
+print("-- push-to-talk --")
+h = HoldRecorder(frame_ms=FRAME_MS)
+for i in range(20):
+    h.idle([float(i)])
+pre = h.press()
+check([int(f[0]) for f in pre] == list(range(20 - round(300 / FRAME_MS), 20)), "press hands back the 300 ms pre-roll")
+h.set_preroll_probs([0.1] * len(pre))
+probs = [0.1] * 10 + [0.9] * 30 + [0.1] * 40  # key down: 320 ms quiet, ~1 s speech, 1.3 s quiet before release
+for i, p in enumerate(probs):
+    h.push([float(20 + i)], p)
+check(h.in_speech and h.speech_ms == round(30 * FRAME_MS), "while held: speech_ms counts speech only")
+check(h.start_frame == 20 - len(pre) and int(h.so_far()[0][0]) == h.start_frame, "so_far() starts at the hold's first frame")
+u = h.release()
+first_speech = 20 + 10
+check(u is not None and int(u.frames[0][0]) == first_speech - round(300 / FRAME_MS), "release trims leading quiet to 300 ms before the speech")
+check(int(u.frames[-1][0]) == first_speech + 29 + round(150 / FRAME_MS), "…and trailing quiet to 150 ms after it")
+check(u.start_frame == 20 - len(pre), "the utterance keeps the hold's start_frame (early language ID matches it)")
+check(not h.in_speech and h.release() is None, "released: nothing more until the next press")
+h.press()
+for p in [0.1] * 20 + [0.9] * 5:
+    h.push([0.0], p)
+check(h.release() is None, "a hold with 160 ms of speech (under 250 ms) gives no utterance")
+h2 = HoldRecorder(frame_ms=FRAME_MS)
+h2.press()
+h2.set_preroll_probs([])
+for _ in range(10):
+    h2.push([0.0], 0.95)
+check(h2.release() is not None, "speech from the first frame (nothing to trim before it)")
+
+print("-- auth --")
+check(has_token("Bearer s3cret-token-0123456789", "s3cret-token-0123456789"), "the right token passes")
+check(has_token("bearer   s3cret-token-0123456789 ", "s3cret-token-0123456789"), "scheme case and spaces don't matter")
+check(not has_token("Bearer wrong", "s3cret-token-0123456789") and not has_token(None, "x" * 20) and not has_token("s3cret-token-0123456789", "s3cret-token-0123456789"), "wrong, missing, or without 'Bearer': refused")
+with tempfile.TemporaryDirectory() as d:
+    f = Path(d) / "data" / "gateway-token"
+    saved = os.environ.pop("AGENT_OS_GATEWAY_TOKEN", None)
+    try:
+        t1, src1 = load_token(f)
+        t2, src2 = load_token(f)
+        check(len(t1) >= 16 and f.read_text().strip() == t1 and src1.endswith("(new)"), "no token yet: one is made and saved where the gateway keeps it")
+        check(t2 == t1 and not src2.endswith("(new)"), "the next start reads the same one")
+        os.environ["AGENT_OS_GATEWAY_TOKEN"] = "from-the-environment-123"
+        check(load_token(f)[0] == "from-the-environment-123", "AGENT_OS_GATEWAY_TOKEN wins over the file")
+    finally:
+        os.environ.pop("AGENT_OS_GATEWAY_TOKEN", None)
+        if saved is not None:
+            os.environ["AGENT_OS_GATEWAY_TOKEN"] = saved
 
 print("-- config --")
 cfg = load_config(Path(tempfile.gettempdir()) / "does-not-exist.yaml")
