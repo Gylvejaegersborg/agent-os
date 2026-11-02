@@ -1,0 +1,14 @@
+# Phase 1. Python 3.11 (the spec's version; `uv venv --python 3.11`).
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+python-multipart>=0.0.9
+pyyaml>=6
+numpy>=1.26,<3
+sounddevice>=0.4.7
+onnxruntime>=1.18,<2
+faster-whisper>=1.1,<2
+huggingface_hub>=0.24
+psutil>=5.9
+truststore>=0.10   # fetch_models.py verifies HTTPS with Windows' certificate store
+# Speech back (tts.enabled: true) only:
+kokoro-onnx>=0.4,<1

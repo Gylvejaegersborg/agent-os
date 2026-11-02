@@ -60,6 +60,14 @@ const MAX_SCROLLBACK = 256 * 1024;
 const MAX_TERMINALS = 8;
 const sessions = new Map<string, TerminalSession>();
 
+/** The "Shell" profile's program: PowerShell on Windows (there is usually no `bash` on a service's PATH), else $SHELL or bash.
+ *  AGENT_OS_SHELL overrides it (a path, or a command name). */
+export function terminalShell(env: NodeJS.ProcessEnv = process.env, platform: string = process.platform): { file: string; args: string[] } {
+  if (env.AGENT_OS_SHELL) return { file: env.AGENT_OS_SHELL, args: [] };
+  if (platform === "win32") return { file: "powershell.exe", args: ["-NoLogo"] };
+  return { file: env.SHELL || "bash", args: [] };
+}
+
 export function terminalsEnabled(): boolean {
   return process.env.AGENT_OS_TERMINAL === "1";
 }
@@ -145,10 +153,12 @@ async function spawnPty(file: string, args: string[], cols: number, rows: number
 // ---- Claude Code wired into the OS ----
 
 let gatewayUrl: string | undefined;
+let gatewayToken: string | undefined;
 /** Set by startGateway() once it's listening, so Claude Code sessions can
- *  reach this gateway's /mcp (mcp.ts). */
-export function setTerminalGatewayUrl(url: string): void {
+ *  reach this gateway's /mcp (mcp.ts) — with the gateway token when it has one. */
+export function setTerminalGatewayUrl(url: string, token?: string): void {
   gatewayUrl = url;
+  gatewayToken = token;
 }
 
 /** Claude Code started from the OS gets the OS as MCP tools (BaseSpace,
@@ -157,7 +167,9 @@ export function setTerminalGatewayUrl(url: string): void {
  *  normal Claude Code, plus the OS. */
 function claudeArgs(): string[] {
   if (!gatewayUrl) return [];
-  const mcpConfig = { mcpServers: { "agent-os": { type: "http", url: `${gatewayUrl}/mcp` } } };
+  const mcpConfig = {
+    mcpServers: { "agent-os": { type: "http", url: `${gatewayUrl}/mcp`, ...(gatewayToken ? { headers: { Authorization: `Bearer ${gatewayToken}` } } : {}) } },
+  };
   return [
     "--mcp-config", JSON.stringify(mcpConfig),
     "--append-system-prompt",
@@ -196,7 +208,7 @@ export async function createTerminal(input: { profile?: unknown; cols?: unknown;
   const [file, args, title] =
     profile === "claude"
       ? [claudeCliCommand(), claudeArgs(), "Claude Code"]
-      : [process.env.SHELL || "bash", [] as string[], "Shell"];
+      : [terminalShell().file, terminalShell().args, "Shell"];
 
   const info: TerminalInfo = { id: generateId(), profile, title, cwd, createdAt: new Date().toISOString(), cols, rows };
   const pty = await spawnPty(file, args, cols, rows, cwd, env);

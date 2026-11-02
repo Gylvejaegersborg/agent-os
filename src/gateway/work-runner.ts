@@ -29,6 +29,8 @@ import {
   createSession,
   getAgentIdentity,
   getWork,
+  flowStepExecutions,
+  flowStepHops,
   listWork,
   reopenWork,
   runTurn,
@@ -123,7 +125,9 @@ export function startWorkRunner(deps: WorkRunnerDeps, opts: { intervalMs?: numbe
           // A verifier reads and reports — it can't do the work it checks.
           ...(item.kind === "verification"
             ? { onlyTools: ["work", "basespace"], maxToolHops: Math.min(14, (item.verifies?.length ?? 1) * 2 + 3) }
-            : { maxToolHops: deps.maxToolHops }),
+            : { maxToolHops: flowStepHops() }),
+          // A work item is a whole job, like a flow step: it gets the same room (a chat reply keeps the smaller cap).
+          maxToolExecutions: flowStepExecutions(),
         });
         const after = await getWork(item.id);
         if (after?.status === "in_progress") {

@@ -17,7 +17,8 @@ export interface WorkerResult {
 export interface Worker {
   id: string;
   kind: string;
-  run(command: string): Promise<WorkerResult>;
+  /** `signal` stops the command when the session is cancelled (workers that can't stop may ignore it). */
+  run(command: string, opts?: { signal?: AbortSignal }): Promise<WorkerResult>;
 }
 
 /** The only Worker implementation this scaffold ships: a local shell.
@@ -27,10 +28,10 @@ export function createLocalShellWorker(id = "local-shell"): Worker {
   return {
     id,
     kind: "local-shell",
-    async run(command: string): Promise<WorkerResult> {
+    async run(command: string, opts?: { signal?: AbortSignal }): Promise<WorkerResult> {
       const { exec } = await import("node:child_process");
       return new Promise((resolve) => {
-        exec(command, { timeout: 30_000 }, (error, stdout, stderr) => {
+        exec(command, { timeout: 30_000, signal: opts?.signal }, (error, stdout, stderr) => {
           if (error) {
             resolve({ ok: false, output: stdout, error: stderr || error.message });
           } else {
@@ -65,12 +66,12 @@ export function createSandboxedWorker(inner: Worker, policy: SandboxPolicy): Wor
   return {
     id: `sandboxed:${inner.id}`,
     kind: `sandboxed:${inner.kind}`,
-    async run(command: string): Promise<WorkerResult> {
+    async run(command: string, opts?: { signal?: AbortSignal }): Promise<WorkerResult> {
       const check = checkSandbox(policy, command);
       if (!check.allowed) {
         return { ok: false, output: "", error: `sandbox rejected command: ${check.reason}` };
       }
-      return inner.run(command);
+      return inner.run(command, opts);
     },
   };
 }

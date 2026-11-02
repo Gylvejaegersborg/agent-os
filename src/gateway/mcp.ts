@@ -24,6 +24,7 @@ import { listApprovals } from "../core/approvals.js";
 import { OPERATOR, createWork, listWork, type WorkStatus } from "../core/work.js";
 import { verifierId, watchWork } from "../core/watchdog.js";
 import type { SessionFocus } from "../core/types.js";
+import { renderDesktopReport } from "../core/desktop.js";
 
 /** The one thing the MCP layer needs from the gateway that isn't a plain
  *  core call: running an agent turn exactly like POST /sessions/:id/turns
@@ -214,6 +215,18 @@ const TOOLS: McpTool[] = [
       return list
         .map((a) => `- ${a.id} · ${a.agentId} wants ${a.toolName} ${JSON.stringify(a.args).slice(0, 200)} — ${a.reason} (${a.requestedAt})`)
         .join("\n");
+    },
+  },
+  {
+    name: "desktop_activity",
+    description:
+      "What the operator has been doing on their machine: time per app, time per BaseSpace project/goal (matched from window titles), app switches and focus blocks for a day, plus the window in front right now. Window titles only — no keystrokes, text or screenshots are ever recorded.",
+    inputSchema: {
+      type: "object",
+      properties: { day: { type: "string", description: "YYYY-MM-DD, local time. Default: today." } },
+    },
+    async run(args) {
+      return renderDesktopReport(typeof args.day === "string" ? args.day : undefined);
     },
   },
 ];

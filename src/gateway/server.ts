@@ -90,6 +90,14 @@ import {
   createFlow,
   cancelFlow,
   resumeFlow,
+  reopenFlow,
+  markStepDone,
+  flowStepHops,
+  completeOverlayTodo,
+  reopenOverlayTodo,
+  openAgentTodos,
+  generateFlowBriefing,
+  getFlowBriefing,
   listApprovals,
   getApproval,
   approveRequest,
@@ -126,6 +134,22 @@ import {
   EXACT_ONLY_TOOLS,
   executeApprovedCall,
   consumeApproval,
+  recordDesktopBatch,
+  getDesktopFocus,
+  desktopTimeline,
+  desktopDaySummary,
+  renderDesktopDigest,
+  weekDigest,
+  recordDesktopCorrection,
+  getFlowDefinition,
+  buildFlowReport,
+  storeFlowDefinition,
+  listConnectors,
+  refreshConnectors,
+  setConnectorEnabled,
+  localDay,
+  transitionTask,
+  flowStepExecutions,
 } from "../core/index.js";
 import { checkPathSandbox } from "../core/permissions.js";
 import { runReview } from "./review-loop.js";
@@ -133,14 +157,22 @@ import type { SessionStatus, ApprovalStatus, ApprovalRequest, TaskStatus, Nomina
 import type { SandboxPolicy } from "../core/permissions.js";
 import type { ConfiguredHook } from "../core/configured-hooks.js";
 import { handleMcp, type McpDeps } from "./mcp.js";
+import { handleLibrary } from "./library-routes.js";
+import { handleSoundlab } from "./soundlab-routes.js";
+import { buildOps } from "./ops.js";
+import { listSongAssets } from "../core/library.js";
 import type { SessionFocus } from "../core/types.js";
 import { closeAllTerminals, closeTerminal, setTerminalGatewayUrl, createTerminal, listTerminals, ptyBackend, resizeTerminal, streamTerminal, terminalsEnabled, writeTerminal } from "./terminal.js";
+import { hasGatewayToken } from "./auth.js";
 import type { ArtifactType } from "../core/artifacts.js";
 import type { FlowStepDefinition } from "../core/flow-engine.js";
 
 export interface GatewayDeps {
   model: ModelAdapter;
   worker: Worker;
+  /** When set, every request but GET /health must carry `Authorization: Bearer <token>` (auth.ts). The gateway
+   *  CLI always sets it; tests that start a gateway without it get the old open behaviour. */
+  token?: string;
   skills?: SkillRegistry;
   /** Root directory writeSkill()/deleteSkill() persist to — separate from
    *  `skills` (the in-memory catalog) because the registry itself doesn't
@@ -213,11 +245,12 @@ function parseFlowSteps(raw: unknown): FlowStepDefinition[] | undefined {
   const steps: FlowStepDefinition[] = [];
   for (const s of raw) {
     if (typeof s !== "object" || s === null) return undefined;
-    const { id, agentId, goal, dependsOn, retries } = s as Record<string, unknown>;
+    const { id, agentId, goal, dependsOn, retries, check } = s as Record<string, unknown>;
     if (typeof id !== "string" || typeof agentId !== "string" || typeof goal !== "string") return undefined;
     if (dependsOn !== undefined && !(Array.isArray(dependsOn) && dependsOn.every((d) => typeof d === "string"))) return undefined;
     if (retries !== undefined && typeof retries !== "number") return undefined;
-    steps.push({ id, agentId, goal, dependsOn: dependsOn as string[] | undefined, retries: retries as number | undefined });
+    if (check !== undefined && check !== "pack-facts") return undefined;
+    steps.push({ id, agentId, goal, dependsOn: dependsOn as string[] | undefined, retries: retries as number | undefined, ...(check ? { check: "pack-facts" as const } : {}) });
   }
   return steps;
 }
@@ -235,7 +268,7 @@ function parseFlowSteps(raw: unknown): FlowStepDefinition[] | undefined {
 function withCors(req: IncomingMessage, res: ServerResponse): boolean {
   res.setHeader("access-control-allow-origin", "*");
   res.setHeader("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.setHeader("access-control-allow-headers", "content-type");
+  res.setHeader("access-control-allow-headers", "content-type, authorization");
   if (req.method === "OPTIONS") {
     res.writeHead(204);
     res.end();
@@ -253,6 +286,11 @@ export function startGateway(deps: GatewayDeps, port = 0): Promise<GatewayHandle
   return new Promise((resolve) => {
     const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
       if (withCors(req, res)) return;
+      // Every route but GET /health needs the gateway token (auth.ts), when the gateway was given one.
+      if (deps.token && !(req.method === "GET" && req.url?.split("?")[0] === "/health") && !hasGatewayToken(req, deps.token)) {
+        sendJson(res, 401, { error: "missing or wrong gateway token (Authorization: Bearer <token>; see agent-os's README, \"Gateway auth\")" });
+        return;
+      }
       try {
         await route(req, res, deps);
       } catch (err) {
@@ -265,10 +303,15 @@ export function startGateway(deps: GatewayDeps, port = 0): Promise<GatewayHandle
       }
     });
 
+    // A music upload (a WAV can be 100+ MB) can take longer than Node's default 5 minute
+    // limit to arrive over a slow link. The gateway is loopback-only (reached through
+    // BaseSpace's proxy), so the slow-request guard can be generous.
+    server.requestTimeout = 30 * 60_000;
+
     server.listen(port, "127.0.0.1", () => {
       const address = server.address();
       const actualPort = typeof address === "object" && address ? address.port : port;
-      setTerminalGatewayUrl(`http://127.0.0.1:${actualPort}`);
+      setTerminalGatewayUrl(`http://127.0.0.1:${actualPort}`, deps.token);
       resolve({
         server,
         port: actualPort,
@@ -355,7 +398,8 @@ async function resumeAfterDecision(deps: GatewayDeps, approval: ApprovalRequest)
     } else {
       userMessage = `[Approvals] Rejected ${approval.id}: ${call}. Don't run it. Say what you'd do instead, or ask what the operator wants.`;
     }
-    await runTurn({
+    const inFlowStep = !!(session.flowId && session.taskId);
+    const result = await runTurn({
       sessionId: session.id,
       agentId: session.agentId,
       userMessage,
@@ -367,11 +411,42 @@ async function resumeAfterDecision(deps: GatewayDeps, approval: ApprovalRequest)
       enableArtifacts: deps.enableArtifacts,
       enableBaseSpace: deps.enableBaseSpace,
       sandboxPolicy: deps.sandboxPolicy,
-      maxToolHops: deps.maxToolHops,
+      maxToolHops: inFlowStep ? flowStepHops() : deps.maxToolHops,
+      ...(inFlowStep ? { maxToolExecutions: flowStepExecutions() } : {}),
     });
+    if (approval.status === "approved" && inFlowStep && result.stopReason === "answered") {
+      await continueFlowAfterApproval(deps, session.flowId!, session.taskId!, session.id, result.finalContent);
+    }
   } catch (err) {
     console.error(`[gateway] resuming session ${approval.sessionId} after approval ${approval.id} failed:`, err instanceof Error ? err.message : err);
   }
+}
+
+/** A flow step that stopped waiting on an approval (flow-engine.ts records it as failed, "waiting on approval")
+ *  has now finished its work in the follow-up turn: the step is recorded as done with that turn's answer, and
+ *  the rest of the flow runs. Only when this step is the flow's one stopped step — otherwise accepting it would
+ *  also re-run other failed steps the operator hasn't looked at (they stay for the operator to Resume). */
+async function continueFlowAfterApproval(deps: GatewayDeps, flowId: string, taskId: string, sessionId: string, finalContent: string | undefined): Promise<void> {
+  const flow = await getFlow(flowId);
+  const step = flow?.steps.find((s) => s.taskId === taskId);
+  if (!flow || !step || flow.status !== "failed" || step.status !== "failed") return;
+  if (flow.steps.some((s) => s !== step && ["failed", "timed_out", "lost"].includes(s.status))) return;
+  const task = await getTask(taskId);
+  if (typeof task?.output?.approvalId !== "string") return; // stopped for some other reason: the operator decides
+  const def = await getFlowDefinition(flowId);
+  if (!def) return;
+  await transitionTask(taskId, "succeeded", { output: { finalContent, sessionId }, reason: "finished after its approval was decided" });
+  await markStepDone(flowId, step.id, def.steps, {
+    model: deps.model,
+    worker: deps.worker,
+    skills: deps.skills,
+    maxToolHopsPerStep: flowStepHops(),
+    enableSubagents: deps.enableSubagents,
+    enableMemoryNominations: deps.enableMemoryNominations,
+    enableArtifacts: deps.enableArtifacts,
+    enableBaseSpace: deps.enableBaseSpace,
+    sandboxPolicy: deps.sandboxPolicy,
+  });
 }
 
 async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDeps): Promise<void> {
@@ -478,6 +553,28 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
     return;
   }
 
+  // ---- Music library (core/library.ts): the operator's own uploads. ----
+  if (segments[0] === "library" && (await handleLibrary(req, res, segments, url, { readJson: readRequestBody, sendJson }))) return;
+  // ---- Connectors (core/connectors.ts): the MCP connectors agents can reach through the Claude CLI. Operator-only. ----
+  if (segments[0] === "connectors") {
+    if (method === "GET" && segments.length === 1) {
+      if (url.searchParams.get("refresh") === "1") await refreshConnectors().catch(() => undefined);
+      sendJson(res, 200, listConnectors());
+      return;
+    }
+    if (method === "PUT" && segments.length === 2) {
+      const body = await readRequestBody(req);
+      try {
+        sendJson(res, 200, await setConnectorEnabled(decodeURIComponent(segments[1]!), body.enabled === true));
+      } catch (err) {
+        sendJson(res, 404, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+  }
+  // ---- Sound Lab (core/soundlab.ts): synthesized candidates the operator listens to and judges. ----
+  if (segments[0] === "soundlab" && (await handleSoundlab(req, res, segments, url, { readJson: readRequestBody, sendJson }))) return;
+
   // ---- Team reviews (core/review.ts, review-loop.ts): what each lead's
   // review would look at (free — no model call), past reviews, and the
   // operator's "review now". ----
@@ -563,6 +660,53 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
   // Which model providers this gateway can use, for BaseSpace's agent
   // editor. An agent's defaultModel can name any of them ("claude-cli:sonnet",
   // "ollama:llama3.2:3b", ...); see models/real.ts's provider router.
+  // ---- Desktop activity (core/desktop.ts) — the operator's machine posts
+  // finished app/window spans; everything else is a projection. ----
+  if (segments[0] === "desktop") {
+    const day = url.searchParams.get("day") ?? localDay(new Date());
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+      sendJson(res, 400, { error: "day must be YYYY-MM-DD" });
+      return;
+    }
+    if (method === "POST" && segments.length === 2 && segments[1] === "spans") {
+      try {
+        sendJson(res, 200, await recordDesktopBatch(await readRequestBody(req)));
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+    if (method === "GET" && segments.length === 2 && segments[1] === "now") {
+      sendJson(res, 200, { focus: getDesktopFocus() ?? null });
+      return;
+    }
+    if (method === "GET" && segments.length === 2 && segments[1] === "timeline") {
+      sendJson(res, 200, { day, spans: await desktopTimeline(day) });
+      return;
+    }
+    if (method === "GET" && segments.length === 2 && segments[1] === "summary") {
+      const summary = await desktopDaySummary(day);
+      sendJson(res, 200, { summary, digest: renderDesktopDigest(summary) });
+      return;
+    }
+    // The Monday-to-Sunday week containing `day`: for the goal/project pages ("3 h 20 m this week").
+    if (method === "GET" && segments.length === 2 && segments[1] === "week") {
+      sendJson(res, 200, await weekDigest(day));
+      return;
+    }
+    // The operator disagreeing with something learned ("no, that wasn't work"): the strongest memory signal there is.
+    if (method === "POST" && segments.length === 2 && segments[1] === "correction") {
+      try {
+        const body = await readRequestBody(req);
+        await recordDesktopCorrection(String(body.text ?? ""));
+        sendJson(res, 200, { ok: true });
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+  }
+
   if (method === "GET" && segments.length === 1 && segments[0] === "providers") {
     sendJson(res, 200, { providers: await listProviders(), defaultModel: deps.model.id });
     return;
@@ -592,9 +736,40 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         return;
       }
     }
+    // GET /basespace/needs-you: everything waiting on the operator, in one answer: pending approvals and the open todos agents created (with the flow each came from).
+    if (segments[1] === "needs-you" && method === "GET" && segments.length === 2) {
+      const approvals = (await listApprovals({ status: "pending" })).map((a) => ({ id: a.id, agentId: a.agentId, toolName: a.toolName, requestedAt: a.requestedAt, summary: JSON.stringify(a.args).slice(0, 140) }));
+      const todos = await openAgentTodos();
+      const flowTitles = new Map<string, string>();
+      for (const t of todos) {
+        if (t.flowId && !flowTitles.has(t.flowId)) flowTitles.set(t.flowId, (await getFlow(t.flowId))?.title ?? (await getFlowDefinition(t.flowId))?.title ?? t.flowId.slice(0, 8));
+      }
+      sendJson(res, 200, {
+        total: approvals.length + todos.length,
+        approvals,
+        todos: todos.map((t) => ({ ...t, ...(t.flowId ? { flowTitle: flowTitles.get(t.flowId) } : {}) })),
+      });
+      return;
+    }
     if (segments[1] === "overlay") {
       if (method === "GET" && segments.length === 2) {
-        sendJson(res, 200, await loadOverlay());
+        // What agents added, plus the songs the operator uploaded (library.ts): the Beat
+        // DB already merges `library` from here.
+        const overlay = await loadOverlay();
+        sendJson(res, 200, { ...overlay, library: [...(Array.isArray(overlay.library) ? overlay.library : []), ...(await listSongAssets())] });
+        return;
+      }
+      // The operator completes (optionally with an answer) or reopens an agent's todo.
+      if (method === "POST" && segments.length === 5 && segments[2] === "tasks" && (segments[4] === "complete" || segments[4] === "reopen")) {
+        const id = decodeURIComponent(segments[3]!);
+        if (segments[4] === "reopen") {
+          const ok = await reopenOverlayTodo(id);
+          sendJson(res, ok ? 200 : 404, ok ? { ok: true } : { error: `no todo ${id}` });
+          return;
+        }
+        const body = await readRequestBody(req);
+        const done = await completeOverlayTodo(id, { answer: typeof body.answer === "string" ? body.answer : undefined });
+        sendJson(res, done.ok ? 200 : 404, done.ok ? done.todo : { error: done.error });
         return;
       }
       if (method === "DELETE" && segments.length === 4) {
@@ -1108,6 +1283,12 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
   }
 
   // ---- Flows ----
+  // ---- Ops: the machine, the services, devices, problems and logs, all real (ops.ts) ----
+  if (segments[0] === "ops" && method === "GET" && segments.length === 1) {
+    sendJson(res, 200, await buildOps());
+    return;
+  }
+
   if (segments[0] === "flows") {
     if (method === "GET" && segments.length === 1) {
       sendJson(res, 200, { flows: await listFlows() });
@@ -1119,7 +1300,33 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         sendJson(res, 404, { error: `no such flow: ${segments[1]}` });
         return;
       }
-      sendJson(res, 200, flow);
+      // With what it was made of, when known, so the flow panel can label every step.
+      sendJson(res, 200, { ...flow, definition: (await getFlowDefinition(flow.id)) ?? null });
+      return;
+    }
+    // Everything about one flow in one answer: per step the goal, agent, attempts, result, tool calls, what it added to
+    // BaseSpace and its tokens (flow-report.ts).
+    if (method === "GET" && segments.length === 3 && segments[2] === "report") {
+      const report = await buildFlowReport(segments[1]!);
+      if (!report) {
+        sendJson(res, 404, { error: `no such flow: ${segments[1]}` });
+        return;
+      }
+      sendJson(res, 200, { ...report, briefing: (await getFlowBriefing(report.flowId)) ?? null });
+      return;
+    }
+    // Write (or rewrite) the briefing: what to decide, what was done, what was found. One model call by the flow's lead.
+    if (method === "POST" && segments.length === 3 && segments[2] === "briefing") {
+      if (!(await getFlow(segments[1]!))) {
+        sendJson(res, 404, { error: `no such flow: ${segments[1]}` });
+        return;
+      }
+      try {
+        const b = await generateFlowBriefing(segments[1]!, deps.model);
+        sendJson(res, b ? 200 : 500, b ?? { error: "the briefing came back empty" });
+      } catch (err) {
+        sendJson(res, 502, { error: err instanceof Error ? err.message : String(err) });
+      }
       return;
     }
     if (method === "POST" && segments.length === 1) {
@@ -1134,10 +1341,13 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         sendJson(res, 400, { error: 'focus must be {kind: "goal" | "project", id}' });
         return;
       }
+      const title = typeof body.title === "string" ? body.title.trim().slice(0, 60) : "";
       const flow = await createFlow(
         "managed",
         steps.map((s) => ({ id: s.id, dependsOn: s.dependsOn ?? [] })),
+        title || undefined,
       );
+      await storeFlowDefinition({ flowId: flow.id, ...(title ? { title } : {}), proposedBy: "operator", summary: title, steps });
       // What the flow serves: every step's session is focused on it.
       if (focus) await setFlowFocus(flow.id, focus);
       // Fire-and-forget: a Flow can run many real model turns across many
@@ -1151,7 +1361,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         model: deps.model,
         worker: deps.worker,
         skills: deps.skills,
-        maxToolHopsPerStep: deps.maxToolHops,
+        maxToolHopsPerStep: flowStepHops(),
         enableSubagents: deps.enableSubagents,
         enableMemoryNominations: deps.enableMemoryNominations,
         enableArtifacts: deps.enableArtifacts,
@@ -1175,11 +1385,13 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         sendJson(res, 400, { error: "steps (the SAME FlowStepDefinition[] originally used to create this flow) is required to resume it" });
         return;
       }
+      // The operator pressed Resume: a stopped flow (failed, or cancelled) runs its unfinished steps again.
+      await reopenFlow(flow.id, { includeCancelled: true });
       resumeFlow(flow.id, steps, {
         model: deps.model,
         worker: deps.worker,
         skills: deps.skills,
-        maxToolHopsPerStep: deps.maxToolHops,
+        maxToolHopsPerStep: flowStepHops(),
         enableSubagents: deps.enableSubagents,
         enableMemoryNominations: deps.enableMemoryNominations,
         enableArtifacts: deps.enableArtifacts,
@@ -1189,6 +1401,85 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         console.error(`[gateway] flow ${flow.id} resume failed:`, err instanceof Error ? err.message : err);
       });
       sendJson(res, 202, flow);
+      return;
+    }
+    // The operator accepts a stopped step as done and the flow carries on from there.
+    // ...one step per call, or several at once: POST /flows/:id/steps/done {steps, stepIds: [...]}. Several at once matters:
+    // reopening a flow re-queues every unfinished step, so accepting them one by one would re-run the others.
+    if (method === "POST" && segments.length === 4 && segments[2] === "steps" && segments[3] === "done") {
+      const flow = await getFlow(segments[1]!);
+      if (!flow) {
+        sendJson(res, 404, { error: `no such flow: ${segments[1]}` });
+        return;
+      }
+      const body = await readRequestBody(req);
+      const steps = parseFlowSteps(body.steps);
+      const stepIds = Array.isArray(body.stepIds) ? body.stepIds.filter((x): x is string => typeof x === "string") : [];
+      if (!steps || !stepIds.length) {
+        sendJson(res, 400, { error: "steps (the flow's step definitions) and stepIds are required" });
+        return;
+      }
+      try {
+        // Validates first (markStepDone throws before changing anything), then drives in the background.
+        const check = (flowNow: typeof flow) => {
+          for (const id of stepIds) {
+            const st = flowNow.steps.find((s) => s.id === id);
+            if (!st) throw new Error(`no step "${id}" in flow ${flow.id}`);
+            if (st.status === "succeeded") throw new Error(`step "${id}" already succeeded`);
+            if (st.status === "running") throw new Error(`step "${id}" is still running`);
+          }
+        };
+        check(flow);
+        markStepDone(flow.id, stepIds, steps, {
+          model: deps.model,
+          worker: deps.worker,
+          skills: deps.skills,
+          maxToolHopsPerStep: flowStepHops(),
+          enableSubagents: deps.enableSubagents,
+          enableMemoryNominations: deps.enableMemoryNominations,
+          enableArtifacts: deps.enableArtifacts,
+          enableBaseSpace: deps.enableBaseSpace,
+          sandboxPolicy: deps.sandboxPolicy,
+        }).catch((err) => console.error(`[gateway] flow ${flow.id} mark-done failed:`, err instanceof Error ? err.message : err));
+        sendJson(res, 202, flow);
+      } catch (err) {
+        sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+    if (method === "POST" && segments.length === 5 && segments[2] === "steps" && segments[4] === "done") {
+      const flow = await getFlow(segments[1]!);
+      if (!flow) {
+        sendJson(res, 404, { error: `no such flow: ${segments[1]}` });
+        return;
+      }
+      const body = await readRequestBody(req);
+      const steps = parseFlowSteps(body.steps);
+      if (!steps) {
+        sendJson(res, 400, { error: "steps (the flow's step definitions) are required" });
+        return;
+      }
+      try {
+        const stepId = decodeURIComponent(segments[3]!);
+        const current = flow.steps.find((s) => s.id === stepId);
+        if (!current) throw new Error(`no step "${stepId}" in flow ${flow.id}`);
+        if (current.status === "succeeded") throw new Error(`step "${stepId}" already succeeded`);
+        if (current.status === "running") throw new Error(`step "${stepId}" is still running`);
+        markStepDone(flow.id, stepId, steps, {
+          model: deps.model,
+          worker: deps.worker,
+          skills: deps.skills,
+          maxToolHopsPerStep: flowStepHops(),
+          enableSubagents: deps.enableSubagents,
+          enableMemoryNominations: deps.enableMemoryNominations,
+          enableArtifacts: deps.enableArtifacts,
+          enableBaseSpace: deps.enableBaseSpace,
+          sandboxPolicy: deps.sandboxPolicy,
+        }).catch((err) => console.error(`[gateway] flow ${flow.id} mark-done failed:`, err instanceof Error ? err.message : err));
+        sendJson(res, 202, flow);
+      } catch (err) {
+        sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
+      }
       return;
     }
     if (method === "POST" && segments.length === 3 && segments[2] === "cancel") {
@@ -1236,6 +1527,8 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         if (segments[2] === "approve" && (body.always === "tool" || body.always === "exact")) {
           const pending = await getApproval(segments[1]!);
           if (!pending) throw new Error(`no such approval request: ${segments[1]}`);
+          // Checked before the rule is added: an already rejected (or approved) request must not leave a standing rule behind.
+          if (pending.status !== "pending") throw new Error(`approval request ${pending.id} is already resolved ("${pending.status}") and cannot be resolved again`);
           await addAllowRule({
             agentId: pending.agentId,
             toolName: pending.toolName,

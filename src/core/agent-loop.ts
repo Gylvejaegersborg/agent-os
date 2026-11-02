@@ -9,24 +9,28 @@ import { AgentBlockedError, assertAgentMayRun, getAgentControlState, recordAgent
 import { GATED_TOOLS, adoptPlan, checkProposal, gateToolCall, hireAgent } from "./governance.js";
 import { watchWork } from "./watchdog.js";
 import { hindsightConfigured, hindsightRecall, hindsightReflect, hindsightRetain } from "./hindsight.js";
+import { dispatchConnector, usableConnectors } from "./connector-tool.js";
 import { addOverlayItem, focusContext, readSnapshotSection, type OverlayKind } from "./basespace.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { appendEvent, project } from "./eventlog.js";
 import { publishEvent } from "./eventbus.js";
-import type { ModelAdapter, ModelMessage, ToolSpec } from "./model.js";
+import { MAX_CALLS_PER_REPLY, type ModelAdapter, type ModelMessage, type ToolSpec } from "./model.js";
 import type { Worker } from "./worker.js";
 import { fireHook } from "./hooks.js";
 import { generateId } from "./id.js";
 import { SkillRegistry, renderSkillCatalog } from "./skills.js";
 import { retrieveMemoryContext } from "./memory.js";
 import { getAgentIdentity, listAgentIdentities } from "./identity.js";
-import { ensureSession, isSessionCancelled, getSession } from "./session.js";
+import { beginTurnAbort, endTurnAbort, ensureSession, isSessionCancelled, getSession } from "./session.js";
 import { getToolDefinition, listToolDefinitions, toToolSpec, toolVisibleTo, withTimeout } from "./tool-registry.js";
 import type { ArtifactType } from "./artifacts.js";
 import type { EpisodicKind } from "./types.js";
 import { checkPathSandbox, type SandboxPolicy } from "./permissions.js";
 import { recordFileRevision } from "./file-revisions.js";
+import { dispatchAudio, dispatchLibrary, dispatchSoundlab } from "./library-tools.js";
+import { renderDesktopReport } from "./desktop.js";
+import { adoptFlow } from "./flow-proposals.js";
 
 export interface AgentTurnResult {
   sessionId: string;
@@ -40,7 +44,7 @@ export interface AgentTurnResult {
    *  makes several) — omitted entirely when the model adapter never
    *  reported usage at all (the stub model, or a provider response that
    *  didn't carry it), never a fabricated {0,0}. */
-  usage?: { inputTokens: number; outputTokens: number };
+  usage?: { inputTokens: number; outputTokens: number; cachedInputTokens?: number };
   /** How the turn ended: a real answer, a tool call the harness refused
    *  (plan mode, policy, an approval still pending), out of tool steps, or
    *  cancelled. Lets callers like the work runner tell "finished" from
@@ -55,6 +59,9 @@ export interface RunTurnOptions {
   model: ModelAdapter;
   worker: Worker;
   maxToolHops?: number;
+  /** Overrides the per-run cap on tool executions (maxToolExecutionsPerRun) for this turn: a flow step that has a whole
+   *  list to write needs more than a chat reply does. */
+  maxToolExecutions?: number;
   /** Layer-1 progressive disclosure: when provided, every skill's
    *  name+description is injected as a system message each turn (not
    *  stored in the session log — the catalog is external state re-read
@@ -138,7 +145,62 @@ export interface RunTurnOptions {
  *  (a nomination has zero effect until a human approves it; recording
  *  an artifact just registers metadata about something already
  *  produced some other way). */
-const PLAN_MODE_BLOCKED_TOOLS = new Set(["shell", "edit_file", "write_file", "subagent"]);
+export const PLAN_MODE_BLOCKED_TOOLS = new Set(["shell", "edit_file", "write_file", "subagent"]);
+
+/** `library` add/update and `audio` edit write something; their list/read/info don't, so plan mode allows those. */
+/** Settles when `promise` does, or rejects the moment `signal` aborts (whichever comes first). The
+ *  original promise is left to finish or fail on its own; its late result is ignored. */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    promise.catch(() => {});
+    return Promise.reject(signal.reason ?? new Error("aborted"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? new Error("aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (v) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(v);
+      },
+      (e) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(e);
+      },
+    );
+  });
+}
+
+/** A hard cap on tool EXECUTIONS in one run (one turn), however they are batched: several calls per reply could otherwise
+ *  multiply the work a turn does. When it is reached the turn ends and says so. AGENT_OS_MAX_TOOL_EXECUTIONS overrides it. */
+export function maxToolExecutionsPerRun(): number {
+  const n = Number(process.env.AGENT_OS_MAX_TOOL_EXECUTIONS ?? 8);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 8;
+}
+
+/** Model replies one flow step may take (AGENT_OS_FLOW_STEP_HOPS, default 25), wherever the flow came from. */
+export function flowStepHops(): number {
+  const n = Number(process.env.AGENT_OS_FLOW_STEP_HOPS ?? 25);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 25;
+}
+
+/** The cap for one flow step (AGENT_OS_FLOW_STEP_EXECUTIONS, default 25). A step is a whole job, so it gets more room than
+ *  a chat turn; it still ends, and says so, when it reaches it. */
+export function flowStepExecutions(): number {
+  const n = Number(process.env.AGENT_OS_FLOW_STEP_EXECUTIONS ?? 25);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 25;
+}
+
+/** The calls in a model reply, in order: `toolCalls` when the adapter parsed several, else the single `toolCall`. */
+function toolCallsOf(response: { toolCall?: { name: string; args: Record<string, unknown> }; toolCalls?: { name: string; args: Record<string, unknown> }[] }): { name: string; args: Record<string, unknown> }[] {
+  const list = response.toolCalls?.length ? response.toolCalls : response.toolCall ? [response.toolCall] : [];
+  return list.slice(0, MAX_CALLS_PER_REPLY);
+}
+
+export function changesLibraryOrAudio(call: { name: string; args: Record<string, unknown> }): boolean {
+  const action = String(call.args.action ?? "");
+  return (call.name === "library" && (action === "add" || action === "update")) || (call.name === "audio" && action === "edit");
+}
 
 function sessionStream(sessionId: string): string {
   return `session:${sessionId}`;
@@ -282,6 +344,8 @@ async function maybeCompactSession(sessionId: string, model: ModelAdapter): Prom
 export interface SessionUsage {
   inputTokens: number;
   outputTokens: number;
+  /** Part of inputTokens that came from the provider's prompt cache (only when the provider says). */
+  cachedInputTokens?: number;
   /** How many of this session's turns actually reported usage — lets a
    *  caller distinguish "zero tokens used" (impossible in practice) from
    *  "no turn in this session ever reported usage" (the honest default
@@ -296,8 +360,9 @@ export interface SessionUsage {
 export async function getSessionUsage(sessionId: string): Promise<SessionUsage> {
   return project<SessionUsage>(sessionStream(sessionId), { inputTokens: 0, outputTokens: 0, turnsWithUsage: 0 }, (state, event) => {
     if (event.type === "agent.turn.end") {
-      const usage = (event.payload as any).usage as { inputTokens: number; outputTokens: number } | undefined;
+      const usage = (event.payload as any).usage as { inputTokens: number; outputTokens: number; cachedInputTokens?: number } | undefined;
       if (usage) {
+        if (usage.cachedInputTokens) state.cachedInputTokens = (state.cachedInputTokens ?? 0) + usage.cachedInputTokens;
         state.inputTokens += usage.inputTokens;
         state.outputTokens += usage.outputTokens;
         state.turnsWithUsage += 1;
@@ -460,6 +525,8 @@ async function dispatchTool(
     sandboxPolicy?: SandboxPolicy;
     /** Set only by executeApprovedCall — the operator approved this call. */
     approved?: boolean;
+    /** Aborted when the session is cancelled; the shell worker stops its command. */
+    signal?: AbortSignal;
   },
 ): Promise<ToolDispatchResult> {
   if (GATED_TOOLS.has(toolCall.name) && !ctx.approved) {
@@ -467,9 +534,20 @@ async function dispatchTool(
     return { ok: false, output: "", error: problem ? `not filed — fix this and propose again: ${problem}` : `"${toolCall.name}" only runs once the operator approves it` };
   }
   if (toolCall.name === "propose-agent") return hireAgent(toolCall.args, ctx.agentId);
+  if (toolCall.name === "propose-flow") {
+    return adoptFlow(toolCall.args, ctx.agentId, ctx.sessionId, (await getSession(ctx.sessionId))?.focus, {
+      model: ctx.model,
+      worker: ctx.worker,
+      skills: ctx.skills,
+      enableSubagents: ctx.enableSubagents,
+      enableMemoryNominations: ctx.enableMemoryNominations,
+      enableArtifacts: ctx.enableArtifacts,
+      sandboxPolicy: ctx.sandboxPolicy,
+    });
+  }
   if (toolCall.name === "propose-plan") return adoptPlan(toolCall.args, ctx.agentId, ctx.sessionId, (await getSession(ctx.sessionId))?.focus);
   if (toolCall.name === "shell") {
-    return ctx.worker.run(String(toolCall.args.command));
+    return ctx.worker.run(String(toolCall.args.command), { signal: ctx.signal });
   }
   if (toolCall.name === "read_file" || toolCall.name === "edit_file" || toolCall.name === "write_file") {
     return dispatchFileTool(toolCall.name, toolCall.args, ctx.sandboxPolicy);
@@ -622,10 +700,16 @@ async function dispatchTool(
     const id = typeof toolCall.args.id === "string" ? toolCall.args.id : undefined;
     return readSnapshotSection(section, { query, id });
   }
+  if (toolCall.name === "desktop") return { ok: true, output: await renderDesktopReport(typeof toolCall.args.day === "string" ? toolCall.args.day : undefined) };
+  if (toolCall.name === "library") return dispatchLibrary(toolCall.args, ctx.agentId, ctx.sandboxPolicy);
+  if (toolCall.name === "soundlab") return dispatchSoundlab(toolCall.args);
+  if (toolCall.name === "connector") return dispatchConnector(toolCall.args, ctx.signal);
+  if (toolCall.name === "audio") return dispatchAudio(toolCall.args, ctx.sandboxPolicy);
   if (toolCall.name === "basespace-add") {
     const kind = String(toolCall.args.kind ?? "") as OverlayKind;
     // Linked back to whatever this session's work serves (its focus).
-    return addOverlayItem(kind, toolCall.args, ctx.agentId, (await getSession(ctx.sessionId))?.focus);
+    const session = await getSession(ctx.sessionId);
+    return addOverlayItem(kind, toolCall.args, ctx.agentId, session?.focus, session?.flowId);
   }
   return { ok: false, output: "", error: `unknown tool: ${toolCall.name}` };
 }
@@ -636,6 +720,21 @@ const FILE_TOOLS = new Set(["read_file", "edit_file", "write_file"]);
  *  full model call on "Done!". */
 const SETTLING_WORK_ACTIONS = new Set(["done", "blocked", "hand-back"]);
 
+/** User messages the harness itself wrote: the work runner's briefs, a lead's
+ *  review digest, an approval decision, a team cron's standup prompt. What
+ *  comes out of them already lives somewhere durable (work items, BaseSpace
+ *  notes, approvals), and filing them as long-term memory records the
+ *  harness's own bookkeeping as things "the user" said ("User assigned a work
+ *  item…", seen live in Hindsight). */
+const HARNESS_MESSAGE = /^\s*(\[(Work|Review|Approvals|Flow)\]|It's time for ")/;
+
+/** Is this finished turn worth sending to Hindsight (each one costs an LLM
+ *  extraction)? Only a real answer to something the operator wrote — not a
+ *  blocked, out-of-steps or cancelled turn, and not the harness talking. */
+function worthRetaining(userMessage: string, stopReason: AgentTurnResult["stopReason"]): boolean {
+  return stopReason === "answered" && !HARNESS_MESSAGE.test(userMessage);
+}
+
 /** The tools this agent can actually use this turn: the ones the turn has
  *  switched on, minus the ones the gateway hides from this agent
  *  (tool-registry.ts's setToolVisibility). Everything offered is described
@@ -644,22 +743,33 @@ const SETTLING_WORK_ACTIONS = new Set(["done", "blocked", "hand-back"]);
  *  hooks still refuse a hidden tool if it's called anyway. */
 function offeredTools(
   agentId: string,
-  on: { skills?: SkillRegistry; enableSubagents?: boolean; enableMemoryNominations?: boolean; enableArtifacts?: boolean; enableBaseSpace?: boolean; isLead?: boolean },
+  on: { skills?: SkillRegistry; enableSubagents?: boolean; enableMemoryNominations?: boolean; enableArtifacts?: boolean; enableBaseSpace?: boolean; isLead?: boolean; recallFoundNothing?: boolean },
 ): ToolSpec[] {
   const enabled: Record<string, boolean | undefined> = {
     skill: !!on.skills && on.skills.listMetadata().length > 0,
     subagent: on.enableSubagents,
     "nominate-memory": on.enableMemoryNominations,
     "record-artifact": on.enableArtifacts,
-    "recall-memory": hindsightConfigured(),
+    // What memory has on this message is already injected into the turn's
+    // system prompt, so the tool would just repeat that search — and a small
+    // local model handed it loops on it (seen live: 4 identical calls, then
+    // out of steps, with the answer in every result). It's the fallback for
+    // when that automatic recall found nothing: a chance to search differently.
+    "recall-memory": hindsightConfigured() && on.recallFoundNothing,
     basespace: on.enableBaseSpace,
     "basespace-add": on.enableBaseSpace,
+    library: on.enableBaseSpace,
+    soundlab: on.enableBaseSpace,
+    // Only when there is a connector an agent could actually use (enabled and connected).
+    connector: on.enableBaseSpace && usableConnectors().length > 0,
+    desktop: on.enableBaseSpace,
     delegate: on.enableBaseSpace,
     work: on.enableBaseSpace,
     // Growing the team and planning a goal are a lead's job (and always
     // go to the operator first — governance.ts).
     "propose-agent": on.enableBaseSpace && on.isLead,
     "propose-plan": on.enableBaseSpace && on.isLead,
+    "propose-flow": on.enableBaseSpace && on.isLead,
   };
   return listToolDefinitions()
     .filter((d) => !(d.name in enabled) || !!enabled[d.name])
@@ -706,6 +816,11 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   let hops = 0;
   let finalContent = "";
   let cancelled = false;
+  // Tool executions so far in this run (a call that was skipped, blocked or refused doesn't count).
+  let toolExecutions = 0;
+  const executionCap = opts.maxToolExecutions && opts.maxToolExecutions > 0 ? Math.floor(opts.maxToolExecutions) : maxToolExecutionsPerRun();
+  // Fired by cancelSession(): stops the in-flight model request and shell command now.
+  const turnAbort = beginTurnAbort(sessionId);
   // Summed across every hop in this turn — a tool-calling turn makes
   // several model calls, and the cost/usage that matters is the whole
   // turn's total, not just the last hop's. Only ever reflects what the
@@ -716,6 +831,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   let stopReason: AgentTurnResult["stopReason"] = "answered";
   let usageInputTokens = 0;
   let usageOutputTokens = 0;
+  let usageCachedTokens = 0;
   let sawUsage = false;
 
   // Fetched once per turn, outside the hop loop — see renderIdentityContext's
@@ -734,7 +850,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // operator's team (the same flag that turns on BaseSpace).
   const orgText = enableBaseSpace ? await orgContext(agentId) : "";
   const isLead = enableBaseSpace ? (await listAgentIdentities()).some((a) => a.reportsTo === agentId) : false;
-  const tools = offeredTools(agentId, { skills, enableSubagents, enableMemoryNominations, enableArtifacts, enableBaseSpace, isLead }).filter(
+  const tools = offeredTools(agentId, { skills, enableSubagents, enableMemoryNominations, enableArtifacts, enableBaseSpace, isLead, recallFoundNothing: recalled.length === 0 }).filter(
     (t) => !opts.onlyTools || opts.onlyTools.includes(t.name),
   );
   const offered = new Set(tools.map((t) => t.name));
@@ -758,7 +874,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
   // response, any test asserting rejection) is unchanged; this only adds
   // a durable trail alongside it.
   try {
-  while (hops < maxHops) {
+  turnLoop: while (hops < maxHops) {
     // Checked at the top of every hop (and again right after tool
     // dispatch below) rather than once before the loop — cancelSession()
     // (session.ts) can be called from a completely different process at
@@ -790,7 +906,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       : "The operator runs a dashboard called BaseSpace (notes, projects, todos, calendar, cron jobs, teams). Read it with the `basespace` tool " +
       "(start with section \"summary\") before answering questions about their work, and use `basespace-add` to leave a note, a todo or a " +
       "project update there — that's how your work shows up for them. Only add things they'd want to see." +
-      (hindsightConfigured() ? " Use `recall-memory` to look up what you've learned in earlier conversations." : "");
+      (offered.has("recall-memory") ? " Nothing relevant was recalled automatically; use `recall-memory` to search what you've learned in earlier conversations." : "");
     const fileToolsText = ![...FILE_TOOLS].some((t) => offered.has(t))
       ? ""
       : "Prefer `read_file`/`edit_file`/`write_file` over shell redirection or `sed` for reading or changing a file's content — " +
@@ -807,7 +923,9 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     // personaText first — "who you are" precedes "what you remember/can do"
     // in the assembled system message, matching how a human-written system
     // prompt would order identity before capability context.
-    const systemParts = [personaText, focusText, orgText, memoryText, catalogText, subagentText, nominationText, artifactText, baseSpaceText, fileToolsText, planModeText].filter(
+    // Stable parts first, the ones that change from turn to turn (focus, recalled memory) last: the provider caches a prompt by its
+    // prefix, so this keeps the long unchanging part reusable.
+    const systemParts = [personaText, orgText, catalogText, subagentText, nominationText, artifactText, baseSpaceText, fileToolsText, planModeText, focusText, memoryText].filter(
       Boolean,
     );
     const messages: ModelMessage[] = systemParts.length
@@ -822,156 +940,211 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     // — they're ephemeral live-progress signal; the one final assembled
     // "session.message" event below remains the durable record, same as
     // always, so the event log doesn't balloon with one entry per token.
-    const response = model.completeStream
-      ? await model.completeStream(
-          messages,
-          (delta) => {
-            publishEvent("agent.turn.delta", { sessionId, agentId, delta }).catch((err) => {
-              console.error("[agent-loop] failed to publish turn delta:", err instanceof Error ? err.message : err);
-            });
-          },
-          { tools },
-        )
-      : await model.complete(messages, { tools });
+    // Cancelling aborts this call for real (adapters cancel their fetch / child process via
+    // `signal`), and raceAbort() makes sure the turn stops waiting even for an adapter that ignores it.
+    let response: Awaited<ReturnType<ModelAdapter["complete"]>>;
+    try {
+      response = await raceAbort(
+        model.completeStream
+          ? model.completeStream(
+              messages,
+              (delta) => {
+                publishEvent("agent.turn.delta", { sessionId, agentId, delta }).catch((err) => {
+                  console.error("[agent-loop] failed to publish turn delta:", err instanceof Error ? err.message : err);
+                });
+              },
+              { tools, signal: turnAbort.signal },
+            )
+          : model.complete(messages, { tools, signal: turnAbort.signal }),
+        turnAbort.signal,
+      );
+    } catch (err) {
+      if (turnAbort.signal.aborted) {
+        cancelled = true;
+        break;
+      }
+      throw err;
+    }
 
     if (response.usage) {
       sawUsage = true;
       usageInputTokens += response.usage.inputTokens;
       usageOutputTokens += response.usage.outputTokens;
+      usageCachedTokens += response.usage.cachedInputTokens ?? 0;
     }
 
-    if (response.toolCall) {
-      toolCalled = response.toolCall.name;
+    const calls = toolCallsOf(response);
+    if (calls.length) {
+      // Several calls in one reply (the model asked for independent things at once) run strictly in order. Each goes through
+      // exactly the same checks as a lone call; anything that stops one (a failure, an approval, a plan-mode block, a
+      // cancel) stops the ones after it, which are recorded as skipped so the model knows they didn't run.
+      let skipReason: string | undefined;
+      for (let ci = 0; ci < calls.length; ci++) {
+        const call = calls[ci]!;
+        toolCalled = call.name;
+        const callLabel = `${call.name} ${JSON.stringify(call.args ?? {})}`.slice(0, 300);
+        if (skipReason) {
+          await appendEvent(sessionStream(sessionId), "session.message", { role: "tool", content: `skipped: ${skipReason}`, call: callLabel });
+          continue;
+        }
+        if (toolExecutions >= executionCap) {
+          // The run's budget is spent: this call and the rest of the reply are not run, and the turn ends saying so.
+          for (const rest of calls.slice(ci)) {
+            await appendEvent(sessionStream(sessionId), "session.message", { role: "tool", content: `skipped: this run reached its limit of ${executionCap} tool executions`, call: `${rest.name} ${JSON.stringify(rest.args ?? {})}`.slice(0, 300) });
+          }
+          stopReason = "max-hops";
+          finalContent = `I reached this run's limit of ${executionCap} tool executions before finishing. What I did so far is in the results above; say "continue" and I'll pick up from there.`;
+          await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent });
+          break turnLoop;
+        }
 
-      // Plan mode is a HARD harness-level override, not a prompt
-      // suggestion — checked before Layer A's own PermissionPolicy, and
-      // not overridable by it (an "allow" rule for e.g. read_file still
-      // has no bearing here). This is what ROADMAP.md's "plan / read-only
-      // mode" item actually asked for: a mode the model is IN, not one
-      // it's merely told about. subagent is blocked too — a delegated
-      // subagent can itself mutate files, so plan mode has to cover it
-      // too to mean anything.
-      if (planMode && PLAN_MODE_BLOCKED_TOOLS.has(response.toolCall.name)) {
-        stopReason = "tool-blocked";
-        finalContent = `Tool call blocked: plan mode is active — "${response.toolCall.name}" would change something, and plan mode only allows read-only inspection. Describe what you'd do instead; the operator can turn plan mode off to actually execute it.`;
-        await appendEvent(sessionStream(sessionId), "session.message", {
-          role: "assistant",
-          content: finalContent,
-        });
-        break;
-      }
+        // Plan mode is a HARD harness-level override, not a prompt
+        // suggestion — checked before Layer A's own PermissionPolicy, and
+        // not overridable by it (an "allow" rule for e.g. read_file still
+        // has no bearing here). This is what ROADMAP.md's "plan / read-only
+        // mode" item actually asked for: a mode the model is IN, not one
+        // it's merely told about. subagent is blocked too — a delegated
+        // subagent can itself mutate files, so plan mode has to cover it
+        // too to mean anything.
+        if (planMode && (PLAN_MODE_BLOCKED_TOOLS.has(call.name) || changesLibraryOrAudio(call))) {
+          stopReason = "tool-blocked";
+          finalContent = `Tool call blocked: plan mode is active — "${call.name}" would change something, and plan mode only allows read-only inspection. Describe what you'd do instead; the operator can turn plan mode off to actually execute it.`;
+          await appendEvent(sessionStream(sessionId), "session.message", {
+            role: "assistant",
+            content: finalContent,
+          });
+          break turnLoop;
+        }
 
-      // Governance gates (governance.ts): hiring and goal plans never run
-      // from a turn — they're filed for the operator's approval, whatever
-      // any hook or allow rule would say.
-      // A proposal with something wrong with it isn't filed: it falls
-      // through to dispatch, which hands the problem back to the agent.
-      const gated = GATED_TOOLS.has(response.toolCall.name);
-      const proposalProblem = gated
-        ? await checkProposal(response.toolCall.name, response.toolCall.args ?? {}, agentId, (await getSession(sessionId))?.focus)
-        : undefined;
-      const blockDecision = gated
-        ? proposalProblem
-          ? { block: false as const }
-          : { block: true, reason: await gateToolCall({ agentId, sessionId, toolName: response.toolCall.name, args: response.toolCall.args ?? {} }) }
-        : await fireHook("tool.before", {
+        // Governance gates (governance.ts): hiring and goal plans never run
+        // from a turn — they're filed for the operator's approval, whatever
+        // any hook or allow rule would say.
+        // A proposal with something wrong with it isn't filed: it falls
+        // through to dispatch, which hands the problem back to the agent.
+        const gated = GATED_TOOLS.has(call.name);
+        const proposalProblem = gated ? await checkProposal(call.name, call.args ?? {}, agentId, (await getSession(sessionId))?.focus) : undefined;
+        const blockDecision = gated
+          ? proposalProblem
+            ? { block: false as const }
+            : { block: true, reason: await gateToolCall({ agentId, sessionId, toolName: call.name, args: call.args ?? {}, sessionFocus: (await getSession(sessionId))?.focus }) }
+          : await fireHook("tool.before", {
+              agentId,
+              sessionId,
+              payload: call,
+            });
+        if (blockDecision.block) {
+          stopReason = "tool-blocked";
+          finalContent = `Tool call blocked: ${blockDecision.reason ?? "no reason given"}`;
+          await appendEvent(sessionStream(sessionId), "session.message", {
+            role: "assistant",
+            content: finalContent,
+          });
+          break turnLoop;
+        }
+
+        // Text the model wrote alongside the tool call ("Let me check your
+        // todos…") is part of its answer — keep it, or it streams in live
+        // and then vanishes when the client re-reads the history.
+        if (ci === 0 && response.content?.trim()) {
+          await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: response.content });
+        }
+        await appendEvent(sessionStream(sessionId), "tool.call.start", call);
+        await publishEvent("tool.call.start", { sessionId, agentId, ...call });
+        // A registered ToolDefinition's timeoutMs (tool-registry.ts) is
+        // enforced HERE, at the one call site every tool call passes
+        // through — not inside dispatchTool()'s individual branches — so
+        // it applies uniformly regardless of which tool ran. Every
+        // built-in tool ships with no timeoutMs by default (see
+        // BUILTIN_TOOL_DEFINITIONS), so withTimeout() is a true no-op for
+        // existing behavior unless a caller explicitly registers one.
+        const toolDef = getToolDefinition(call.name);
+        const result = await withTimeout(
+          dispatchTool(call, {
+            worker,
+            skills,
             agentId,
             sessionId,
-            payload: response.toolCall,
-          });
-      if (blockDecision.block) {
-        stopReason = "tool-blocked";
-        finalContent = `Tool call blocked: ${blockDecision.reason ?? "no reason given"}`;
+            model,
+            signal: turnAbort.signal,
+            enableSubagents,
+            enableMemoryNominations,
+            enableArtifacts,
+            sandboxPolicy,
+          }),
+          toolDef?.timeoutMs,
+          () => ({
+            ok: false,
+            output: "",
+            error: `tool "${call.name}" timed out after ${toolDef?.timeoutMs}ms`,
+          }),
+        );
+        toolExecutions++;
+        await appendEvent(sessionStream(sessionId), "tool.call.end", { ...call, result });
+        await publishEvent("tool.call.end", { sessionId, agentId, ...call, result });
+        await fireHook("tool.after", { agentId, sessionId, payload: { ...call, result } });
+
+        // Record which call produced the result: the history keeps no other
+        // record of the model's own tool call, and a model reading back a
+        // bare result can't tell what it asked for (see getModelFacingHistory).
         await appendEvent(sessionStream(sessionId), "session.message", {
-          role: "assistant",
-          content: finalContent,
+          role: "tool",
+          content: result.ok ? result.output : `error: ${result.error}`,
+          call: callLabel,
         });
-        break;
+        // Settling a work item (done / blocked / hand-back) is the last thing
+        // the agent has to do — end here, with the result as the reply,
+        // rather than one more model call to say so.
+        if (call.name === "work" && result.ok && SETTLING_WORK_ACTIONS.has(String(call.args?.action ?? ""))) {
+          const text = typeof call.args?.text === "string" ? call.args.text.trim() : "";
+          finalContent = text || response.content?.trim() || result.output;
+          await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent });
+          break turnLoop;
+        }
+        // Re-checked immediately after the tool actually ran (not just at
+        // the top of the next hop) so a cancellation that arrives WHILE a
+        // tool call is in flight is honored before the next model call is
+        // made, rather than one full extra hop later.
+        if (await isSessionCancelled(sessionId)) {
+          cancelled = true;
+          break turnLoop;
+        }
+        if (!result.ok) skipReason = "an earlier call in this reply failed, so it wasn't run (look at that error first)";
       }
-
-      // Text the model wrote alongside the tool call ("Let me check your
-      // todos…") is part of its answer — keep it, or it streams in live
-      // and then vanishes when the client re-reads the history.
-      if (response.content?.trim()) {
-        await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: response.content });
+      // Anything beyond the cap wasn't run either: say so, so the model asks again instead of assuming.
+      const requested = (response.toolCalls?.length ?? 0);
+      if (requested > calls.length) {
+        await appendEvent(sessionStream(sessionId), "session.message", { role: "tool", content: `skipped: only the first ${MAX_CALLS_PER_REPLY} calls of a reply are run; ask for the rest in your next reply`, call: "(extra calls)" });
       }
-      await appendEvent(sessionStream(sessionId), "tool.call.start", response.toolCall);
-      await publishEvent("tool.call.start", { sessionId, agentId, ...response.toolCall });
-      // A registered ToolDefinition's timeoutMs (tool-registry.ts) is
-      // enforced HERE, at the one call site every tool call passes
-      // through — not inside dispatchTool()'s individual branches — so
-      // it applies uniformly regardless of which tool ran. Every
-      // built-in tool ships with no timeoutMs by default (see
-      // BUILTIN_TOOL_DEFINITIONS), so withTimeout() is a true no-op for
-      // existing behavior unless a caller explicitly registers one.
-      const toolDef = getToolDefinition(response.toolCall.name);
-      const result = await withTimeout(
-        dispatchTool(response.toolCall, {
-          worker,
-          skills,
-          agentId,
-          sessionId,
-          model,
-          enableSubagents,
-          enableMemoryNominations,
-          enableArtifacts,
-          sandboxPolicy,
-        }),
-        toolDef?.timeoutMs,
-        () => ({
-          ok: false,
-          output: "",
-          error: `tool "${response.toolCall!.name}" timed out after ${toolDef?.timeoutMs}ms`,
-        }),
-      );
-      await appendEvent(sessionStream(sessionId), "tool.call.end", { ...response.toolCall, result });
-      await publishEvent("tool.call.end", { sessionId, agentId, ...response.toolCall, result });
-      await fireHook("tool.after", { agentId, sessionId, payload: { ...response.toolCall, result } });
-
-      // Record which call produced the result: the history keeps no other
-      // record of the model's own tool call, and a model reading back a
-      // bare result can't tell what it asked for (see getModelFacingHistory).
-      const callLabel = `${response.toolCall.name} ${JSON.stringify(response.toolCall.args ?? {})}`.slice(0, 300);
-      await appendEvent(sessionStream(sessionId), "session.message", {
-        role: "tool",
-        content: result.ok ? result.output : `error: ${result.error}`,
-        call: callLabel,
-      });
+      // One reply is one tool step, however many calls it carried.
       hops++;
-      // Settling a work item (done / blocked / hand-back) is the last thing
-      // the agent has to do — end here, with the result as the reply,
-      // rather than one more model call to say so.
-      if (response.toolCall.name === "work" && result.ok && SETTLING_WORK_ACTIONS.has(String(response.toolCall.args?.action ?? ""))) {
-        const text = typeof response.toolCall.args?.text === "string" ? response.toolCall.args.text.trim() : "";
-        finalContent = text || response.content?.trim() || result.output;
-        await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent });
-        break;
-      }
-      // Re-checked immediately after the tool actually ran (not just at
-      // the top of the next hop) so a cancellation that arrives WHILE a
-      // tool call is in flight is honored before the next model call is
-      // made, rather than one full extra hop later.
-      if (await isSessionCancelled(sessionId)) {
-        cancelled = true;
-        break;
-      }
       continue;
     }
 
-    finalContent = response.content;
+    // A small local model that just got a tool result back sometimes ends
+    // its turn with a genuinely empty completion — no further tool call,
+    // no text either (seen with qwen2.5:3b after a `basespace` call). Left
+    // as "" this reads as the reply silently vanishing, same failure shape
+    // the maxHops fallback below already guards against.
+    finalContent =
+      response.content ||
+      (toolCalled
+        ? `Got the ${toolCalled} result but didn't produce a reply — try asking again or rephrasing.`
+        : "No reply came back for that message — try again or rephrase.");
     await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent });
     break;
   }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     finalContent = `⚠ ${message}`;
-    const usage = sawUsage ? { inputTokens: usageInputTokens, outputTokens: usageOutputTokens } : undefined;
+    const usage = sawUsage ? { inputTokens: usageInputTokens, outputTokens: usageOutputTokens, ...(usageCachedTokens ? { cachedInputTokens: usageCachedTokens } : {}) } : undefined;
     if (usage) await recordAgentUsage(agentId, usage, sessionId);
     await appendEvent(sessionStream(sessionId), "session.message", { role: "assistant", content: finalContent, error: true });
     await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled, error: message, usage });
     await fireHook("agent.turn.end", { agentId, sessionId, payload: { finalContent, toolCalled, cancelled, error: message, usage } });
     await publishEvent("agent.turn.end", { sessionId, agentId, finalContent, toolCalled, cancelled, error: message, usage });
     throw err;
+  } finally {
+    endTurnAbort(sessionId, turnAbort);
   }
 
   // Used up every tool step without a final answer — say so instead of
@@ -994,7 +1167,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     });
   }
 
-  const usage = sawUsage ? { inputTokens: usageInputTokens, outputTokens: usageOutputTokens } : undefined;
+  const usage = sawUsage ? { inputTokens: usageInputTokens, outputTokens: usageOutputTokens, ...(usageCachedTokens ? { cachedInputTokens: usageCachedTokens } : {}) } : undefined;
   // Counts toward the agent's budget (controls.ts) — including a cancelled
   // turn's tokens, since those were spent too.
   if (usage) {
@@ -1004,9 +1177,9 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
     const working = await workForSession(sessionId, { anyStatus: true });
     if (working) await recordWorkUsage(working.id, usage.inputTokens + usage.outputTokens);
   }
-  if (!cancelled && finalContent) {
-    // Every completed exchange goes to Hindsight (when configured) so it can
-    // extract facts/experiences from it; no-op otherwise.
+  if (!cancelled && finalContent && worthRetaining(userMessage, stopReason)) {
+    // A real exchange goes to Hindsight (when configured) so it can extract
+    // facts/experiences from it; no-op otherwise.
     void hindsightRetain(agentId, `User: ${userMessage}\n\n${agentId}: ${finalContent}`, { context: "conversation turn", tags: ["turn"] });
   }
   await appendEvent(sessionStream(sessionId), "agent.turn.end", { agentId, finalContent, toolCalled, cancelled, usage });

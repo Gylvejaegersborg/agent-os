@@ -13,6 +13,8 @@ export interface ModelMessage {
 export interface ModelResponse {
   content: string;
   toolCall?: { name: string; args: Record<string, unknown> };
+  /** All the calls the reply carried, in order, when the adapter can parse several (`toolCall` is the first of them). The loop runs them one after another; an adapter that returns one call at a time just leaves this out. */
+  toolCalls?: { name: string; args: Record<string, unknown> }[];
   /** Token counts for this one call, when the provider reports them —
    *  ROADMAP.md's "cost/token usage tracking" item. Best-effort and
    *  provider-shaped (Anthropic/OpenAI/Ollama all report this slightly
@@ -22,7 +24,8 @@ export interface ModelResponse {
    *  per-model pricing changes and varies by provider/tier in ways this
    *  scaffold has no reliable source of truth for; inventing a cost
    *  figure would be worse than not showing one. */
-  usage?: { inputTokens: number; outputTokens: number };
+  /** inputTokens includes the cached part; cachedInputTokens is how much of it was read from the provider's prompt cache. */
+  usage?: { inputTokens: number; outputTokens: number; cachedInputTokens?: number };
 }
 
 /** A tool as the provider APIs take it: name, description, JSON Schema. */
@@ -38,8 +41,13 @@ export interface ToolSpec {
  *  agent-loop.ts's offeredTools), so a model isn't billed on every call for
  *  describing tools it would only be refused. Omitted → the adapter's own
  *  default (every registered tool). An empty list offers none. */
+/** How many tool calls one model reply may carry (the loop runs them in order; the prompt tells the model this number). */
+export const MAX_CALLS_PER_REPLY = 4;
+
 export interface ModelCallOptions {
   tools?: ToolSpec[];
+  /** Aborted when the session is cancelled: adapters stop the in-flight request (fetch, child process) instead of letting it finish. */
+  signal?: AbortSignal;
 }
 
 export interface ModelAdapter {

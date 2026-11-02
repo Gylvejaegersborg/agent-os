@@ -22,6 +22,8 @@ import {
   newSessionId,
   createStubModel,
   createStubWorker,
+  registerTool,
+  RECALL_MEMORY_TOOL,
 } from "./core/index.js";
 import { previousSlotMs, standupPrompt } from "./gateway/basespace-crons.js";
 
@@ -168,7 +170,7 @@ async function testHindsight(): Promise<void> {
       const body = raw ? JSON.parse(raw) : undefined;
       seen.push({ method: req.method!, url: req.url!, body, auth: req.headers.authorization });
       res.setHeader("content-type", "application/json");
-      if (req.url!.endsWith("/memories/recall")) res.end(JSON.stringify({ results: [{ id: "1", text: "ISΛRK prefers sparse lowercase copy." }] }));
+      if (req.url!.endsWith("/memories/recall")) res.end(JSON.stringify({ results: String(body?.query).includes("zzz-nothing-known") ? [] : [{ id: "1", text: "ISΛRK prefers sparse lowercase copy." }] }));
       else if (req.url!.endsWith("/reflect")) res.end(JSON.stringify({ text: "Keep captions short." }));
       else if (req.url!.endsWith("/memories")) res.end(JSON.stringify({ success: true }));
       else {
@@ -194,13 +196,40 @@ async function testHindsight(): Promise<void> {
   // Recall shows up in a real turn's system message.
   const recorded: { role: string; content: string }[][] = [];
   const stub = createStubModel();
-  const model = { ...stub, complete: async (m: { role: string; content: string }[]) => (recorded.push(m), stub.complete(m as never)) } as typeof stub;
+  const offeredTools: string[][] = [];
+  const model = { ...stub, complete: async (m: { role: string; content: string }[], o?: { tools?: { name: string }[] }) => (recorded.push(m), offeredTools.push((o?.tools ?? []).map((t) => t.name)), stub.complete(m as never)) } as typeof stub;
   delete (model as { completeStream?: unknown }).completeStream;
   await runTurn({ sessionId: newSessionId(), agentId: "nyx", userMessage: "write a caption", model, worker: createStubWorker() });
   const system = recorded[0]?.find((m) => m.role === "system")?.content ?? "";
   assert(system.includes("Recalled from long-term memory") && system.includes("sparse lowercase"), "recalled memories are injected into the turn's system message");
   await new Promise((r) => setTimeout(r, 50));
   assert(seen.some((s) => s.url.endsWith("/memories") && String(s.body.items[0].content).startsWith("User: write a caption")), "the finished exchange is retained");
+
+  // recall-memory duplicates the automatic recall already in the system prompt, so it is only
+  // offered when that recall found nothing (a small model handed it looped on it, live).
+  registerTool(RECALL_MEMORY_TOOL);
+  const callsBefore = offeredTools.length;
+  await runTurn({ sessionId: newSessionId(), agentId: "nyx", userMessage: "what do you remember about captions?", model, worker: createStubWorker() });
+  assert(offeredTools.slice(callsBefore).every((t) => !t.includes("recall-memory")), "recall-memory is not offered when automatic recall already found something");
+  const emptyFrom = offeredTools.length;
+  await runTurn({ sessionId: newSessionId(), agentId: "nyx", userMessage: "zzz-nothing-known about this", model, worker: createStubWorker(), enableBaseSpace: true });
+  assert(offeredTools.slice(emptyFrom).some((t) => t.includes("recall-memory")), "…and is offered when it found nothing");
+  assert(recorded.at(-1)?.find((m) => m.role === "system")?.content.includes("Nothing relevant was recalled automatically") === true, "…with a system-prompt line saying so");
+
+  // The harness talking to itself isn't memory: a [Work] brief, a [Review]
+  // digest, an [Approvals] note and a cron standup prompt finish as real
+  // answers but are not retained (each retain costs an LLM extraction, and
+  // the outcome already lives in work items / notes / approvals).
+  const retainsBefore = () => seen.filter((s) => s.url.endsWith("/memories")).length;
+  const before = retainsBefore();
+  for (const harness of ["[Work] Hemera handed you this (work item x): Draft captions", "[Review] Team review: 1 item needs you.", "[Approvals] Approved abc: shell {}. Go ahead", `It's time for "Morning standup" — you chair it.`]) {
+    await runTurn({ sessionId: newSessionId(), agentId: "nyx", userMessage: harness, model, worker: createStubWorker() });
+  }
+  await new Promise((r) => setTimeout(r, 80));
+  assert(retainsBefore() === before, "harness-written turns ([Work], [Review], [Approvals], cron standups) are not retained");
+  await runTurn({ sessionId: newSessionId(), agentId: "nyx", userMessage: "keep it lowercase please", model, worker: createStubWorker() });
+  await new Promise((r) => setTimeout(r, 80));
+  assert(retainsBefore() === before + 1, "an operator's own message still is");
 
   // A turn with a tool hop still recalls only once (the query doesn't
   // change between hops).

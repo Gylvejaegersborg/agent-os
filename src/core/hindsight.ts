@@ -24,7 +24,17 @@
 //   HINDSIGHT_RECALL_TOKENS optional recall budget in tokens (default 600)
 
 const warned = new Set<string>();
+/** A bank is created by an agent's first retain, so reading an agent that
+ *  hasn't remembered anything yet is a 404 — an empty memory, not a failure.
+ *  It must not count as one: the warning below fires once per kind, and a
+ *  harmless "new agent" 404 used it up and hid a real outage afterwards. */
+function isMissingBank(err: unknown): boolean {
+  // Only "Bank '…' not found": a 404 from a wrong URL ("Not Found") is a real
+  // misconfiguration and still warns.
+  return err instanceof Error && /^HTTP 404\b.*\bBank\b.*\bnot found\b/i.test(err.message);
+}
 function warnOnce(kind: string, err: unknown): void {
+  if (isMissingBank(err)) return;
   if (warned.has(kind)) return;
   warned.add(kind);
   console.warn(`[hindsight] ${kind} failed (further ${kind} errors are silenced): ${err instanceof Error ? err.message : String(err)}`);

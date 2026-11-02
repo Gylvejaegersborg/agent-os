@@ -32,7 +32,8 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import os from "node:os";
-import type { ModelAdapter, ModelCallOptions, ModelMessage, ModelResponse } from "../model.js";
+import { connectorGrantsFor } from "../connectors.js";
+import { MAX_CALLS_PER_REPLY, type ModelAdapter, type ModelCallOptions, type ModelMessage, type ModelResponse } from "../model.js";
 import { registryToolSpecs, type ToolSpec } from "./real.js";
 
 export interface ClaudeCliOptions {
@@ -45,6 +46,10 @@ export interface ClaudeCliOptions {
   command?: string;
   tools?: ToolSpec[];
   timeoutMs?: number;
+  /** Connector grants for this adapter's calls (default: connectors.ts's grants for the model). */
+  grants?: { allow: string[]; deny: string[] };
+  /** Leave the Agent-OS tool protocol out of the system prompt (a plain one-shot call). */
+  noToolProtocol?: boolean;
   /** Working directory for the child process. Defaults to the OS temp dir
    *  so the CLI doesn't pick up whatever project it happens to start in. */
   cwd?: string;
@@ -88,7 +93,7 @@ function renderArgs(parameters: Record<string, unknown>): string {
  *  JSON Schema per tool: this goes out in the system prompt of every call
  *  (the CLI gives no prompt caching here), so every character is paid for
  *  again on each tool step. */
-export function renderToolProtocol(tools: ToolSpec[]): string {
+export function renderToolProtocol(tools: ToolSpec[], withConnectors = true): string {
   if (!tools.length) return "";
   const list = tools
     .map((t) => {
@@ -98,10 +103,20 @@ export function renderToolProtocol(tools: ToolSpec[]): string {
     .join("\n");
   return [
     "# Tools",
+    // The exact names up front, and what kind of tool they are: without this a small model reads the list, then says a tool "isn't available".
+    `Agent-OS tools you can call right now (exact names): ${tools.map((t) => t.name).join(", ")}. They are NOT native tools and not MCP: you call them only by ending your reply with the block below.`,
     "Agent-OS runs tools for you (your built-in tools are off). To use one, end your reply with exactly one block:",
     `${TOOL_OPEN}{"name": "<tool>", "args": {...}}${TOOL_CLOSE}`,
-    "That format only (not <function_calls> or XML), one call per reply, nothing after it — never guess a result. " +
-      "The output comes back as a [tool result] message (some calls wait for the operator's approval). No tool needed → just answer.",
+    "That format only for the Agent-OS tools below (not <function_calls> or XML) — never guess a result. " +
+      `You may end a reply with up to ${MAX_CALLS_PER_REPLY} blocks in a row when the calls are independent (none needs another's result): they run in order, and each result comes back as its own [tool result]. ` +
+      "If a call needs the result of another, send it alone and wait. If one fails, the ones after it are skipped. Nothing after the last block. " +
+      "(Some calls wait for the operator's approval.) No tool needed → just answer.",
+    ...(withConnectors
+      ? [
+          "You may also be offered native connector tools (names starting mcp__, e.g. a search or docs tool). Those are extras: call them natively, as usual. " +
+            "They never replace the Agent-OS tools below: those are always available to you, and are used ONLY with the block above.",
+        ]
+      : []),
     "Tools (* = required argument):",
     list,
   ].join("\n");
@@ -226,6 +241,25 @@ export function parseToolCall(text: string): { content: string; toolCall?: Parse
   return call ? { content: text.slice(0, start).trim(), toolCall: call } : { content: text.trim() };
 }
 
+/** Splits a reply into its visible text and EVERY tool call it carries, in order (a model may send several independent
+ *  calls at once). A block that doesn't parse is skipped, not guessed at. `content` is the text before the first block. */
+export function parseToolCalls(text: string): { content: string; toolCalls: ParsedCall[] } {
+  const starts: number[] = [];
+  for (let from = 0; from < text.length; ) {
+    const at = firstOpener(text.slice(from));
+    if (at === -1) break;
+    starts.push(from + at);
+    from += at + 1;
+  }
+  if (!starts.length) return { content: text.trim(), toolCalls: [] };
+  const toolCalls: ParsedCall[] = [];
+  starts.forEach((start, i) => {
+    const call = parseBlock(text.slice(start, starts[i + 1] ?? text.length));
+    if (call) toolCalls.push(call);
+  });
+  return { content: toolCalls.length ? text.slice(0, starts[0]).trim() : text.trim(), toolCalls };
+}
+
 /** How much of `text` is safe to show live: everything before a tool-call
  *  block, minus any trailing characters that could be the start of one. */
 function visiblePrefixLength(text: string): number {
@@ -238,6 +272,26 @@ function visiblePrefixLength(text: string): number {
   return text.length;
 }
 
+/** How the CLI is launched. Its own built-in tools are off. The operator's MCP connectors stay loaded (they added them
+ *  on purpose), but a connector tool is refused in non-interactive mode unless granted, so the ones the operator
+ *  has enabled are granted here and the rest are withheld (connectors.ts). Agent-OS's own tools are described in
+ *  the system prompt and used with a block, never as native calls. */
+export function claudeCliArgs(systemPrompt: string, model?: string, grants: { allow: string[]; deny: string[] } = { allow: [], deny: [] }): string[] {
+  return [
+    "-p",
+    "--output-format", "stream-json",
+    "--verbose",
+    "--include-partial-messages",
+    "--tools", "",
+    "--no-session-persistence",
+    "--setting-sources", "",
+    ...(grants.allow.length ? ["--allowedTools", grants.allow.join(",")] : []),
+    ...(grants.deny.length ? ["--disallowedTools", grants.deny.join(",")] : []),
+    "--system-prompt", systemPrompt,
+    ...(model ? ["--model", model] : []),
+  ];
+}
+
 export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter {
   const command = opts.command ?? claudeCliCommand();
   const thinkSuffix = /\+think$/.test(opts.model ?? "");
@@ -247,19 +301,13 @@ export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter 
 
   async function run(messages: ModelMessage[], onDelta?: (delta: string) => void, callOpts?: ModelCallOptions): Promise<ModelResponse> {
     const system = messages.find((m) => m.role === "system")?.content ?? "";
-    const toolText = renderToolProtocol(callOpts?.tools ?? opts.tools ?? registryToolSpecs());
-    const systemPrompt = [system, toolText].filter(Boolean).join("\n\n") || "You are a helpful assistant.";
-    const args = [
-      "-p",
-      "--output-format", "stream-json",
-      "--verbose",
-      "--include-partial-messages",
-      "--tools", "",
-      "--no-session-persistence",
-      "--setting-sources", "",
-      "--system-prompt", systemPrompt,
-      ...(model ? ["--model", model] : []),
-    ];
+    const grants = opts.grants ?? connectorGrantsFor(model);
+    const toolText = opts.noToolProtocol ? "" : renderToolProtocol(callOpts?.tools ?? opts.tools ?? registryToolSpecs(), grants.allow.length > 0);
+    // The tool protocol goes FIRST: it is the biggest block and identical on every call an agent makes, so the provider's prompt
+    // cache can reuse the whole prefix (tools + persona + the other stable parts). What changes per turn (the conversation focus,
+    // recalled memory) is last in `system`, so it only breaks the cache at the very end.
+    const systemPrompt = [toolText, system].filter(Boolean).join("\n\n") || "You are a helpful assistant.";
+    const args = claudeCliArgs(systemPrompt, model, grants);
     // The CLI authenticates with its own login. ANTHROPIC_TOKEN is Agent-OS's
     // own variable for the direct-API path, not something the CLI reads —
     // dropped so it can't leak into the child's environment.
@@ -280,6 +328,13 @@ export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter 
         child.kill("SIGKILL");
         reject(new Error(`Claude CLI timed out after ${timeoutMs}ms`));
       }, timeoutMs);
+      const onAbort = () => {
+        clearTimeout(timer);
+        child.kill("SIGKILL");
+        reject(new Error("Claude CLI call cancelled"));
+      };
+      if (callOpts?.signal?.aborted) onAbort();
+      else callOpts?.signal?.addEventListener("abort", onAbort, { once: true });
 
       const handleLine = (line: string) => {
         if (!line.trim()) return;
@@ -306,6 +361,7 @@ export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter 
             usage = {
               inputTokens: (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0),
               outputTokens: u.output_tokens ?? 0,
+              ...(u.cache_read_input_tokens ? { cachedInputTokens: u.cache_read_input_tokens } : {}),
             };
           }
         }
@@ -332,8 +388,8 @@ export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter 
           const reason = stderr.trim().split("\n").find(Boolean) ?? `exit code ${code}`;
           return reject(new Error(`Claude CLI returned no result: ${reason}`));
         }
-        const parsed = parseToolCall(finalText);
-        resolve({ ...parsed, ...(usage ? { usage } : {}) });
+        const { content, toolCalls } = parseToolCalls(finalText);
+        resolve({ content, ...(toolCalls.length ? { toolCall: toolCalls[0], toolCalls } : {}), ...(usage ? { usage } : {}) });
       });
 
       child.stdin.on("error", () => {

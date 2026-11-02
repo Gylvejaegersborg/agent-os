@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy to privacy.json and edit. Nothing here ever leaves your machine; this decides what the sensor tells your own gateway.",
+  "skip_apps": ["KeePassXC.exe", "KeePass.exe", "1Password.exe", "Bitwarden.exe"],
+  "private_title_patterns": ["InPrivate", "Incognito", "Inkognito", "Private Browsing", "Privat nettlesing", "nettbank", "BankID"],
+  "title_only_app_apps": ["OUTLOOK.EXE", "olk.exe", "Teams.exe", "ms-teams.exe", "Discord.exe", "WhatsApp.exe", "Signal.exe"],
+  "redact_patterns": ["[\\w.+-]+@[\\w-]+\\.[\\w.]+", "\\b\\d{11}\\b", "\\b\\d{4}[ .]?\\d{2}[ .]?\\d{5}\\b"]
+}

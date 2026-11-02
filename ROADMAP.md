@@ -115,6 +115,11 @@ into the LIVE gateway, not just what exists somewhere in the codebase).
       `GET /files/revisions`, `POST /files/revisions/:id/restore`
       (sandbox-checked); **[UI]** a "Files" tab in the Workbench listing
       revisions with a Restore button per entry.
+- [x] Music library: BaseSpace's Beat DB "Add song" uploads real audio (streamed,
+      size-capped, extension-whitelisted, ranged downloads) and keeps a catalog
+      of what the operator typed; agents read it via `basespace` `songs`, and
+      cannot upload or delete. **[core]** `library.ts`; **[gateway]**
+      `library-routes.ts`; **[UI]** Beat DB. See the README section.
 
 ## Open
 
@@ -132,12 +137,15 @@ checked — see the correction below.
       image/screenshot attachment support in `useAgentOsChat`/
       `ConversationPane`, and no corresponding support in `model.ts`'s
       `ModelMessage`. **[core]** **[UI]**
-- [ ] **Cancellation genuinely preempts an in-flight step.** Documented,
-      accepted limitation today (cancellation stops scheduling NEW work,
-      never an in-flight model call) — revisit if it keeps being
-      friction in practice, since this is a real architectural change
-      (would need an abortable fetch at the model-adapter level), not a
-      quick fix. **[core]**
+- [x] **Cancellation preempts an in-flight step.** `cancelSession()` fires the
+      running turn's `AbortController` (`session.ts`); the signal reaches the
+      Anthropic/OpenAI/Ollama fetches, kills the Claude CLI child process and
+      the shell command, and the turn stops waiting at once even for an
+      adapter that ignores the signal (`raceAbort` in `agent-loop.ts`). A
+      cancelled turn is reported as cancelled, not as an error. Limit: the
+      abort registry is per process, so a cancel issued from a different
+      process than the one running the turn still only lands at the next
+      step boundary. Tests: `test-cancel-inflight`. **[core]**
 
 ## Where agent-os is already ahead (keep this true, don't regress it)
 
@@ -257,17 +265,32 @@ per-item `tags` and `budget: "low"` are real fields.
       `HINDSIGHT_ENABLED=1`: runs the server through `uvx`, uses the
       Codespace's Ollama for fact extraction, and sets `HINDSIGHT_URL` for
       the gateway. **[Codespace]** `hindsight.sh`, `start.sh`.
-- [ ] Pick the extraction LLM deliberately. Hindsight's default for Ollama
-      is `gemma3:12b` (too big here); the Codespace uses the agents' own
-      3B model, which extracts poorly. `HINDSIGHT_LLM_PROVIDER=claude-code`
-      (Hindsight's own Claude CLI provider) is worth trying once the CLI is
-      logged in.
+- [x] Pick the extraction LLM deliberately. Measured on the Windows server
+      (16 GB RAM, 4 GB GPU) with the same six turns: `qwen2.5:3b` lost the
+      durable specifics (225 s), `llama3.1:8b` took 998 s and failed 2 of 6,
+      `claude-code` + Haiku kept everything in 199 s and leaves the GPU to the
+      agents. Chosen: `claude-code` + `haiku` (the supervisor's default; env
+      overrides). Numbers and caveats (cost is subscription usage, unmeasured)
+      are in the README. **[gateway]** `deploy/windows/run-os.ps1`.
+- [x] What gets retained: only real operator conversations. `[Work]`,
+      `[Review]`, `[Approvals]` and cron-standup turns and turns that didn't
+      end in an answer are skipped: they cost an extraction and filed the
+      harness's own bookkeeping as "the user" facts. `recall-memory` is only
+      offered when the automatic recall found nothing (it duplicated it, and a
+      3B model looped on it). A missing bank (a new agent) is an empty recall,
+      not an error. Tolerant tool-argument parsing so a local model's
+      malformed arguments no longer kill the turn. **[core]**
+- [x] Windows: Hindsight runs under the supervisor on `127.0.0.1` only (its
+      default is `0.0.0.0`, no auth) with `PYTHONUTF8=1` (its banner crashes
+      on cp1252). **[gateway]**
 - [ ] Use what's unused: mental models (`/mental-models`, living documents
       Hindsight keeps current), tag-filtered recall, document ingestion
       (`/files/retain`) for Notes. **[core]**
-- Note: episodic writes are mirrored into Hindsight too, but the only live
-  caller is an approved memory nomination, so that's a small, deliberate
-  duplicate of a human-confirmed fact, not double extraction of every turn.
+- Note: episodic writes are mirrored into Hindsight too (an approved memory
+  nomination: a small, deliberate duplicate of a human-confirmed fact). **But
+  every finished operator turn is also retained** (`agent-loop.ts`, after the
+  turn), so each real conversation costs one extraction. An earlier version of
+  this note said otherwise; that was wrong.
 
 ## 3. Knowledge graph (not built yet)
 
@@ -292,6 +315,13 @@ wraps apps' own backends as JSON-emitting CLIs, each with a `SKILL.md` in
 the same format as `skills/`. That suits small models far better than
 screenshot-driven computer use.
 
+- Decision (2026-09): CLI-Anything's Audacity CLI is a pure-Python WAV
+  processor, not a remote control for the app, and its OBS CLI only edits
+  scene-collection JSON. The operator wants the Audacity capabilities, so
+  they are built in natively: the `audio` tool (`core/audio.ts`, ffmpeg:
+  info/loudness, trim, fades, gain, peak-normalize, limiter, EQ filters,
+  speed, pitch, convert; new file only, engineer-only, edits need approval).
+  OBS is dropped until something needs it.
 - [ ] `parseSkillFile` reads YAML block scalars (`description: >-`) as the
       literal text `">-"`, so every CLI-Anything skill imports with an empty
       description. Tested against `cli-anything-audacity`. **[core]**
@@ -429,3 +459,47 @@ Ordered so each step is safe before the next adds autonomy:
 enterprise RBAC (one operator here); "not a chatbot" as a hard rule — the
 Workbench keeps chat, but work that comes out of a chat should become a
 task attached to a goal; dollar-cost tracking without a real price source.
+
+## 8. Own HUD mode — learns from what the operator actually does
+
+Handoff and specs for the open items: `docs/hud-mode-handoff.md`.
+
+Hermes' HUD mode is a draggable overlay that looks at the screen only when
+asked. Ours adds the missing half: a continuous, privacy-filtered record of
+desktop activity, tied to BaseSpace goals and projects, feeding the same
+memory gate as everything else.
+
+- [x] Desktop activity stream. A stdlib-only Windows sensor posts
+      app/window/idle spans; stored as `desktop:YYYY-MM-DD`, projected into
+      a day summary (time per app, per project/goal, switches, focus
+      blocks). Never keystrokes, text, clipboard or screenshots. **[core]**
+      `desktop.ts`; **[gateway]** `/desktop/spans|now|timeline|summary`,
+      MCP `desktop_activity`; sensor in `desktop/sensor/`.
+- [x] Agents can read it: a `desktop` tool in the registry (read-only,
+      same digest as the MCP tool, allowed in plan mode). Only Hemera and
+      Mnemosyne see it (enforced by a `tool.before` hook, not just hidden).
+      Focus-block times are now local time. **[core]** `renderDesktopReport`.
+- [x] Learning loop, and the coach folded into it: no separate automation.
+      Each finished day (and week) becomes a few fixed-wording observations by
+      code (`desktop-learning.ts`), written with `writeEpisodic` (so Hindsight
+      gets them too). Dreaming promotes one only after it repeats across days;
+      a quiet day writes nothing; the operator's correction
+      (`POST /desktop/correction`) is promoted at once. Weekly numbers:
+      `GET /desktop/week`. No model turn. Tests: `test-desktop-learning`.
+      **[UI]** still open: show the week's time on goal/project pages.
+      **[core]**
+- [ ] HUD shell: a small always-on-top, click-through window (Tauri or
+      Electron) loading a `/hud` route of BaseOStest — composer + last reply,
+      session focused on the goal matched from `desktop.focus`. **[UI]**
+- [ ] Push-to-talk in the HUD: local faster-whisper on the operator's
+      machine (the mic is there), text sent as a normal turn. **[UI]**
+      Voice service phase 1 is in `voice/` (Silero VAD, NB-Whisper, optional
+      Kokoro speech back, off by default; 127.0.0.1:8765). Measured on the
+      operator's PC: 670 MB RAM with everything loaded; after phase 4
+      (short encoder window + speculative transcription) ~0.6 s from end
+      of speech to text, down from ~2 s. Next: English routing (phase 2; NB-Whisper set to
+      Norwegian translates English instead of transcribing it), then
+      Ctrl+Alt+B push-to-talk in the HUD.
+- [ ] "This": on demand, screenshot → OCR text for small local models;
+      the image itself only when the agent is routed to `claude-cli`
+      (depends on multimodal input above). **[core]** **[UI]**

@@ -304,6 +304,12 @@ const WINDOWS_DRIVE_PATH = /^[A-Za-z]:[\\/]/;
 function resolveCandidate(root: string, token: string): string {
   const normalized = normalizeMsysPath(token);
   if (WINDOWS_DRIVE_PATH.test(normalized)) {
+    // On a win32 host this is a genuine absolute path: resolve it natively so
+    // it compares against the (native) workspace roots. With posix rules it
+    // became "/C:/work/a.txt" for "C:\work\a.txt", which can never sit inside
+    // the root "C:\work" — every in-workspace path was rejected on Windows.
+    // On any other host it stays a foreign absolute path (the bypass fix).
+    if (IS_WIN32) return path.win32.resolve(normalized);
     return path.posix.resolve("/" + normalized.replace(/\\/g, "/"));
   }
   return path.resolve(root, normalized);

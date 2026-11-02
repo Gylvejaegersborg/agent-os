@@ -72,6 +72,8 @@ export async function writeEpisodic(input: {
    *  exactly as before — this parameter is a pure opt-in upgrade, never
    *  a requirement, so every existing caller keeps working unchanged. */
   similarityProvider?: SimilarityProvider;
+  /** For writers whose wording is fixed (desktop-learning.ts): the exact repeat count, instead of the fuzzy similarity search. */
+  repetitionCount?: number;
 }): Promise<EpisodicEntry> {
   const id = generateId();
   const entry: EpisodicEntry = {
@@ -82,7 +84,7 @@ export async function writeEpisodic(input: {
     kind: input.kind,
     sourceSessionId: input.sourceSessionId,
     wasExplicitCorrection: input.wasExplicitCorrection ?? false,
-    repetitionCount: await countSimilar(input.agentId, input.content, input.similarityProvider),
+    repetitionCount: input.repetitionCount ?? (await countSimilar(input.agentId, input.content, input.similarityProvider)),
     taskOutcome: input.taskOutcome,
     agentFlaggedImportant: input.agentFlaggedImportant ?? false,
   };

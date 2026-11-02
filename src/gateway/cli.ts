@@ -13,10 +13,15 @@ import {
   createLocalShellWorker,
   createSandboxedWorker,
   seedDefaultAgents,
+  listAgentRecords,
   reconcileLostTasks,
   startTaskTimeoutSweeper,
   startTaskLivenessRenewer,
   startMemoryDreamingSweeper,
+  startDesktopLearning,
+  startConnectorSync,
+  generateFlowBriefing,
+  worthBriefing,
   registerHook,
   setToolVisibility,
   subscribeToAllEvents,
@@ -30,6 +35,7 @@ import {
   type SandboxPolicy,
 } from "../core/index.js";
 import { startGateway } from "./server.js";
+import { loadGatewayToken } from "./auth.js";
 import { startBaseSpaceCronRunner } from "./basespace-crons.js";
 import { startWorkRunner } from "./work-runner.js";
 import { startReviewLoop } from "./review-loop.js";
@@ -53,7 +59,11 @@ const ENGINEER_AGENT_ID = "claude";
 // capability, same restriction, just a cleaner primitive for the model
 // (and a diff-able one for the Approvals tab) instead of an opaque
 // command string.
-const FILESYSTEM_TOOLS = ["shell", "read_file", "edit_file", "write_file"];
+const FILESYSTEM_TOOLS = ["shell", "read_file", "edit_file", "write_file", "audio"];
+
+/** Who may read the operator's desktop activity: the lead (coaching) and the agent that
+ *  keeps the team's memory tidy (the learning loop). Everyone else doesn't see the tool. */
+const DESKTOP_READERS = ["hemera", "mnemosyne"];
 
 /** Builds the Layer-A PermissionPolicy for ENGINEER_AGENT_ID. Read-only
  *  inspection (shell's own safe-command list, plus read_file uncondition-
@@ -84,6 +94,8 @@ function buildEngineerPolicy() {
       },
       { tool: "shell", decision: "allow" as const, argsPattern: SAFE_READONLY },
       { tool: "read_file", decision: "allow" as const },
+      // Measuring a file changes nothing; an audio edit writes a new file, so it asks.
+      { tool: "audio", decision: "allow" as const, argsPattern: /"action":\s*"info"/ },
       // No further rules: anything else (shell edits, git add/commit/push,
       // npm/apt installs, rm, edit_file, write_file, ...) falls through to
       // the default "ask".
@@ -102,6 +114,14 @@ async function main(): Promise<void> {
   if (reconciled.lost.length) {
     console.log(`[gateway] reconciliation found ${reconciled.lost.length} orphaned task(s) from a previous run: ${reconciled.lost.join(", ")}`);
   }
+  // A quick restart finds the previous run's tasks still inside the 45 s liveness window, so the pass above
+  // leaves them 'running'. Nothing renews them now, so one more pass once the window has passed catches them
+  // (and the flow steps they belonged to).
+  setTimeout(() => {
+    reconcileLostTasks()
+      .then((r) => r.lost.length && console.log(`[gateway] second reconciliation found ${r.lost.length} orphaned task(s): ${r.lost.join(", ")}`))
+      .catch((err) => console.error("[gateway] second reconciliation failed:", err instanceof Error ? err.message : err));
+  }, 50_000).unref();
   // Keeps enforcing Task timeouts and renewing this process's OWN running
   // Tasks' durable liveness for as long as the gateway is up — see each
   // function's doc comment in tasks.ts for why a real deployment needs
@@ -116,6 +136,13 @@ async function main(): Promise<void> {
   // dreaming itself is cheap (no model call, pure scoring) when there's
   // nothing newly eligible to phrase.
   startMemoryDreamingSweeper();
+  // Turns each finished day of desktop activity into a few fixed-wording observations
+  // for dreaming to weigh (desktop-learning.ts). No model call; nothing without a sensor.
+  if (process.env.AGENT_OS_DESKTOP_LEARNING !== "off") startDesktopLearning();
+  // The connectors the agents can reach through the Claude CLI follow the operator's account (connectors.ts).
+  if (process.env.AGENT_OS_CONNECTORS !== "off") startConnectorSync();
+  // Warm the agent list (its metrics take a second to derive) so the first BaseSpace load after a start is not the slow one.
+  void listAgentRecords().catch(() => undefined);
 
   // Skills (skills.ts) previously had ZERO wiring into the live gateway —
   // SkillRegistry.fromDirectory() existed, was tested, and had a full
@@ -179,6 +206,9 @@ async function main(): Promise<void> {
   // "whichever agent happens to be open."
   registerHook("tool.before", async (ctx) => {
     const toolName = String(ctx.payload.name ?? "");
+    if (toolName === "desktop" && !DESKTOP_READERS.includes(ctx.agentId)) {
+      return { block: true, reason: `"desktop" (the operator's activity) is only for ${DESKTOP_READERS.join(" and ")}.` };
+    }
     if (!FILESYSTEM_TOOLS.includes(toolName)) return;
     if (ctx.agentId === ENGINEER_AGENT_ID) return;
     return {
@@ -189,7 +219,10 @@ async function main(): Promise<void> {
   // …and the other agents aren't shown those tools at all: describing four
   // tools an agent can only be refused costs tokens on every one of its
   // model calls. The hook above stays the enforcement.
-  setToolVisibility((agentId, toolName) => !FILESYSTEM_TOOLS.includes(toolName) || agentId === ENGINEER_AGENT_ID);
+  setToolVisibility(
+    (agentId, toolName) =>
+      (!FILESYSTEM_TOOLS.includes(toolName) || agentId === ENGINEER_AGENT_ID) && (toolName !== "desktop" || DESKTOP_READERS.includes(agentId)),
+  );
   // Layer A, part 2: ENGINEER_AGENT_ID's own rules (see buildEngineerPolicy
   // above) — safe reads pre-approved, everything else durably queued for
   // approval in the Workbench's Approvals tab.
@@ -207,7 +240,8 @@ async function main(): Promise<void> {
   // policy asks by default — may also use the other harness tools that
   // can't touch files or a shell. Editable per agent from the Workbench.
   const seededRules = await seedAllowRules([
-    ...roster.flatMap((a) => ["basespace", "basespace-add"].map((toolName) => ({ agentId: a.id, toolName }))),
+    ...roster.flatMap((a) => ["basespace", "basespace-add", "library", "soundlab", "connector"].map((toolName) => ({ agentId: a.id, toolName }))),
+    ...DESKTOP_READERS.map((agentId) => ({ agentId, toolName: "desktop" })),
     ...["recall-memory", "skill", "nominate-memory", "record-artifact"].map((toolName) => ({ agentId: ENGINEER_AGENT_ID, toolName })),
   ]);
   if (seededRules) console.log(`[gateway] allowlist: seeded ${seededRules} default rule(s)`);
@@ -222,8 +256,15 @@ async function main(): Promise<void> {
   // for the live gateway; every agent's own persona/capabilities already
   // claims some of these (e.g. "subagent-delegation"), so leaving them
   // off made that claim false in practice.
+  // Gateway auth (auth.ts): the env var, else data/gateway-token (made on first start).
+  const auth = loadGatewayToken();
+  console.log(
+    auth
+      ? `[gateway] auth on: requests need the token from ${auth.source}`
+      : "[gateway] WARNING: auth is OFF (AGENT_OS_GATEWAY_AUTH=off) — anything that can reach this port, including web pages in a browser on this machine, can drive the OS",
+  );
   const handle = await startGateway(
-    { model, worker, skills, skillsDir, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true, enableBaseSpace: true, maxToolHops: 8, sandboxPolicy, configuredHooks },
+    { token: auth?.token, model, worker, skills, skillsDir, enableSubagents: true, enableMemoryNominations: true, enableArtifacts: true, enableBaseSpace: true, maxToolHops: 8, sandboxPolicy, configuredHooks },
     port,
   );
   console.log(`[gateway] listening on http://127.0.0.1:${handle.port}`);
@@ -245,6 +286,25 @@ async function main(): Promise<void> {
           if (type.startsWith("work.") || type === "watch.created") void checkWatches().catch((err) => console.error("[watchdog]", err instanceof Error ? err.message : err));
         });
   console.log(`[gateway] watchdog ${unwatch ? `on (verifier: ${verifierId()})` : "off (AGENT_OS_WATCHDOG=off)"}`);
+  // When a flow finishes, its lead writes the briefing the operator reads first (flow-briefing.ts).
+  if (process.env.AGENT_OS_FLOW_BRIEFING !== "off") {
+    const writing = new Set<string>();
+    subscribeToAllEvents((type, payload) => {
+      if (type !== "flow.completed") return;
+      const flowId = String(payload.flowId ?? "");
+      if (!flowId || writing.has(flowId) || payload.status === "running") return;
+      writing.add(flowId);
+      void (async () => {
+        try {
+          if (await worthBriefing(flowId)) await generateFlowBriefing(flowId, model);
+        } catch (err) {
+          console.error("[briefing]", err instanceof Error ? err.message : err);
+        } finally {
+          writing.delete(flowId);
+        }
+      })();
+    });
+  }
   // Leads review their team's work when something needs them (review.ts).
   const reviewLoop = process.env.AGENT_OS_REVIEW === "off" ? undefined : startReviewLoop({ model, worker, skills, sandboxPolicy });
   console.log(`[gateway] team reviews ${reviewLoop ? "on" : "off (AGENT_OS_REVIEW=off)"}`);

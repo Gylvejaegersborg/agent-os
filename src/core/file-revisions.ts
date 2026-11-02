@@ -12,6 +12,7 @@
 // checkpoint/rewind is ever built; this is the useful, honest subset.
 
 import { appendEvent, project } from "./eventlog.js";
+import { publishEvent } from "./eventbus.js";
 import { generateId } from "./id.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -43,6 +44,7 @@ export async function recordFileRevision(input: {
   const id = generateId();
   const timestamp = new Date().toISOString();
   await appendEvent(FILE_REVISIONS_STREAM, "file.revision.recorded", { revisionId: id, timestamp, ...input });
+  await publishEvent("file.revision.recorded", { revisionId: id });
   return { id, timestamp, ...input };
 }
 

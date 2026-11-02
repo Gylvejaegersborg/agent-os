@@ -176,8 +176,23 @@ export async function setSessionStatus(
  *  best-effort: if the linked Task is already terminal, transitionTask()
  *  is simply not called for it (nothing to cancel), and the Session
  *  cancellation itself always proceeds regardless of the Task's state. */
+/** The running turn's AbortController, per session (in this process). cancelSession() fires it so an
+ *  in-flight model request or shell command stops now, not at the next step boundary. */
+const turnAborts = new Map<string, AbortController>();
+
+export function beginTurnAbort(sessionId: string): AbortController {
+  const controller = new AbortController();
+  turnAborts.set(sessionId, controller);
+  return controller;
+}
+
+export function endTurnAbort(sessionId: string, controller: AbortController): void {
+  if (turnAborts.get(sessionId) === controller) turnAborts.delete(sessionId);
+}
+
 export async function cancelSession(id: string, reason?: string): Promise<Session> {
   const session = await setSessionStatus(id, "cancelled", { reason: reason ?? "cancelled by caller" });
+  turnAborts.get(id)?.abort(new Error("session cancelled"));
   if (session.taskId) {
     const { getTask, transitionTask } = await import("./tasks.js");
     const task = await getTask(session.taskId);

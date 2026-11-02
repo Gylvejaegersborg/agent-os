@@ -308,8 +308,30 @@ export async function reconcileLostTasks(opts: { staleAfterMs?: number; now?: Da
   for (const t of lost) {
     await transitionTask(t.id, "lost", { reason: `no liveness renewal within the last ${staleAfterMs}ms` });
   }
+  await settleLostFlowSteps();
 
   return { checked: running.length, lost: lost.map((t) => t.id) };
+}
+
+/** A managed flow's step whose task was lost (its process died mid-step) would otherwise stay "running" forever:
+ *  the flow never stops, and Resume can't reopen a running flow. Records the step as lost, so the flow ends as
+ *  failed and Resume runs that step again. Only 'lost' — any other ending is the flow engine's own to record. */
+async function settleLostFlowSteps(): Promise<void> {
+  const { tasks } = await projectTasks();
+  for (const flow of await listFlows()) {
+    if (flow.kind !== "managed" || flow.status !== "running") continue;
+    for (const step of flow.steps) {
+      if (step.status !== "running" || !step.taskId || tasks.get(step.taskId)?.status !== "lost") continue;
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const current = await getFlow(flow.id);
+        if (!current || current.status !== "running") break;
+        if ((await updateFlowStep(flow.id, step.id, "lost", current.revision, step.taskId)).ok) break;
+      }
+      await publishEvent("flow.step.completed", { flowId: flow.id, stepId: step.id, taskId: step.taskId, status: "lost", error: "the gateway stopped while this step was running" });
+      const after = await getFlow(flow.id);
+      if (after && after.status !== "running") await publishEvent("flow.completed", { flowId: flow.id, status: after.status });
+    }
+  }
 }
 
 export interface LivenessRenewerHandle {
@@ -495,9 +517,10 @@ const FLOWS_STREAM = "flows";
  *  function ever had; kept unchanged as the contrast case for
  *  createMirroredFlow() below (see that function's header for the
  *  difference). */
-export async function createFlow(kind: Flow["kind"], stepIds: { id: string; dependsOn: string[] }[]): Promise<Flow> {
+export async function createFlow(kind: Flow["kind"], stepIds: { id: string; dependsOn: string[] }[], title?: string): Promise<Flow> {
   const id = generateId();
-  await appendEvent(FLOWS_STREAM, "flow.created", { flowId: id, kind, steps: stepIds });
+  const name = title?.trim().slice(0, 60);
+  await appendEvent(FLOWS_STREAM, "flow.created", { flowId: id, kind, steps: stepIds, ...(name ? { title: name } : {}) });
   const flow = await getFlow(id);
   if (!flow) throw new Error("flow.created event did not project to a flow");
   return flow;
@@ -612,6 +635,7 @@ async function projectFlows(): Promise<FlowProjectionState> {
       const p = event.payload as any;
       state.flows.set(p.flowId, {
         id: p.flowId,
+        ...(typeof p.title === "string" && p.title ? { title: p.title } : {}),
         kind: p.kind,
         status: "running",
         steps: p.steps.map((s: any) => ({ id: s.id, dependsOn: s.dependsOn, status: "queued" as TaskStatus })),
@@ -641,9 +665,30 @@ async function projectFlows(): Promise<FlowProjectionState> {
       const flow = state.flows.get(p.flowId);
       if (!flow) return state;
       state.flows.set(p.flowId, { ...flow, status: "cancelled", revision: flow.revision + 1 });
+    } else if (event.type === "flow.reopened") {
+      // Resume after a stop: every step that didn't succeed goes back to queued (its taskId stays, as the previous attempt).
+      const p = event.payload as any;
+      const flow = state.flows.get(p.flowId);
+      if (!flow) return state;
+      const steps: FlowStep[] = flow.steps.map((s) => (s.status === "succeeded" ? s : { ...s, status: "queued" as TaskStatus }));
+      state.flows.set(p.flowId, { ...flow, steps, status: "running", revision: flow.revision + 1 });
     }
     return state;
   });
+}
+
+/** Puts a stopped flow back to running, with every step that didn't succeed queued again. Steps that succeeded keep
+ *  their results. A running or finished-successfully flow is returned unchanged; a cancelled one stays cancelled unless
+ *  `includeCancelled` (the operator pressing Resume on it is the only caller that sets it). */
+export async function reopenFlow(flowId: string, opts: { includeCancelled?: boolean } = {}): Promise<Flow> {
+  const existing = await getFlow(flowId);
+  if (!existing) throw new Error(`no such flow: ${flowId}`);
+  if (existing.status === "running" || existing.status === "succeeded") return existing;
+  if (existing.status === "cancelled" && !opts.includeCancelled) return existing;
+  await appendEvent(FLOWS_STREAM, "flow.reopened", { flowId });
+  const updated = await getFlow(flowId);
+  if (!updated) throw new Error("flow.reopened event did not project to a flow");
+  return updated;
 }
 
 export async function getFlow(flowId: string): Promise<Flow | undefined> {
@@ -663,9 +708,8 @@ export async function listFlows(): Promise<Flow[]> {
  *  session.ts's cancelSession() for the same "stop real in-flight work,
  *  not just the bookkeeping" reason). flow-engine.ts's driveFlow() checks
  *  this status on every iteration and stops scheduling new steps once
- *  it's set — already-running steps are cancelled via their Task, not
- *  forcibly killed (same honest limitation as Session cancellation: this
- *  stops NEW work, it doesn't preempt a model call already in flight). */
+ *  it's set — already-running steps are cancelled via their Task and
+ *  their session, which aborts the model call and shell command in flight. */
 export async function cancelFlow(flowId: string, reason?: string): Promise<Flow> {
   const existing = await getFlow(flowId);
   if (!existing) throw new Error(`no such flow: ${flowId}`);
@@ -689,6 +733,18 @@ export async function cancelFlow(flowId: string, reason?: string): Promise<Flow>
       await transitionTask(t.id, "cancelled", { reason: `flow ${flowId} was cancelled` });
       const step = existing.steps.find((s) => s.taskId === t.id);
       await publishEvent("flow.step.completed", { flowId, stepId: step?.id ?? t.id, agentId: t.agentId, taskId: t.id, status: "cancelled" });
+    }
+  }
+  // Cancelling the tasks alone left each running step's agent working (its model call and tools went on, and
+  // it kept writing to BaseSpace). Cancelling the step's session aborts its turn for real. Approvals those
+  // sessions were waiting on are rejected: nothing is left to carry them on.
+  const { listSessions, cancelSession } = await import("./session.js");
+  const { listApprovals, rejectRequest } = await import("./approvals.js");
+  for (const s of await listSessions()) {
+    if (s.flowId !== flowId) continue;
+    if (s.status === "active" || s.status === "paused") await cancelSession(s.id, `flow ${flowId} was cancelled`);
+    for (const a of await listApprovals({ sessionId: s.id, status: "pending" })) {
+      await rejectRequest(a.id, { resolvedBy: "system", note: `flow ${flowId} was cancelled` });
     }
   }
 

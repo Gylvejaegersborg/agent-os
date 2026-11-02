@@ -42,15 +42,17 @@
 //      other worker processes. "Parallel" means concurrent within one
 //      Node process's event loop, which is genuinely parallel for I/O
 //      (model API calls) but not a multi-machine execution grid.
-//   3. Cancellation stops NEW steps from being scheduled and cancels the
-//      Tasks of already-started steps, but (same limitation session.ts's
-//      cancellation has) cannot preempt a model call already in flight
-//      mid-runTurn() — it stops at the next checkpoint runTurn() itself
-//      checks, not instantly.
+//   3. Cancellation stops NEW steps from being scheduled, cancels the
+//      Tasks of already-started steps and cancels their sessions, which
+//      aborts the step's model call and shell command in flight (the
+//      adapters cancel their request; see session.ts's cancelSession).
+//      A tool that has already finished its write isn't undone.
 
-import { createFlow, getFlow, updateFlowStep, createTask, transitionTask } from "./tasks.js";
-import { runTurn } from "./agent-loop.js";
+import { createFlow, getFlow, getTask, reopenFlow, updateFlowStep, createTask, transitionTask } from "./tasks.js";
+import { flowStepExecutions, runTurn } from "./agent-loop.js";
+import { checkAgentNotesSince } from "./pack-check.js";
 import { createSession, linkSessionWork } from "./session.js";
+import { listApprovals } from "./approvals.js";
 import type { SessionFocus } from "./types.js";
 import { createModelForAgent } from "./models/real.js";
 import { publishEvent } from "./eventbus.js";
@@ -76,6 +78,8 @@ export interface FlowStepDefinition {
    *  dependents). Default 0 — fail fast, matching every other primitive
    *  in this codebase's "don't retry silently unless asked" posture. */
   retries?: number;
+  /** A check run by code after the step: "pack-facts" compares the counts in the notes the agent wrote to the latest built pack (pack-check.ts). Up to 2 correction rounds, then the step fails with the list. */
+  check?: "pack-facts";
 }
 
 export interface DriveFlowOptions {
@@ -83,6 +87,8 @@ export interface DriveFlowOptions {
   worker: Worker;
   skills?: SkillRegistry;
   maxToolHopsPerStep?: number;
+  /** Cap on tool executions inside one step (default flowStepExecutions()). */
+  maxToolExecutionsPerStep?: number;
   /** Forwarded as-is to each step's runTurn() call (agent-loop.ts) — same
    *  meaning as the gateway's direct-chat turns route. Previously just
    *  missing from this options type entirely, so even a gateway that
@@ -134,10 +140,11 @@ const STEP_TERMINAL: TaskStatus[] = ["succeeded", "failed", "timed_out", "cancel
  *  to completion (or cancellation) in one call — the common case. Returns
  *  once every step has reached a terminal status, or the Flow was
  *  cancelled mid-run. */
-export async function runFlow(steps: FlowStepDefinition[], opts: DriveFlowOptions): Promise<DriveFlowResult> {
+export async function runFlow(steps: FlowStepDefinition[], opts: DriveFlowOptions & { title?: string }): Promise<DriveFlowResult> {
   const flow = await createFlow(
     "managed",
     steps.map((s) => ({ id: s.id, dependsOn: s.dependsOn ?? [] })),
+    opts.title,
   );
   if (opts.focus) await setFlowFocus(flow.id, opts.focus);
   return driveFlow(flow.id, steps, opts);
@@ -149,6 +156,34 @@ export async function runFlow(steps: FlowStepDefinition[], opts: DriveFlowOption
  *  already fully done (returns immediately with its current, unchanged
  *  state) or already cancelled. */
 export async function resumeFlow(flowId: string, steps: FlowStepDefinition[], opts: DriveFlowOptions): Promise<DriveFlowResult> {
+  // A flow that stopped (a step failed, or it was cancelled) is reopened: the steps that didn't succeed run again,
+  // the ones that did keep their results. Without this a stopped flow is terminal and Resume did nothing.
+  await reopenFlow(flowId);
+  return driveFlow(flowId, steps, opts);
+}
+
+/** The operator accepts a stopped step as done (for instance it finished its work and only ran out of steps saying so).
+ *  The flow is reopened, that step is recorded as succeeded against its latest attempt, and the rest of the flow runs. */
+export async function markStepDone(flowId: string, stepIds: string | string[], steps: FlowStepDefinition[], opts: DriveFlowOptions): Promise<DriveFlowResult> {
+  const ids = Array.isArray(stepIds) ? stepIds : [stepIds];
+  const flow = await getFlow(flowId);
+  if (!flow) throw new Error(`no such flow: ${flowId}`);
+  if (!ids.length) throw new Error("no steps given");
+  // Check every step first, so nothing is changed when one of them can't be accepted.
+  const picked = ids.map((stepId) => {
+    const step = flow.steps.find((s) => s.id === stepId);
+    if (!step) throw new Error(`no step "${stepId}" in flow ${flowId}`);
+    if (step.status === "succeeded") throw new Error(`step "${stepId}" already succeeded`);
+    if (step.status === "running") throw new Error(`step "${stepId}" is still running`);
+    return step;
+  });
+  // Reopening puts every unfinished step back to queued; the ones the operator did NOT accept would run again, so say so
+  // in the caller (the panel shows each failed step on its own). Accepted steps are marked before anything is driven.
+  await reopenFlow(flowId, { includeCancelled: true });
+  for (const step of picked) {
+    await setStepStatus(flowId, step.id, "succeeded", step.taskId);
+    await publishEvent("flow.step.completed", { flowId, stepId: step.id, taskId: step.taskId, status: "succeeded", acceptedBy: "operator" });
+  }
   return driveFlow(flowId, steps, opts);
 }
 
@@ -167,11 +202,34 @@ async function setStepStatus(flowId: string, stepId: string, status: TaskStatus,
   throw new Error(`setStepStatus: too many revision conflicts updating step "${stepId}" on flow ${flowId}`);
 }
 
+/** What the steps this one depends on produced, so a downstream step works from real results
+ *  instead of just running after them. Each result is capped so a long chain stays small. */
+async function upstreamResults(flowId: string, step: FlowStepDefinition): Promise<string> {
+  if (!step.dependsOn?.length) return "";
+  const flow = await getFlow(flowId);
+  const parts: string[] = [];
+  for (const dep of step.dependsOn) {
+    const taskId = flow?.steps.find((s) => s.id === dep)?.taskId;
+    const task = taskId ? await getTask(taskId) : undefined;
+    const text = typeof task?.output?.finalContent === "string" ? task.output.finalContent.trim() : "";
+    if (text) parts.push(`### Result of step "${dep}"\n${text.slice(0, 3000)}${text.length > 3000 ? "\n[…cut]" : ""}`);
+  }
+  return parts.length ? `\n\n---\nWhat the steps you depend on produced:\n\n${parts.join("\n\n")}` : "";
+}
+
 async function runStepOnce(
   flowId: string,
   step: FlowStepDefinition,
   opts: DriveFlowOptions,
-): Promise<{ status: TaskStatus; taskId: string; finalContent?: string }> {
+): Promise<{ status: TaskStatus; taskId: string; finalContent?: string; blocked?: boolean }> {
+  // An earlier attempt at this step (the flow was resumed): tell the agent, so it checks what already exists
+  // instead of adding it all again.
+  const previous = (await getFlow(flowId))?.steps.find((s) => s.id === step.id)?.taskId;
+  const retryNote = previous
+    ? "\n\n---\nNote: an earlier attempt at this step was stopped before it finished (it may have run out of tool steps). Some of its work may already be in BaseSpace: look first (basespace, with a search for the titles you would add) and only add what is missing. Never add a duplicate."
+    : "";
+  // Cancelled between batches (or before a retry): start nothing.
+  if ((await getFlow(flowId))?.status !== "running") return { status: "cancelled", taskId: previous ?? "" };
   const task = await createTask({ type: "flow-step", agentId: step.agentId, flowId, input: { stepId: step.id, goal: step.goal } });
   await transitionTask(task.id, "running");
   await setStepStatus(flowId, step.id, "running", task.id);
@@ -189,24 +247,72 @@ async function runStepOnce(
     // is linked to the step's task so stale-work detection sees its activity.
     const session = await createSession({ agentId: step.agentId, title: `Flow step: ${step.id}`, ...(focus ? { focus } : {}) });
     await linkSessionWork(session.id, { taskId: task.id, flowId });
-    const result = await runTurn({
-      sessionId: session.id,
-      agentId: step.agentId,
-      userMessage: step.goal,
-      model,
-      worker: opts.worker,
-      skills: opts.skills,
-      maxToolHops: opts.maxToolHopsPerStep,
-      enableSubagents: opts.enableSubagents,
-      enableMemoryNominations: opts.enableMemoryNominations,
-      enableArtifacts: opts.enableArtifacts,
-      enableBaseSpace: opts.enableBaseSpace,
-      sandboxPolicy: opts.sandboxPolicy,
-    });
+    const turn = (userMessage: string) =>
+      runTurn({
+        sessionId: session.id,
+        agentId: step.agentId,
+        userMessage,
+        model,
+        worker: opts.worker,
+        skills: opts.skills,
+        maxToolHops: opts.maxToolHopsPerStep,
+        maxToolExecutions: opts.maxToolExecutionsPerStep ?? flowStepExecutions(),
+        enableSubagents: opts.enableSubagents,
+        enableMemoryNominations: opts.enableMemoryNominations,
+        enableArtifacts: opts.enableArtifacts,
+        enableBaseSpace: opts.enableBaseSpace,
+        sandboxPolicy: opts.sandboxPolicy,
+      });
+    const startedAt = new Date().toISOString();
+    let result = await turn(step.goal + retryNote + (await upstreamResults(flowId, step)));
+    // Cancelled while the agent was working (cancelFlow cancels the task and the session): the task already says
+    // so. Recording the turn's outcome now would turn a cancelled step back into a finished one.
+    if (result.stopReason === "cancelled" || (await getTask(task.id))?.status === "cancelled") {
+      return { status: "cancelled", taskId: task.id, finalContent: result.finalContent };
+    }
+    // A check done by code: what the agent saved is compared to the facts. Wrong numbers go back to the agent as an exact list
+    // (up to 2 rounds); if they are still wrong the step FAILS with the list, whatever the agent's report says.
+    if (step.check === "pack-facts" && result.stopReason === "answered") {
+      let bad = await checkAgentNotesSince(step.agentId, startedAt);
+      for (let round = 0; round < 2 && bad.length; round++) {
+        const list = bad.map((b) => `Note "${b.note}":\n${b.problems.map((p) => `  - ${p}`).join("\n")}`).join("\n");
+        result = await turn(
+          `A check run by code (not an opinion) compared the notes you just saved to the pack and found:\n${list}\n` +
+            "Fix exactly these: use basespace-add with the note's title and edit [{find, replace}], changing only the wrong text. Do not rewrite whole notes. Then say which lines you changed.",
+        );
+        if (result.stopReason !== "answered") break;
+        bad = await checkAgentNotesSince(step.agentId, startedAt);
+      }
+      if (bad.length) {
+        const error = `the fact check still fails: ${bad.map((b) => `${b.note}: ${b.problems.join("; ")}`).join(" | ")}`;
+        await transitionTask(task.id, "failed", { output: { error, finalContent: result.finalContent, sessionId: session.id } });
+        await publishEvent("flow.step.completed", { flowId, stepId: step.id, agentId: step.agentId, taskId: task.id, status: "failed", error });
+        return { status: "failed", taskId: task.id, finalContent: result.finalContent };
+      }
+    }
+    // A step that ran out of tool steps didn't finish its work: say so instead of reporting success.
+    if (result.stopReason === "max-hops") {
+      const error = "the agent ran out of tool steps before finishing (raise AGENT_OS_FLOW_STEP_HOPS, or split the step)";
+      await transitionTask(task.id, "failed", { output: { error, finalContent: result.finalContent, sessionId: session.id } });
+      await publishEvent("flow.step.completed", { flowId, stepId: step.id, agentId: step.agentId, taskId: task.id, status: "failed", error });
+      return { status: "failed", taskId: task.id, finalContent: result.finalContent };
+    }
+    // A tool call was blocked (plan mode, a hook, or it went to Approvals): the work it was for didn't happen.
+    // The step stops there; once an approval is decided, the gateway's resumeAfterDecision carries it on.
+    if (result.stopReason === "tool-blocked") {
+      const waiting = (await listApprovals({ sessionId: session.id, status: "pending" })).at(-1);
+      const error = waiting
+        ? `waiting on approval ${waiting.id} (${waiting.toolName})`
+        : `a tool call was blocked: ${(result.finalContent ?? "").replace(/^Tool call blocked:\s*/, "").slice(0, 300)}`;
+      await transitionTask(task.id, "failed", { output: { error, finalContent: result.finalContent, sessionId: session.id, ...(waiting ? { approvalId: waiting.id } : {}) } });
+      await publishEvent("flow.step.completed", { flowId, stepId: step.id, agentId: step.agentId, taskId: task.id, status: "failed", error });
+      return { status: "failed", taskId: task.id, finalContent: result.finalContent, blocked: true };
+    }
     await transitionTask(task.id, "succeeded", { output: { finalContent: result.finalContent, sessionId: session.id } });
     await publishEvent("flow.step.completed", { flowId, stepId: step.id, agentId: step.agentId, taskId: task.id, status: "succeeded" });
     return { status: "succeeded", taskId: task.id, finalContent: result.finalContent };
   } catch (err) {
+    if ((await getTask(task.id))?.status === "cancelled") return { status: "cancelled", taskId: task.id };
     const message = err instanceof Error ? err.message : String(err);
     await transitionTask(task.id, "failed", { output: { error: message } });
     await publishEvent("flow.step.completed", { flowId, stepId: step.id, agentId: step.agentId, taskId: task.id, status: "failed", error: message });
@@ -216,12 +322,19 @@ async function runStepOnce(
 
 async function runStepWithRetries(flowId: string, step: FlowStepDefinition, opts: DriveFlowOptions): Promise<FlowStepResult> {
   const maxAttempts = 1 + (step.retries ?? 0);
-  let last: { status: TaskStatus; taskId: string; finalContent?: string } | undefined;
+  let last: { status: TaskStatus; taskId: string; finalContent?: string; blocked?: boolean } | undefined;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     last = await runStepOnce(flowId, step, opts);
     if (last.status === "succeeded") {
       await setStepStatus(flowId, step.id, "succeeded", last.taskId);
       return { stepId: step.id, status: "succeeded", taskId: last.taskId, finalContent: last.finalContent, attempts: attempt };
+    }
+    // Cancelled: no retry, and nothing to record (the flow is cancelled, so setStepStatus would be a no-op anyway).
+    if (last.status === "cancelled") return { stepId: step.id, status: "cancelled", taskId: last.taskId || undefined, attempts: attempt };
+    // Blocked: a retry would only hit the same block (or file the same approval again).
+    if (last.blocked) {
+      await setStepStatus(flowId, step.id, "failed", last.taskId);
+      return { stepId: step.id, status: "failed", taskId: last.taskId, attempts: attempt };
     }
     // failed this attempt — loop again if attempts remain, otherwise fall through to record the final failure below
   }
@@ -239,8 +352,25 @@ async function runStepWithRetries(flowId: string, step: FlowStepDefinition, opts
  *  dependsOn naturally waits for prior batches. Stops scheduling new work
  *  the moment the Flow is cancelled (checked at the top of every
  *  iteration), matching Session's own cancellation-checkpoint pattern. */
+// Flows a driveFlow() call in this process is driving right now. A second call (Resume pressed twice, or Resume
+// while the flow is still going) returns the current state instead of starting the same ready steps a second time.
+const driving = new Set<string>();
+
 async function driveFlow(flowId: string, stepDefs: FlowStepDefinition[], opts: DriveFlowOptions): Promise<DriveFlowResult> {
-  const byId = new Map(stepDefs.map((s) => [s.id, s]));
+  if (driving.has(flowId)) {
+    const flow = await getFlow(flowId);
+    if (!flow) throw new Error(`no such flow: ${flowId}`);
+    return { flowId, status: flow.status, steps: flow.steps.map((s) => ({ stepId: s.id, status: s.status, taskId: s.taskId, attempts: 0 })) };
+  }
+  driving.add(flowId);
+  try {
+    return await driveFlowSteps(flowId, stepDefs, opts);
+  } finally {
+    driving.delete(flowId);
+  }
+}
+
+async function driveFlowSteps(flowId: string, stepDefs: FlowStepDefinition[], opts: DriveFlowOptions): Promise<DriveFlowResult> {
   const results = new Map<string, FlowStepResult>();
 
   for (;;) {
