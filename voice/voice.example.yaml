@@ -40,6 +40,13 @@ tts:
 resources:
   threads: 4
   priority: below_normal
+  idle_unload_min: 15    # drop NB-Whisper / Phonon-2 / Kokoro after this long unused; reloaded when you speak
 
 mic:
-  enabled: true          # false = HTTP routes only, no always-open mic
+  enabled: true          # false = HTTP routes only, no mic
+  trigger: push_to_talk  # push_to_talk: only while ptt_key is held · always: open mic, every utterance in the room
+  ptt_key: ctrl+alt+b
+
+auth:
+  enabled: true          # every route but /health needs the Agent-OS gateway token
+  token_file: ../data/gateway-token

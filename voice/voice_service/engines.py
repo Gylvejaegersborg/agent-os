@@ -165,6 +165,8 @@ class EnglishStt:
             opts = ort.SessionOptions()
             opts.intra_op_num_threads = threads
             opts.inter_op_num_threads = 1
+            # Without the arena: ~690 MB instead of ~860 MB resident, at the same speed (measured, phase 5).
+            opts.enable_cpu_mem_arena = False
             self._model = onnx_asr.load_model("nemo-conformer-tdt", model_dir, quantization="int8", sess_options=opts)
         elif runtime == "sherpa-onnx":
             import sherpa_onnx

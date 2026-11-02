@@ -1,13 +1,14 @@
-# Local voice service (HUD mode, part 6) — phases 1, 2 and 4
+# Local voice service (HUD mode, part 6) — phases 1, 2, 4, 5 and 6
 
 One local Python process for speech in and, optionally, speech back. It runs on the machine with the mic,
 keeps its models loaded, and serves OpenAI-compatible routes on `127.0.0.1:8765` only. Nothing leaves the
 machine. Spec: "Local Voice Service — Spec" (17 Oct 2026); handoff: `docs/hud-mode-handoff.md`, part 6.
 
 ```
-mic 16 kHz ─▶ Silero VAD (32 ms frames) ─▶ segmenter ─┬─▶ whisper-tiny language ID (from 1 s in, while you talk)
-                                                      └─▶ en ≥ 0.80 ? Phonon-2 : NB-Whisper ─▶ WS /v1/listen  {type: final, …}
-                                                                                          POST /v1/audio/transcriptions
+Ctrl+Alt+B held ─▶ mic 16 kHz ─▶ Silero VAD ─▶ hold recorder ─┬─▶ whisper-tiny language ID (from 1 s in, while you talk)
+                                                              └─▶ en ≥ 0.80 ? Phonon-2 : NB-Whisper ─▶ WS /v1/listen  {type: final, …}
+                                                                                                  POST /v1/audio/transcriptions
+BaseSpace (Vite proxy /voice/*, adds the token) ◀── WS /v1/listen: dictation lands in the launcher (Alt+B)
 text ─▶ Kokoro (en) ─▶ wav/pcm        POST /v1/audio/speech   (only with tts.enabled — off by default)
 ```
 
@@ -71,9 +72,49 @@ these numbers. Phase 1's mic test (operator, Norwegian): ~2.7 s, text right in 5
   ~0.9 GB per its export's card). Over the spec's 1 GB; idle unload is phase 5's job.
 - The spec's 60-clip test set (≥ 95% routing) isn't recorded; this is 8 synthetic + 8 live.
 
+**Phase 5 (resources), measured on this PC:**
+
+| | RAM (resident) |
+|---|---|
+| VAD | 36 MB |
+| whisper-tiny (language ID) | 106 MB |
+| NB-Whisper small int8 | 358 MB (980 MB peak while loading: the ct2 folder is full precision, made int8 at load) |
+| Phonon-2 int8 | 688 MB with onnxruntime's arena off (861 MB with it; same speed, 145 vs 149 ms) |
+| Bark 3.0 Plus int8 (only for A/B) | 873 MB |
+| the service, everything loaded | 1.17–1.22 GB |
+| **after idle unload** | **181 MB** |
+
+- *Idle unload* (`resources.idle_unload_min: 15`): NB-Whisper, the English engine and Kokoro are dropped after
+  15 min unused; the VAD and language ID stay. Pressing push-to-talk (or, with the open mic, speech starting)
+  reloads them in the background: both in ~3.2 s in parallel, so after a long idle the first sentence is ~1–3 s
+  slower, the rest normal. Each model gives its memory back when dropped (lazy.py).
+- *Idle CPU:* the VAD's onnxruntime pool of 2 threads never stopped spin-waiting between its 31 frames a second
+  and held a whole core in silence (6.3% of this 16-thread machine). On one thread without spinning it's 0.09%.
+  With push-to-talk the VAD doesn't run between holds: the whole service idles at **0.04%** (spec: ≤ 3%).
+- **Not met:** "≤ 1 GB with everything loaded". Phonon-2 is ~690 MB of it and no smaller ONNX export exists;
+  idle unload is what keeps the everyday footprint at ~180 MB.
+
+**Phase 6 (hookup):**
+- *Push-to-talk, the default* (`mic.trigger: push_to_talk`, `mic.ptt_key: ctrl+alt+b`): hold the key with any
+  window focused, speak, let go. Only that is transcribed; between holds the VAD doesn't run and frames only
+  fill the 300 ms pre-roll. The release ends the utterance, so there's no 600 ms silence window: release → text
+  was a median 184 ms in `replay.py --ptt` and 114–534 ms live (Phonon-2 / NB-Whisper). Language ID starts
+  1 s into the hold. `mic.trigger: always` is the open mic of phases 1–4; live, it turned everything said in the
+  room into text, which is why it's no longer the default. `POST /v1/control {"ptt": true|false}` does the same
+  as the key (for a button).
+- *The token:* every route but `GET /health` needs the Agent-OS gateway's token (`auth.py`). Binding 127.0.0.1
+  keeps other machines out, not web pages: browsers don't apply CORS to WebSockets, so any page could have read
+  your dictation from `/v1/listen`. The token is the gateway's own (`AGENT_OS_GATEWAY_TOKEN`, else
+  `../data/gateway-token`, made in the gateway's format if missing).
+- *BaseSpace:* its Vite proxy serves this service at `/voice/*` and adds the token (`ws: true`, so `/v1/listen`
+  too). `src/features/voice/voiceClient.ts` keeps one WebSocket for the app. Holding Ctrl+Alt+B opens the
+  launcher ("Listening…"); on release the text lands in its input tagged `dictated · NO|EN`, and Enter runs it
+  like typed text. Sending it to an agent and speaking replies (`speak()`, there already) is the launcher's AI
+  mode, which hud/core wires up.
+- `/v1/listen` never worked before this: uvicorn needs the `websockets` package, which wasn't in requirements.
+
 **Not yet:** English partials, the 60-clip routing test set, Piper Norwegian speech, sentence routing and
-barge-in (phase 3), idle unload and measured RAM (phase 5), the HUD and gateway hookup, including
-Ctrl+Alt+B push-to-talk (phase 6).
+barge-in (phase 3), dictation reaching an agent and replies spoken (with hud/core's launcher AI mode / HUD).
 
 ## Set up (Windows)
 
@@ -103,19 +144,23 @@ Pick the mic: `python -m sounddevice` lists devices; put the name or index in `a
   `-F language=en` or `no` to skip language ID).
 - Speak English, then Norwegian, then a mix: `final (en, phonon-2, detected en 0.98, …)` for English,
   `nb-whisper-small` for the rest. Ctrl+Alt+L prints `mode: no` / `en` / `auto`.
+- Every route but `/health` needs `-H "Authorization: Bearer <agent-os/data/gateway-token>"`; without it, 401.
+- With BaseSpace open: hold Ctrl+Alt+B, speak, let go: the launcher opens and the text is in its input.
 
-`python test_voice.py` tests the segmenter, speculation events, routing, hotkey parsing and config without
-models or a mic. `python replay.py a.wav b.wav …` plays clips through the real pipeline at real-time pace and
+`python test_voice.py` tests the segmenter, speculation events, push-to-talk holds, routing, idle unload,
+the token check, hotkey parsing and config without models or a mic. `python replay.py a.wav b.wav …` plays clips through the real pipeline at real-time pace and
 prints each one's engine, route and end of speech → final latency (`--no-speculation`, `--window 0`,
-`--en bark-plus|none`, `--mode no|en` to compare).
+`--en bark-plus|none`, `--mode no|en`, `--ptt` to compare).
 
 ## Rules it keeps
 
 - Audio goes from the mic to the transcriber and nowhere else; nothing is stored. Only the text leaves,
-  and only to whoever is connected to `/v1/listen` locally.
+  and only to whoever is connected to `/v1/listen` with the token.
+- Push-to-talk by default: nothing is transcribed unless the key is held.
 - Binds 127.0.0.1; `run.py` refuses any other host.
 - Speech back is off unless `tts.enabled: true`; with it off, no TTS model is loaded.
-- Below-normal process priority; 4 threads for NB-Whisper, Phonon-2 and Kokoro, 2 for the VAD and language ID.
-- The mode hotkey is a registered hotkey, not a keyboard hook: no keystroke ever reaches the service.
+- Below-normal process priority; 4 threads for NB-Whisper, Phonon-2 and Kokoro, 2 for language ID, 1 for the VAD.
+- Both hotkeys are registered hotkeys, not keyboard hooks: no other keystroke ever reaches the service.
+  Push-to-talk's release is read with GetAsyncKeyState on that one key, only while it's held.
 - Phonon-2 and Bark 3.0 Plus weights are CC BY 4.0 (Fermion Research / Conway Research, from NVIDIA's
   Parakeet TDT 0.6B v3); their NOTICE files are kept in `models/`.

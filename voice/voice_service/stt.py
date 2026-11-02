@@ -2,6 +2,8 @@
 
 Loads NB-Whisper always, and language ID plus the English engine named by stt.en ("phonon-2", "bark-plus",
 or none). If the English engine can't load (models missing), everything goes to NB-Whisper and /health says why.
+NB-Whisper and the English engine unload after resources.idle_unload_min without use (lazy.py); language ID
+stays loaded.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import numpy as np
 
 from .config import model_path
 from .engines import EnglishStt, NbWhisper, Transcript, WhisperLangId
+from .lazy import Lazy
 from .router import Route, Router
 
 
@@ -27,10 +30,17 @@ class Detection:
 class SpeechToText:
     def __init__(self, cfg: dict[str, Any], log=print) -> None:
         s, r, li = cfg["stt"], cfg["resources"], cfg["lang_id"]
+        idle_s = 60 * (r.get("idle_unload_min") or 0)
         t0 = time.perf_counter()
-        self.no = NbWhisper(model_path(s["no"]), threads=r["threads"], beam=s["no_beam"], min_chars=s["min_chars"], min_window_s=s["min_window_s"])
+        self.no: Lazy[NbWhisper] = Lazy(
+            NbWhisper.name,
+            lambda: NbWhisper(model_path(s["no"]), threads=r["threads"], beam=s["no_beam"], min_chars=s["min_chars"], min_window_s=s["min_window_s"]),
+            idle_s,
+            log,
+        )
+        self.no.load()
         log(f"[voice] NB-Whisper loaded in {time.perf_counter() - t0:.1f}s")
-        self.en: Optional[EnglishStt] = None
+        self.en: Optional[Lazy[EnglishStt]] = None
         self.langid: Optional[WhisperLangId] = None
         self.en_error: Optional[str] = None
         name = s.get("en")
@@ -39,7 +49,9 @@ class SpeechToText:
                 spec = s["en_engines"][name]
                 t0 = time.perf_counter()
                 self.langid = WhisperLangId(model_path(li["model"]), threads=r["vad_threads"], max_s=li["max_s"])
-                self.en = EnglishStt(name, spec["runtime"], model_path(spec["path"]), threads=r["threads"], min_chars=s["min_chars"])
+                en = Lazy(name, lambda: EnglishStt(name, spec["runtime"], model_path(spec["path"]), threads=r["threads"], min_chars=s["min_chars"]), idle_s, log)
+                en.load()
+                self.en = en
                 log(f"[voice] language ID + {name} loaded in {time.perf_counter() - t0:.1f}s")
             except Exception as err:  # Norwegian keeps working without them
                 self.en, self.langid = None, None
@@ -52,6 +64,15 @@ class SpeechToText:
             has_en=self.en is not None,
             mode=cfg.get("mode", "auto"),
         )
+
+    @property
+    def lazy_models(self) -> list[Lazy]:
+        return [m for m in (self.no, self.en) if m is not None]
+
+    def prefetch(self) -> None:
+        """Speech started: reload whatever idle unload dropped, while the speaker talks."""
+        for m in self.lazy_models:
+            m.prefetch()
 
     def detect(self, audio: np.ndarray) -> Optional[Detection]:
         if self.langid is None:
@@ -70,7 +91,7 @@ class SpeechToText:
 
     def transcribe(self, audio: np.ndarray, route: Route) -> Transcript:
         engine = self.en if route.engine == "en" and self.en is not None else self.no
-        return engine.transcribe(audio)
+        return engine.run(lambda m: m.transcribe(audio))
 
     def transcribe_file(self, audio: np.ndarray, language: Optional[str]) -> tuple[Transcript, Route]:
         """For POST /v1/audio/transcriptions: an explicit language wins; else the mode; else language ID.
@@ -89,12 +110,3 @@ class SpeechToText:
             d = self.detect(audio)
             route = self.router.decide(d.language, d.prob)
         return self.transcribe(audio, route), route
-
-    def health(self) -> dict[str, Any]:
-        return {
-            "no": self.no.name,
-            "en": self.en.name if self.en else None,
-            "lang_id": self.langid.name if self.langid else None,
-            "en_error": self.en_error,
-            "mode": self.router.mode,
-        }
