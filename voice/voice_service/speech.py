@@ -8,8 +8,9 @@ queue on this machine's speakers. Only with tts.enabled (off by default).
   previous sentence's language; a request can force one. Anything not English is spoken by Piper's Norwegian
   voice: fastText often calls Norwegian Danish or Swedish, and that's the closest voice there is anyway.
 - Speaker: synthesizes sentence N+1 while N plays, both engines resampled to one rate, on ONE output stream
-  that stays open, so there's no gap or click between sentences or engines. stop() (barge-in) cuts the sound
-  within one 20 ms block and drops everything queued.
+  that stays open, so there's no gap or click between sentences or engines. An engine that streams (Phonon 31M)
+  is played chunk by chunk as it's made, so a sentence starts ~75 ms after it's handed over. stop() (barge-in)
+  cuts the sound within one 20 ms block, drops everything queued and stops a stream mid-sentence.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 
-from .engines import normalize
+from .engines import loudness_gain, normalize
 
 _END = re.compile(r"([.!?:…]+[\"')\]]*)(\s+)|(\n+)")
 
@@ -132,7 +133,12 @@ class Spoken:
     language: str
     engine: str
     audio: np.ndarray
-    synth_ms: int
+    synth_ms: int  # time to make it, or for a stream the time to its first chunk
+    first: bool = True  # a streamed sentence arrives as pieces: the first one announces the sentence…
+    last: bool = True  # …and the last one (possibly empty) ends it
+
+
+CALIBRATION = "This is a sentence to measure how loud the voice speaks."
 
 
 class Speaker:
@@ -146,8 +152,11 @@ class Speaker:
         device: Any = None,
         emit: Callable[[dict[str, Any]], None] = lambda e: None,
         play: bool = True,
+        quick_start: bool = True,  # speak a reply's first clause first; for engines that don't stream (Kokoro)
     ) -> None:
         self._engines = engines
+        self._quick_start = quick_start
+        self._gains: dict[str, float] = {}  # per streaming engine: one loudness gain, measured once
         self._language = language
         self._rate = sample_rate
         self._device = device
@@ -164,6 +173,10 @@ class Speaker:
         self._stream = None
         self._stop = threading.Event()
         self.timeline: list[tuple[str, float]] = []  # (event, time) for the gap measurement in tests
+        # Measure each streaming voice's loudness now (~0.6 s for Phonon), not in front of the first sentence it says.
+        for lazy in engines.values():
+            if getattr(lazy, "streams", False) and lazy.name not in self._gains:
+                self._gains[lazy.name] = lazy.run(lambda e: loudness_gain(e.synthesize(CALIBRATION)))
         threading.Thread(target=self._synth_loop, name="voice-tts", daemon=True).start()
         if play:
             import sounddevice as sd
@@ -180,7 +193,7 @@ class Speaker:
 
     def say(self, sentences: list[str], language: Optional[str] = None) -> None:
         with self._lock:
-            starting = not self._speaking and self._pending == 0
+            starting = self._quick_start and not self._speaking and self._pending == 0
             for i, s in enumerate(sentences):
                 parts = first_clause(s) if starting and i == 0 else [s]
                 for part in parts:
@@ -231,7 +244,11 @@ class Speaker:
                 continue
             lang = self._language(whole, forced)
             started = time.perf_counter()
+            lazy = self.engine_for(lang)
             try:
+                if lazy is not None and getattr(lazy, "streams", False):
+                    lazy.run(lambda e: self._stream_sentence(e, lazy.name, gen, sentence, lang, started))
+                    continue
                 audio, engine = self.synthesize(sentence, lang)
             except Exception as err:
                 with self._lock:
@@ -242,6 +259,25 @@ class Speaker:
             with self._lock:
                 if gen == self._gen:
                     self._audio.put(Spoken(gen, sentence, lang, engine, audio, round((time.perf_counter() - started) * 1000)))
+
+    def _stream_sentence(self, engine: Any, name: str, gen: int, sentence: str, lang: str, started: float) -> None:
+        """Queue a streaming engine's chunks as they come: the first starts the sentence, an empty last one ends it."""
+        if name not in self._gains:
+            self._gains[name] = loudness_gain(engine.synthesize(CALIBRATION))
+        gain = self._gains[name]
+        first_ms = None
+        for chunk in engine.stream(sentence, keep_going=lambda: gen == self._gen):
+            first = first_ms is None
+            if first:
+                first_ms = round((time.perf_counter() - started) * 1000)
+            with self._lock:
+                if gen != self._gen:
+                    return
+                piece = np.clip(chunk * gain, -0.98, 0.98).astype(np.float32)
+                self._audio.put(Spoken(gen, sentence, lang, name, piece, first_ms, first=first, last=False))
+        with self._lock:
+            if gen == self._gen:
+                self._audio.put(Spoken(gen, sentence, lang, name, np.zeros(0, np.float32), first_ms or 0, first=False, last=True))
 
     def next_block(self, frames: int) -> np.ndarray:
         """The next `frames` samples to play (silence when there's nothing). The output callback calls this; tests
@@ -262,8 +298,9 @@ class Speaker:
                     if not self._speaking:
                         self._speaking = True
                         events.append({"type": "speak_start", "t": time.time()})
-                    events.append({"type": "sentence", "text": nxt.text, "language": nxt.language, "engine": nxt.engine, "synth_ms": nxt.synth_ms})
-                    self.timeline.append(("start", time.perf_counter()))
+                    if nxt.first:
+                        events.append({"type": "sentence", "text": nxt.text, "language": nxt.language, "engine": nxt.engine, "synth_ms": nxt.synth_ms})
+                        self.timeline.append(("start", time.perf_counter()))
                 cur = self._current
                 take = min(frames - filled, cur.audio.size - self._pos)
                 out[filled : filled + take] = cur.audio[self._pos : self._pos + take]
@@ -271,8 +308,9 @@ class Speaker:
                 self._pos += take
                 if self._pos >= cur.audio.size:
                     self._current = None
-                    self._pending -= 1
-                    self.timeline.append(("end", time.perf_counter()))
+                    if cur.last:  # a sentence ends with its last piece (a stream's empty closing piece)
+                        self._pending -= 1
+                        self.timeline.append(("end", time.perf_counter()))
             if self._current is None and self._speaking and self._pending <= 0:
                 self._speaking = False
                 events.append({"type": "speak_end", "reason": "done", "t": time.time()})

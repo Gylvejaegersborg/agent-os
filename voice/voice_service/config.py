@@ -49,7 +49,15 @@ DEFAULTS: dict[str, Any] = {
     "tts": {
         # Speech back is an option, off by default: with it off, no TTS model is loaded.
         "enabled": False,
-        "en": {"engine": "kokoro", "model": "models/kokoro-v1.0.int8.onnx", "voices": "models/voices-v1.0.bin", "voice": "af_heart"},
+        # English: Gradium's Phonon 31M, default voice (the operator's pick by ear over Kokoro af_heart and Paradee),
+        # streamed. engine: kokoro is the alternative (voice null = af_heart; needs fetch_models.py --kokoro).
+        "en": {
+            "engine": "phonon-31m",
+            "voice": None,  # null = the engine's default; Phonon: Harper, Hadley, Easton, … (ptts.catalog_voices())
+            "quant": "q8",
+            "kokoro_model": "models/kokoro-v1.0.int8.onnx",
+            "kokoro_voices": "models/voices-v1.0.bin",
+        },
         # Norwegian: Piper's one Norwegian voice (Kokoro has none).
         "no": {"engine": "piper", "model": "models/piper/no/no_NO/talesyntese/medium/no_NO-talesyntese-medium.onnx"},
         "lang_model": "models/lid.176.ftz",  # fastText language ID, per sentence

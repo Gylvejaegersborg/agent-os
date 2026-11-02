@@ -6,9 +6,10 @@ warms up once at load so the first real request isn't the slow one.
   guess towards Norwegian.
 - EnglishStt: English only (phase 2), Phonon-2 through onnx-asr or Bark 3.0 Plus through sherpa-onnx. Both are
   fine-tunes of NVIDIA's Parakeet TDT 0.6B v3, so they share one slot and are A/B'd on the same clips.
-- KokoroTts: English speech back. PiperTts: Norwegian speech back (phase 3); Kokoro has no Norwegian voice.
-  Both resample to tts.sample_rate (24 kHz) and are loudness-matched (normalize), so a mixed reply can switch
-  engines between sentences on one open output device."""
+- PhononTts (Gradium's Phonon 31M, the default) or KokoroTts: English speech back. PiperTts: Norwegian speech
+  back (phase 3); neither English model has Norwegian. All resample to tts.sample_rate (24 kHz) and are
+  loudness-matched (normalize), so a mixed reply can switch engines between sentences on one open output
+  device. Phonon streams, so a sentence starts playing ~75 ms after it's handed over."""
 
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Union
+from typing import BinaryIO, Callable, Iterator, Union
 
 import numpy as np
 
@@ -239,6 +240,54 @@ class KokoroTts:
         return audio
 
 
+class PhononTts:
+    """Gradium's Phonon 31M (English, Apache 2.0) through its `ptts` runtime, q8. Chosen over Kokoro by the operator
+    by ear; on this PC it's ~6.5x real time (Kokoro ~2.4x) at ~230 MB, and it streams: the first 80 ms chunk is
+    out ~75 ms after the text goes in. The model comes from Hugging Face on first load (fetch_models.py --tts)."""
+
+    name = "phonon-31m"
+
+    def __init__(self, voice: str | None = None, quant: str = "q8", threads: int = 4, sample_rate: int = 24000) -> None:
+        import ptts
+
+        ptts.set_num_threads(threads)  # it takes every core otherwise
+        self._tts = ptts.TTS(lang="en", quant=quant, voice=voice or None)
+        self._rate = sample_rate
+        self._lock = threading.Lock()
+        self.last_ms: int | None = None
+        self.synthesize("Ready.")  # warm-up
+        self.last_ms = None
+
+    def _fit(self, audio: np.ndarray) -> np.ndarray:
+        audio = np.asarray(audio, np.float32).reshape(-1)
+        return resample(audio, self._tts.sample_rate, self._rate) if self._tts.sample_rate != self._rate else audio
+
+    def synthesize(self, text: str, voice: str | None = None, speed: float = 1.0) -> np.ndarray:
+        started = time.perf_counter()
+        with self._lock:
+            audio = self._fit(self._tts.synth(text))
+        self.last_ms = round((time.perf_counter() - started) * 1000)
+        return audio
+
+    def stream(self, text: str, keep_going: Callable[[], bool] = lambda: True) -> Iterator[np.ndarray]:
+        """The sentence's audio in chunks as they're made. Stops making more (and frees its threads) as soon as
+        keep_going() turns false — barge-in."""
+        started = time.perf_counter()
+        with self._lock:
+            s = self._tts.stream(text)
+            try:
+                first = True
+                for chunk in s:
+                    if first:
+                        self.last_ms = round((time.perf_counter() - started) * 1000)  # time to first audio
+                        first = False
+                    yield self._fit(chunk)
+                    if not keep_going():
+                        break
+            finally:
+                s.close()
+
+
 class PiperTts:
     name = "piper"
 
@@ -268,16 +317,19 @@ class PiperTts:
         return audio.astype(np.float32)
 
 
+def loudness_gain(audio: np.ndarray, target_db: float = -20.0) -> float:
+    """The gain that brings the voiced part's RMS to target_db dBFS (a stand-in for the spec's −20 LUFS; same idea
+    without a K-weighting filter)."""
+    voiced = audio[np.abs(audio) > 0.01] if audio.size else audio
+    rms = float(np.sqrt(np.mean(np.square(voiced)))) if voiced.size else 0.0
+    return 1.0 if rms < 1e-5 else 10 ** (target_db / 20) / rms
+
+
 def normalize(audio: np.ndarray, target_db: float = -20.0) -> np.ndarray:
-    """Loudness match between engines: RMS of the voiced part to target_db dBFS (a stand-in for the spec's
-    −20 LUFS; same idea without a K-weighting filter), peaks kept under 0.98."""
+    """Loudness match between engines (loudness_gain), peaks kept under 0.98."""
     if audio.size == 0:
         return audio
-    voiced = audio[np.abs(audio) > 0.01]
-    rms = float(np.sqrt(np.mean(np.square(voiced)))) if voiced.size else 0.0
-    if rms < 1e-5:
-        return audio
-    out = audio * (10 ** (target_db / 20) / rms)
+    out = audio * loudness_gain(audio, target_db)
     peak = float(np.abs(out).max())
     return (out * (0.98 / peak) if peak > 0.98 else out).astype(np.float32)
 

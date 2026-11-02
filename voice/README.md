@@ -9,7 +9,7 @@ Ctrl+Alt+B held ─▶ mic 16 kHz ─▶ Silero VAD ─▶ hold recorder ─┬�
                                                               └─▶ en ≥ 0.80 ? Phonon-2 : NB-Whisper ─▶ WS /v1/listen  {type: final, …}
                                                                                                   POST /v1/audio/transcriptions
 BaseSpace (Vite proxy /voice/*, adds the token) ◀── WS /v1/listen: dictation lands in the launcher (Alt+B)
-text ─▶ sentences ─▶ fastText per sentence ─▶ Kokoro (en) | Piper (no) ─▶ one queue ─▶ speakers   POST/WS /v1/speak
+text ─▶ sentences ─▶ fastText per sentence ─▶ Phonon 31M (en, streamed) | Piper (no) ─▶ one queue ─▶ speakers   POST/WS /v1/speak
                                                        (only with tts.enabled — off by default; Ctrl+Alt+B cuts it off)
 ```
 
@@ -107,7 +107,7 @@ these numbers. Phase 1's mic test (operator, Norwegian): ~2.7 s, text right in 5
 | the service, everything loaded | 1.17–1.22 GB |
 | **after idle unload** | **181 MB** |
 
-- *Idle unload* (`resources.idle_unload_min: 15`): NB-Whisper, the English engine and Kokoro are dropped after
+- *Idle unload* (`resources.idle_unload_min: 15`): NB-Whisper, the English engine and the speech-back voices are dropped after
   15 min unused; the VAD and language ID stay. Pressing push-to-talk (or, with the open mic, speech starting)
   reloads them in the background: both in ~3.2 s in parallel, so after a long idle the first sentence is ~1–3 s
   slower, the rest normal. Each model gives its memory back when dropped (lazy.py).
@@ -138,16 +138,27 @@ these numbers. Phase 1's mic test (operator, Norwegian): ~2.7 s, text right in 5
 
 **Phase 3 (bilingual speech back), only with `tts.enabled: true` (off by default):**
 - *Sentences:* replies are split as each sentence ends (`speech.py`), so a streamed reply starts speaking at its
-  first sentence; fragments under 4 words join the next one. A reply's first sentence starts with its first
-  clause when it has one (see below).
-- *A voice per sentence:* fastText lid.176 per sentence → Kokoro (`af_heart`, the operator's pick by ear) for
-  English, Piper `no_NO-talesyntese-medium` for everything else. Norwegian, Danish and Swedish count together:
-  fastText spreads a Norwegian sentence over all three, and with only the top one, "Jeg har lagt inn en
-  påminnelse…" stayed under 0.6 and was read by the English voice. Sentences under 5 words or under 0.6 keep the
-  previous sentence's voice; `language` in a request forces one. The spec's voice match (same gender and pitch)
-  was tried and passed on: the operator preferred `af_heart` to the four male Kokoro voices.
-- *One playback queue on this machine's speakers:* sentence N+1 is made while N plays; both voices are resampled
-  to 24 kHz and loudness-matched (RMS to −20 dBFS, a stand-in for −20 LUFS) on one output stream that stays open.
+  first sentence; fragments under 4 words join the next one.
+- *A voice per sentence:* fastText lid.176 per sentence → **Gradium's Phonon 31M** (default voice; Apache 2.0,
+  `ptts`) for English, Piper `no_NO-talesyntese-medium` for everything else. Norwegian, Danish and Swedish count
+  together: fastText spreads a Norwegian sentence over all three, and with only the top one, "Jeg har lagt inn
+  en påminnelse…" stayed under 0.6 and was read by the English voice. Sentences under 5 words or under 0.6 keep
+  the previous sentence's voice; `language` in a request forces one.
+- *The English voice, chosen by ear:* the operator listened to Kokoro `af_heart`, Paradee-8M `af_heart` and four
+  Phonon 31M voices on the same sentences and picked Phonon's default. Measured here (4 threads):
+
+  | | speed | first audio | RAM |
+  |---|---|---|---|
+  | Kokoro int8 `af_heart` (before) | 2.4x real time (1.5 s for a 3.7 s sentence) | whole sentence first | +532 MB |
+  | Paradee-8M v1.2 `af_heart` | ~40x real time | whole sentence first | +635 MB (spaCy) |
+  | **Phonon 31M q8** | ~6.5x real time | **~40 ms (streams)** | **+230 MB** |
+
+  `tts.en.engine: kokoro` still works (`fetch_models.py --kokoro`); for it, a reply's first sentence is spoken
+  from its first clause, which cut Kokoro's first sound from ~2.4 s to ~0.86 s. Paradee isn't wired in.
+- *One playback queue on this machine's speakers:* sentence N+1 is made while N plays, and Phonon's sentences
+  play chunk by chunk as they're made; both voices are resampled to 24 kHz and loudness-matched (RMS to −20 dBFS,
+  a stand-in for −20 LUFS; for a streaming voice, one gain measured on a calibration sentence at load) on one
+  output stream that stays open.
 - *Barge-in:* pressing push-to-talk while it talks stops the sound; the next 20 ms block is already silent. Live,
   twice: 4 ms from the press reaching the service to `speak_end`. Open-mic barge-in (`tts.barge_in_open_mic`) is
   off: the mic hears the speakers.
@@ -159,18 +170,15 @@ these numbers. Phase 1's mic test (operator, Norwegian): ~2.7 s, text right in 5
 
 | | |
 |---|---|
-| gaps between sentences | 0 ms, once 60 ms (spec: none over 150 ms), engine switches included |
+| gaps between sentences | 0 ms (spec: none over 150 ms), engine switches included |
 | first sound, reply starting in Norwegian | ~0.1 s (Piper: ~85 ms for a sentence) |
-| first sound, reply starting in English | ~0.86 s with the first-clause split; ~2.4 s without |
-| Kokoro int8 / fp32 on this CPU | 1.3 / 1.5 s for 3.7 s of speech: int8 isn't the slow part |
-| RAM with speech back on | ~1.46 GB loaded (Kokoro and Piper unload with the rest when idle) |
+| first sound, reply starting in English | **~40 ms** (Phonon 31M streaming), also on a fresh start |
+| speech back's RAM | +259 MB loaded (Phonon 31M and Piper; they unload with the rest when idle) |
 
-The spec's "first audio within ~500 ms" holds for Norwegian, not for English with Kokoro on this CPU. The spec's
-alternative, Gradium's Phonon 31M (`ptts` package), wasn't tried: installing an unvetted package needs the
-operator's go-ahead.
+The spec's "first audio within ~500 ms of the first sentence" now holds in both languages.
 
-**Not yet:** ≥ 95% routing (90% on the test set), English partials, Kokoro vs Phonon 31M, dictation reaching an
-agent and replies spoken by the HUD (hud/core's launcher AI mode; `speak()` in BaseSpace is ready for it).
+**Not yet:** ≥ 95% routing (90% on the test set), English partials, dictation reaching an agent and replies
+spoken by the HUD (hud/core's launcher AI mode; `speak()` in BaseSpace is ready for it).
 
 ## Set up (Windows)
 
@@ -181,7 +189,7 @@ uv venv --python 3.11
 uv pip install -r requirements.txt
 python fetch_models.py            # Silero VAD, NB-Whisper small, whisper-tiny, Phonon-2 (~1.7 GB download)
 python fetch_models.py --bark     # also Bark 3.0 Plus, only to A/B it against Phonon-2
-python fetch_models.py --tts      # also Kokoro, Piper (Norwegian) and fastText, only if you turn speech back on
+python fetch_models.py --tts      # also Phonon 31M (English), Piper (Norwegian) and fastText, only for speech back
 copy voice.example.yaml voice.yaml   # optional: pick the mic, tune the VAD, turn speech back on
 python run.py
 ```
@@ -223,8 +231,8 @@ push-to-talk pipeline and reports routing, word error rate and release → text 
 - Push-to-talk by default: nothing is transcribed unless the key is held.
 - Binds 127.0.0.1; `run.py` refuses any other host.
 - Speech back is off unless `tts.enabled: true`; with it off, no TTS model is loaded.
-- Below-normal process priority; 4 threads for NB-Whisper, Phonon-2 and Kokoro, 2 for language ID, 1 for the VAD.
+- Below-normal process priority; 4 threads for NB-Whisper, Phonon-2 and Phonon 31M, 2 for language ID, 1 for the VAD.
 - Both hotkeys are registered hotkeys, not keyboard hooks: no other keystroke ever reaches the service.
   Push-to-talk's release is read with GetAsyncKeyState on that one key, only while it's held.
 - Phonon-2 and Bark 3.0 Plus weights are CC BY 4.0 (Fermion Research / Conway Research, from NVIDIA's
-  Parakeet TDT 0.6B v3); their NOTICE files are kept in `models/`.
+  Parakeet TDT 0.6B v3); their NOTICE files are kept in `models/`. Phonon 31M is Apache 2.0 (Gradium).

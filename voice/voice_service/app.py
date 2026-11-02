@@ -3,7 +3,7 @@
 Routes:
   GET  /health                     loaded models, mode, mic, routing counts, RAM, last latencies
   POST /v1/audio/transcriptions    file upload → text; language "no"/"en", or auto (language ID picks the engine)
-  POST /v1/audio/speech            text → wav/pcm, a voice per sentence (Kokoro en, Piper no) — tts.enabled only
+  POST /v1/audio/speech            text → wav/pcm, a voice per sentence (Phonon 31M en, Piper no) — tts.enabled only
   POST /v1/speak                   text → spoken on this machine's speakers, sentence by sentence — tts.enabled only
   POST /v1/speak/stop              stop speaking now and drop the rest
   WS   /v1/speak                   stream text in ({"type": "text", "text": …}, then "end" or "cancel"), spoken as
@@ -32,7 +32,7 @@ from pydantic import BaseModel
 
 from .auth import has_token, load_token
 from .config import load_config, model_path
-from .engines import KokoroTts, PiperTts, to_pcm16, to_wav
+from .engines import KokoroTts, PhononTts, PiperTts, to_pcm16, to_wav
 from .hotkey import Hotkey
 from .lazy import Lazy, start_idle_watch
 from .router import MODES
@@ -96,14 +96,18 @@ def set_priority(level: str) -> None:
 def load_speech_back(cfg: dict[str, Any], idle_s: float) -> None:
     t = cfg["tts"]
     rate = t["sample_rate"]
-    factories = {
-        "en": (KokoroTts.name, lambda: KokoroTts(model_path(t["en"]["model"]), model_path(t["en"]["voices"]), t["en"]["voice"], sample_rate=rate)),
-        "no": (PiperTts.name, lambda: PiperTts(model_path(t["no"]["model"]), sample_rate=rate)),
-    }
+    en = t["en"]
+    if en["engine"] == "kokoro":
+        english = (KokoroTts.name, lambda: KokoroTts(model_path(en["kokoro_model"]), model_path(en["kokoro_voices"]), en.get("voice") or "af_heart", sample_rate=rate), False)
+    elif en["engine"] == "phonon-31m":
+        english = (PhononTts.name, lambda: PhononTts(en.get("voice"), quant=en.get("quant", "q8"), threads=cfg["resources"]["threads"], sample_rate=rate), True)
+    else:
+        raise ValueError(f"tts.en.engine is {en['engine']!r}: phonon-31m or kokoro")
+    factories = {"en": english, "no": (PiperTts.name, lambda: PiperTts(model_path(t["no"]["model"]), sample_rate=rate), False)}
     state.tts, state.tts_errors = {}, {}
-    for lang, (name, make) in factories.items():
+    for lang, (name, make, streams) in factories.items():
         t0 = time.perf_counter()
-        lazy = Lazy(name, make, idle_s)
+        lazy = Lazy(name, make, idle_s, streams=streams)
         try:
             lazy.load()
             state.tts[lang] = lazy
@@ -119,11 +123,13 @@ def load_speech_back(cfg: dict[str, Any], idle_s: float) -> None:
         detect = None
         print(f"[voice] no text language ID ({err}): every sentence keeps the request's or the last language")
     try:
+        # The first-clause start only helps an engine that can't stream (Kokoro); Phonon starts in ~75 ms anyway.
+        quick = not english[2]
         state.speaker = Speaker(
-            state.tts, SentenceLanguage(detect), sample_rate=rate, device=t.get("output_device"), emit=state.bus.emit, play=t.get("playback", True)
+            state.tts, SentenceLanguage(detect), sample_rate=rate, device=t.get("output_device"), emit=state.bus.emit, play=t.get("playback", True), quick_start=quick
         )
     except Exception as err:  # no output device: files from /v1/audio/speech still work
-        state.speaker = Speaker(state.tts, SentenceLanguage(detect), sample_rate=rate, emit=state.bus.emit, play=False)
+        state.speaker = Speaker(state.tts, SentenceLanguage(detect), sample_rate=rate, emit=state.bus.emit, play=False, quick_start=not english[2])
         state.tts_errors["playback"] = str(err)
         print(f"[voice] no speakers ({err}); /v1/audio/speech still works")
 

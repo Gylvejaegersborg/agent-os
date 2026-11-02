@@ -18,7 +18,7 @@ from voice_service.hotkey import parse as parse_hotkey  # noqa: E402
 from voice_service.lazy import Lazy  # noqa: E402
 from voice_service.router import Router  # noqa: E402
 from voice_service.segmenter import HoldRecorder, Segmenter  # noqa: E402
-from voice_service.speech import SentenceLanguage, SentenceSplitter, Speaker, first_clause, split_sentences  # noqa: E402
+from voice_service.speech import CALIBRATION, SentenceLanguage, SentenceSplitter, Speaker, first_clause, split_sentences  # noqa: E402
 
 import numpy as np  # noqa: E402
 
@@ -297,6 +297,56 @@ for _ in range(30):
     spk2.next_block(480)
 check([e["type"] for e in events].count("speak_end") == 1, "a sentence still being made doesn't end the speech early")
 check(Speaker({"no": slow}, SentenceLanguage(None), play=False).engine_for("en") is slow, "no English voice: the Norwegian one speaks it")
+
+
+class FakeStreamer(FakeVoice):
+    """Like Phonon 31M: stream() yields 80 ms chunks, a little slower than instantly."""
+
+    streams = True
+
+    def __init__(self, name, chunks):
+        super().__init__(name, 0.08)
+        self.chunks, self.made, self.closed = chunks, 0, False
+
+    def stream(self, text, keep_going=lambda: True):
+        self.said.append(text)
+        try:
+            for _ in range(self.chunks):
+                time.sleep(0.005)
+                self.made += 1
+                yield np.full(1920, 0.3, np.float32)
+                if not keep_going():
+                    break
+        finally:
+            self.closed = True
+
+
+events.clear()
+st = FakeStreamer("phonon-31m", chunks=10)
+spk3 = Speaker({"en": st}, SentenceLanguage(None, default="en"), emit=events.append, play=False, quick_start=False)
+spk3.say(["The masters will be ready on Thursday, after the label signs off."])
+time.sleep(0.03)
+first_block = spk3.next_block(480)
+check(np.any(first_block), "a streamed sentence starts playing before it's all made")
+time.sleep(0.15)
+played = np.concatenate([first_block] + [spk3.next_block(480) for _ in range(60)])
+voiced = np.flatnonzero(played)
+check(voiced.size == 10 * 1920 and voiced[-1] - voiced[0] + 1 == voiced.size, "…all its chunks play back to back, nothing lost, no gap")
+check([s for s in st.said if s != CALIBRATION] == ["The masters will be ready on Thursday, after the label signs off."], "quick_start off: a streaming engine gets the whole sentence (no first-clause split)")
+check(CALIBRATION in st.said and st.said.count(CALIBRATION) == 1, "a streaming voice's loudness is measured once, on a calibration sentence")
+kinds = [e["type"] for e in events]
+check(kinds.count("sentence") == 1 and kinds.count("speak_end") == 1 and kinds[-1] == "speak_end", "one sentence event per sentence, however many chunks; speak_end after the last")
+
+events.clear()
+long = FakeStreamer("phonon-31m", chunks=500)
+spk4 = Speaker({"en": long}, SentenceLanguage(None, default="en"), emit=events.append, play=False, quick_start=False)
+spk4.say(["A very long sentence that will be cut off by pressing push-to-talk."])
+time.sleep(0.05)
+spk4.next_block(480)
+spk4.stop("barge_in")
+time.sleep(0.1)
+check(long.closed and long.made < 500, f"barge-in stops a stream mid-sentence (made {long.made} of 500 chunks, then closed)")
+check(not np.any(np.concatenate([spk4.next_block(480) for _ in range(10)])), "…and nothing of it plays after the stop")
 
 print("-- config --")
 cfg = load_config(Path(tempfile.gettempdir()) / "does-not-exist.yaml")

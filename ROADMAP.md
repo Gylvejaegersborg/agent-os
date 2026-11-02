@@ -503,8 +503,9 @@ memory gate as everything else.
       ~1.2 GB loaded), idle CPU 0.04%. Phase 6: Ctrl+Alt+B push-to-talk
       (~0.1–0.5 s release → text), gateway token on every route, and
       BaseSpace's launcher takes the dictation (Vite proxy /voice/*).
-      Phase 3: speech back per sentence (Piper Norwegian, Kokoro
-      English), no gaps, Ctrl+Alt+B cuts it off; off by default. The
+      Phase 3: speech back per sentence (Piper Norwegian, Gradium's
+      Phonon 31M English, streamed: ~40 ms to first sound), no gaps,
+      Ctrl+Alt+B cuts it off; off by default. The
       operator's 60-clip test set routes 54/60 (90%; spec ≥ 95%), short
       English commands being the misses. Next: the launcher's AI mode /
       HUD sends dictation as a turn and speaks replies (hud/core).
