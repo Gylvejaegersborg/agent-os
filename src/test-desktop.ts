@@ -142,6 +142,36 @@ async function testSummary(): Promise<void> {
   assert(!/from \d{2}:\d{2}Z/.test(digest), "focus block times are local time, not UTC (no trailing Z)");
 }
 
+async function testServes(): Promise<void> {
+  // Runs after testSummary's snapshot: projects Sinnsyk + agent-os, goal "Release Sinnsyk single".
+  const seen: Record<string, unknown>[] = [];
+  const off = subscribeToEvent("desktop.focus", (_t, p) => void seen.push(p));
+  await recordDesktopBatch({ spans: [], focus: { app: "FL64.exe", title: "Sinnsyk.flp - FL Studio" } });
+  const f = getDesktopFocus();
+  assert(f?.serves?.kind === "project" && f.serves.id === "p1" && f.serves.title === "Sinnsyk", "a window matching a project carries serves {kind, id, title}");
+  assert((seen.at(-1) as any)?.serves?.id === "p1", "the desktop.focus bus event carries serves too");
+
+  await recordDesktopBatch({ spans: [], focus: { app: "chrome.exe", title: "Release Sinnsyk single - checklist" } });
+  assert(getDesktopFocus()?.serves?.id === "g1", "the most specific match wins: the goal's three words beat the project's one");
+
+  await recordDesktopBatch({ spans: [], focus: { app: "chrome.exe", title: "YouTube - Google Chrome" } });
+  assert(getDesktopFocus()?.serves === undefined, "a window that matches nothing has no serves");
+
+  // Same window, BaseSpace gains a project for it: the next report picks it up and publishes the change.
+  const before = seen.length;
+  await saveSnapshot({
+    schema: 1,
+    projects: [{ id: "p1", name: "Sinnsyk", status: "active" }, { id: "p3", name: "YouTube", status: "active" }],
+    goals: [{ id: "g1", title: "Release Sinnsyk single", status: "active" }],
+  });
+  await recordDesktopBatch({ spans: [], focus: { app: "chrome.exe", title: "YouTube - Google Chrome" } });
+  assert(getDesktopFocus()?.serves?.id === "p3" && seen.length === before + 1, "a new match for the same window is published once");
+  await recordDesktopBatch({ spans: [], focus: { app: "chrome.exe", title: "YouTube - Google Chrome" } });
+  assert(seen.length === before + 1, "…and not again while nothing changes");
+  assert(/serves project "YouTube"/.test(await renderDesktopReport(day)), "the desktop report's 'Right now' line names what the window serves");
+  off();
+}
+
 async function testGateway(): Promise<void> {
   const skillsDir = path.join(process.env.AGENT_OS_DATA_DIR!, "skills");
   const gw = await startGateway({
@@ -161,6 +191,15 @@ async function testGateway(): Promise<void> {
 
     const now = await fetch(`${url}/desktop/now`).then((r) => r.json() as Promise<any>);
     assert(now.focus?.app === "Obsidian.exe", "GET /desktop/now returns the current window");
+    assert(now.focus.serves === undefined, "…with no serves when the title matches nothing");
+
+    await fetch(`${url}/desktop/spans`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ spans: [], focus: { app: "FL64.exe", title: "Sinnsyk.flp - FL Studio" } }),
+    });
+    const matched = await fetch(`${url}/desktop/now`).then((r) => r.json() as Promise<any>);
+    assert(matched.focus?.serves?.kind === "project" && matched.focus.serves.id === "p1", "GET /desktop/now carries serves for a matching window");
 
     const sum = await fetch(`${url}/desktop/summary?day=${day}`).then((r) => r.json() as Promise<any>);
     assert(sum.summary.activeSec === 52 * 60 && typeof sum.digest === "string", "GET /desktop/summary returns the projection and the digest");
@@ -174,7 +213,7 @@ async function testGateway(): Promise<void> {
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "desktop_activity", arguments: { day } } }),
     }).then((r) => r.json() as Promise<any>);
     const text: string = mcp.result?.content?.[0]?.text ?? JSON.stringify(mcp);
-    assert(/Right now: Obsidian\.exe/.test(text) && /Desktop activity/.test(text), "the desktop_activity MCP tool answers with focus + digest");
+    assert(/Right now: FL64\.exe .*serves project "Sinnsyk"/.test(text) && /Desktop activity/.test(text), "the desktop_activity MCP tool answers with focus (and what it serves) + digest");
   } finally {
     await gw.stop();
   }
@@ -211,6 +250,7 @@ await testIngest();
 await testDevices();
 await testFocus();
 await testSummary();
+await testServes();
 await testGateway();
 
 if (failed) {

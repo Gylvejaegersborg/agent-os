@@ -35,7 +35,7 @@
 //      and model management" section for that future work).
 
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
-import type { ModelAdapter } from "../core/model.js";
+import { parseTurnImages, type ModelAdapter } from "../core/model.js";
 import type { Worker } from "../core/worker.js";
 import type { SkillRegistry } from "../core/skills.js";
 import {
@@ -199,6 +199,8 @@ export interface GatewayHandle {
   port: number;
   stop: () => Promise<void>;
 }
+
+const TURN_BODY_MAX_BYTES = 12 * 1024 * 1024;
 
 function readRequestBody(req: IncomingMessage, maxBytes = 1024 * 1024): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
@@ -1225,9 +1227,15 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         sendJson(res, 404, { error: `no such session: ${segments[1]}` });
         return;
       }
-      const body = await readRequestBody(req);
+      // Room for two screenshots at the limit (4 MB each is ~5.4 MB as base64); anything bigger reads as an empty body.
+      const body = await readRequestBody(req, TURN_BODY_MAX_BYTES);
       if (typeof body.userMessage !== "string" || !body.userMessage) {
-        sendJson(res, 400, { error: "userMessage (string) is required" });
+        sendJson(res, 400, { error: `userMessage (string) is required (a body over ${TURN_BODY_MAX_BYTES / 1024 / 1024} MB is refused)` });
+        return;
+      }
+      const images = parseTurnImages(body.images);
+      if (typeof images === "string") {
+        sendJson(res, 400, { error: images });
         return;
       }
       // Per-agent model preference (set via POST/PUT /agents) overrides
@@ -1254,6 +1262,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         // same as a Claude Code user flipping into plan mode for one
         // turn at a time.
         planMode: body.planMode === true,
+        ...(images.length ? { images } : {}),
       });
       sendJson(res, 200, result);
       return;

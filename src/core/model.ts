@@ -5,9 +5,50 @@
 // runnable with zero API keys; real adapters (Anthropic, OpenAI, etc.)
 // implement the exact same three-method interface.
 
+/** An image sent with one user message (a screenshot from the HUD), base64 without the data: prefix. */
+export interface ModelImage {
+  mediaType: "image/png" | "image/jpeg";
+  data: string;
+}
+
 export interface ModelMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
+  /** Only on user messages, and only for the turn they were sent with: images are never stored (see runTurn). */
+  images?: ModelImage[];
+}
+
+export const MAX_TURN_IMAGES = 2;
+export const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+
+/** Validates a turn's `images` (absent → none): at most MAX_TURN_IMAGES, png/jpeg only, each MAX_IMAGE_BYTES decoded
+ *  at most, and the bytes must start like the type they claim. Returns the images, or why they were refused. */
+export function parseTurnImages(raw: unknown): ModelImage[] | string {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) return "images must be an array of {mediaType, data}";
+  if (raw.length > MAX_TURN_IMAGES) return `at most ${MAX_TURN_IMAGES} images per turn`;
+  const out: ModelImage[] = [];
+  for (const [i, item] of raw.entries()) {
+    const r = (item ?? {}) as Record<string, unknown>;
+    if (r.mediaType !== "image/png" && r.mediaType !== "image/jpeg") return `images[${i}]: mediaType must be image/png or image/jpeg`;
+    if (typeof r.data !== "string" || !r.data || !/^[A-Za-z0-9+/]+={0,2}$/.test(r.data)) return `images[${i}]: data must be base64 (no data: prefix)`;
+    // Checked on the length before decoding, so an oversized image is never decoded at all.
+    if (Math.floor((r.data.length * 3) / 4) - (r.data.match(/=+$/)?.[0].length ?? 0) > MAX_IMAGE_BYTES) return `images[${i}]: over ${MAX_IMAGE_BYTES / 1024 / 1024} MB`;
+    const head = Buffer.from(r.data.slice(0, 16), "base64");
+    const isPng = head.subarray(0, 4).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    const isJpeg = head.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]));
+    if (r.mediaType === "image/png" ? !isPng : !isJpeg) return `images[${i}]: the data is not a ${r.mediaType === "image/png" ? "PNG" : "JPEG"}`;
+    out.push({ mediaType: r.mediaType, data: r.data });
+  }
+  return out;
+}
+
+/** What a model that can't see images gets instead, so it knows something was there and can say so. */
+export const NO_VISION_NOTE = "(a screenshot was attached, but this model can't see images)";
+
+/** The message text plus NO_VISION_NOTE when it carried images — for adapters that only take text. */
+export function textWithImageNote(m: ModelMessage): string {
+  return m.images?.length ? `${m.content}\n\n${NO_VISION_NOTE}` : m.content;
 }
 
 export interface ModelResponse {

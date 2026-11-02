@@ -35,6 +35,17 @@ gateway refuses any span kind other than `active`/`idle`.
 
 Check it: `http://127.0.0.1:8787/desktop/summary` (add `?day=YYYY-MM-DD`).
 
+## Serves
+
+The current window (`getDesktopFocus()`, `GET /desktop/now`, the
+`desktop.focus` bus event) carries `serves: {kind: "project" | "goal", id,
+title}` when its title matches a BaseSpace project or goal, by the same rule
+as the day summary below. One answer only, so the HUD can show it and focus a
+session on it: the name with the most significant words wins, a project
+before a goal on a tie. Re-matched on every sensor report, so a project added
+while the window stays open shows up on the next batch (and is published as
+a change).
+
 ## Projection
 
 `desktopDaySummary(day)`: active/idle time, app switches, time per app, top

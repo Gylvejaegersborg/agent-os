@@ -33,7 +33,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import os from "node:os";
 import { connectorGrantsFor } from "../connectors.js";
-import { MAX_CALLS_PER_REPLY, type ModelAdapter, type ModelCallOptions, type ModelMessage, type ModelResponse } from "../model.js";
+import { MAX_CALLS_PER_REPLY, type ModelAdapter, type ModelCallOptions, type ModelImage, type ModelMessage, type ModelResponse } from "../model.js";
 import { registryToolSpecs, type ToolSpec } from "./real.js";
 
 export interface ClaudeCliOptions {
@@ -276,10 +276,11 @@ function visiblePrefixLength(text: string): number {
  *  on purpose), but a connector tool is refused in non-interactive mode unless granted, so the ones the operator
  *  has enabled are granted here and the rest are withheld (connectors.ts). Agent-OS's own tools are described in
  *  the system prompt and used with a block, never as native calls. */
-export function claudeCliArgs(systemPrompt: string, model?: string, grants: { allow: string[]; deny: string[] } = { allow: [], deny: [] }): string[] {
+export function claudeCliArgs(systemPrompt: string, model?: string, grants: { allow: string[]; deny: string[] } = { allow: [], deny: [] }, streamInput = false): string[] {
   return [
     "-p",
     "--output-format", "stream-json",
+    ...(streamInput ? ["--input-format", "stream-json"] : []),
     "--verbose",
     "--include-partial-messages",
     "--tools", "",
@@ -290,6 +291,12 @@ export function claudeCliArgs(systemPrompt: string, model?: string, grants: { al
     "--system-prompt", systemPrompt,
     ...(model ? ["--model", model] : []),
   ];
+}
+
+/** stdin for `--input-format stream-json`: one user message, the images before the text (same block shape as the Messages API). */
+export function streamJsonInput(text: string, images: ModelImage[]): string {
+  const content = [...images.map((i) => ({ type: "image", source: { type: "base64", media_type: i.mediaType, data: i.data } })), { type: "text", text }];
+  return `${JSON.stringify({ type: "user", message: { role: "user", content } })}\n`;
 }
 
 export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter {
@@ -307,7 +314,10 @@ export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter 
     // cache can reuse the whole prefix (tools + persona + the other stable parts). What changes per turn (the conversation focus,
     // recalled memory) is last in `system`, so it only breaks the cache at the very end.
     const systemPrompt = [toolText, system].filter(Boolean).join("\n\n") || "You are a helpful assistant.";
-    const args = claudeCliArgs(systemPrompt, model, grants);
+    // Images can't go in a plain-text prompt, so a turn that has them sends stdin as one stream-json user message
+    // (the CLI's SDK input format): the image blocks, then the transcript as text. Without images it stays plain text.
+    const images = messages.flatMap((m) => (m.role === "user" ? (m.images ?? []) : []));
+    const args = claudeCliArgs(systemPrompt, model, grants, images.length > 0);
     // The CLI authenticates with its own login. ANTHROPIC_TOKEN is Agent-OS's
     // own variable for the direct-API path, not something the CLI reads —
     // dropped so it can't leak into the child's environment.
@@ -396,7 +406,7 @@ export function createClaudeCliModel(opts: ClaudeCliOptions = {}): ModelAdapter 
         // The child exiting early (bad flag, not logged in) closes stdin;
         // the close handler above reports why.
       });
-      child.stdin.end(renderTranscript(messages));
+      child.stdin.end(images.length ? streamJsonInput(renderTranscript(messages), images) : renderTranscript(messages));
     });
   }
 
