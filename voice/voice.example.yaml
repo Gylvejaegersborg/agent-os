@@ -14,10 +14,12 @@ vad:
   speech_pad_ms: 150
   preroll_ms: 300
   min_speech_ms: 250     # shorter is dropped (clicks, coughs)
+  speculative_ms: 250    # start transcribing after this much silence; 0 = wait for min_silence_ms
 
 stt:
   no: models/nb-whisper-small/ct2
   no_beam: 1
+  min_window_s: 10       # encode only this much of Whisper's 30 s window for short clips; 0 = always 30 s
 
 tts:
   enabled: false         # speech back; off by default. Needs: python fetch_models.py --tts

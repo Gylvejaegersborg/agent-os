@@ -15,7 +15,7 @@ DEFAULTS: dict[str, Any] = {
         "model": "models/silero_vad.onnx",
         "threshold": 0.5,
         "min_silence_ms": 600,
-        "speculative_ms": 250,  # used from phase 4
+        "speculative_ms": 250,  # start transcribing at this much silence; 0 = off
         "speech_pad_ms": 150,
         "preroll_ms": 300,
         "min_speech_ms": 250,
@@ -24,6 +24,8 @@ DEFAULTS: dict[str, Any] = {
         "no": "models/nb-whisper-small/ct2",
         "no_beam": 1,
         "min_chars": 2,
+        # Encode only as much of Whisper's 30 s window as the clip needs, at least this much (0 = full 30 s).
+        "min_window_s": 10,
     },
     "tts": {
         # Speech back is an option, off by default: with it off, no TTS model is loaded.
