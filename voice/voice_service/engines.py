@@ -25,10 +25,13 @@ class Transcript:
     took_ms: int
 
 
+SHORT_WINDOW_MARGIN_S = 1.0
+
+
 class NbWhisper:
     name = "nb-whisper-small"
 
-    def __init__(self, model_dir: Path, threads: int = 4, beam: int = 1, min_chars: int = 2) -> None:
+    def __init__(self, model_dir: Path, threads: int = 4, beam: int = 1, min_chars: int = 2, min_window_s: float = 10.0) -> None:
         from faster_whisper import WhisperModel
 
         if not model_dir.exists():
@@ -36,12 +39,50 @@ class NbWhisper:
         self._model = WhisperModel(str(model_dir), device="cpu", compute_type="int8", cpu_threads=threads)
         self._beam = beam
         self._min_chars = min_chars
+        # 0 turns the short window off (every clip padded to 30 s, as faster-whisper does).
+        self._min_window_s = min_window_s
+        tok = self._model.hf_tokenizer
+        self._prompt = [tok.token_to_id(t) for t in ("<|startoftranscript|>", "<|no|>", "<|transcribe|>", "<|notimestamps|>")]
         self._lock = threading.Lock()
         self.last_ms: int | None = None
         self.transcribe(np.zeros(16000, dtype=np.float32))  # warm-up
         self.last_ms = None
 
     def transcribe(self, audio: Union[np.ndarray, BinaryIO]) -> Transcript:
+        if not isinstance(audio, np.ndarray):
+            from faster_whisper.audio import decode_audio
+
+            audio = decode_audio(audio, sampling_rate=16000)
+        if self._min_window_s and audio.size / 16000 <= 30 - SHORT_WINDOW_MARGIN_S:
+            return self._transcribe_short(audio)
+        return self._transcribe_full(audio)
+
+    def _transcribe_short(self, audio: np.ndarray) -> Transcript:
+        """Encodes only as much of Whisper's 30 s window as the clip needs (at least min_window_s).
+        The encoder is ~85% of the time and its cost grows with the window, so a 3 s clip in a 10 s
+        window is ~4x faster than padded to 30 s, with the same text in our checks (whisper.cpp's
+        audio_ctx does the same). Shorter than ~10 s started changing words, hence the floor."""
+        import ctranslate2
+
+        started = time.perf_counter()
+        duration = audio.size / 16000
+        window = min(30.0, max(self._min_window_s, duration + SHORT_WINDOW_MARGIN_S))
+        frames = int(window * 100)  # 10 ms mel frames
+        with self._lock:
+            feats = self._model.feature_extractor(audio)[:, :frames]
+            if feats.shape[1] < frames:
+                feats = np.pad(feats, ((0, 0), (0, frames - feats.shape[1])))
+            enc = self._model.model.encode(ctranslate2.StorageView.from_array(np.ascontiguousarray(feats[None], dtype=np.float32)), to_cpu=False)
+            r = self._model.model.generate(enc, [self._prompt], beam_size=self._beam, max_length=224, return_scores=True)[0]
+        text = self._model.hf_tokenizer.decode(r.sequences_ids[0]).strip()
+        if len(text) < self._min_chars:
+            text = ""
+        conf = float(np.exp(r.scores[0])) if r.scores else None  # length-normalized log prob → 0–1
+        took = round((time.perf_counter() - started) * 1000)
+        self.last_ms = took
+        return Transcript(text=text, language="no", engine=self.name, confidence=conf, duration_s=round(duration, 2), took_ms=took)
+
+    def _transcribe_full(self, audio: np.ndarray) -> Transcript:
         started = time.perf_counter()
         with self._lock:
             segments, info = self._model.transcribe(

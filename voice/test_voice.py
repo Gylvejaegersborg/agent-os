@@ -70,6 +70,29 @@ check(frames(ends[1][2])[0] < 45 and frames(ends[1][2])[0] >= 45 - round(300 / F
 ev = run([0.9] * 10)
 check([e[1] for e in ev] == ["speech_start"], "speech still going at the end of input: no end event yet")
 
+print("-- speculation --")
+# 20 speech frames, then silence: pause at 250 ms (8 frames of 32 ms), end at 600 ms (19 frames)
+ev = run([0.1] * 5 + [0.9] * 20 + [0.1] * 25, speculative_ms=250)
+kinds = [e[1] for e in ev]
+check(kinds == ["speech_start", "pause", "speech_end"], "silence gives a pause at 250 ms before the end at 600 ms")
+pause, end = ev[1], ev[2]
+check(pause[0] == 24 + 8 and end[0] == 24 + 19, "the pause comes at 256 ms of silence, the end at 608 ms")
+check(pause[2] is not None and (pause[2].start_frame, pause[2].end_frame) == (end[2].start_frame, end[2].end_frame), "the pause's utterance is cut exactly like the end's, so its result can be used")
+check(frames(pause[2]) == frames(end[2]), "…same frames")
+
+ev = run([0.9] * 20 + [0.1] * 10 + [0.9] * 10 + [0.1] * 25, speculative_ms=250)
+kinds = [e[1] for e in ev]
+check(kinds == ["speech_start", "pause", "resume", "pause", "speech_end"], "speech after a pause gives resume, then a new pause")
+first_pause, last_pause, end = ev[1][2], ev[3][2], ev[4][2]
+check((first_pause.start_frame, first_pause.end_frame) != (end.start_frame, end.end_frame), "the first pause doesn't match the final utterance (it would miss the second part)")
+check((last_pause.start_frame, last_pause.end_frame) == (end.start_frame, end.end_frame), "the last pause does")
+
+ev = run([0.1] * 5 + [0.9] * 4 + [0.1] * 30, speculative_ms=250)
+check([e[1] for e in ev] == ["speech_start", "pause", "speech_end"] and ev[1][2] is None and ev[2][2] is None, "too-short speech: the pause carries no utterance either")
+
+ev = run([0.9] * 20 + [0.1] * 25)
+check("pause" not in [e[1] for e in ev], "speculative_ms 0 (the default for the class): no pause events")
+
 print("-- config --")
 cfg = load_config(Path(tempfile.gettempdir()) / "does-not-exist.yaml")
 check(cfg == DEFAULTS, "no file: the defaults")

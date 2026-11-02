@@ -54,7 +54,7 @@ def load(cfg: dict[str, Any]) -> None:
     state.cfg = cfg
     state.started = time.time()
     t0 = time.perf_counter()
-    state.stt = NbWhisper(model_path(cfg["stt"]["no"]), threads=r["threads"], beam=cfg["stt"]["no_beam"], min_chars=cfg["stt"]["min_chars"])
+    state.stt = NbWhisper(model_path(cfg["stt"]["no"]), threads=r["threads"], beam=cfg["stt"]["no_beam"], min_chars=cfg["stt"]["min_chars"], min_window_s=cfg["stt"]["min_window_s"])
     print(f"[voice] NB-Whisper loaded in {time.perf_counter() - t0:.1f}s")
     t = cfg["tts"]
     if t["enabled"]:
@@ -114,6 +114,7 @@ def health() -> dict[str, Any]:
             "device": state.mic.device_name if state.mic else None,
             "error": state.mic_error,
             "dropped_frames": state.mic.dropped_frames if state.mic else 0,
+            "speculation": state.mic.stats if state.mic else None,
         },
         "ram_mb": rss,
         "last_ms": {"stt": state.stt.last_ms if state.stt else None, "tts": state.tts.last_ms if state.tts else None},
