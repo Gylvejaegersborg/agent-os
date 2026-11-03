@@ -29,6 +29,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -418,6 +419,8 @@ class MicListener:
         self._emit(
             {
                 "type": "final",
+                # Every page that listens gets this; the one that claims the id (POST /v1/claim) acts on it.
+                "id": uuid.uuid4().hex,
                 "text": t.text,
                 "language": t.language,
                 "engine": t.engine,

@@ -11,6 +11,7 @@ Routes:
   WS   /v1/listen                  live events: ptt_start/ptt_end, speech_start/speech_end, final, mode,
                                    speak_start/sentence/speak_end, barge_in
   POST /v1/control                 {"mute": true|false, "mode": "auto"|"no"|"en"|"next", "ptt": true|false}
+  POST /v1/claim                   {"id": <a final's id>} → {"claimed": true} for the first caller only
 
 Every route but GET /health needs `Authorization: Bearer <the gateway token>` (auth.py).
 Barge-in: pressing push-to-talk while it speaks stops the sound and drops the rest (tts.barge_in_open_mic also
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Optional
@@ -440,6 +442,28 @@ async def speak_stream(ws: WebSocket) -> None:
     finally:
         sender.cancel()
         unsubscribe()
+
+
+class ClaimRequest(BaseModel):
+    id: str
+
+
+_claims: dict[str, float] = {}
+_claims_lock = threading.Lock()
+
+
+@app.post("/v1/claim")
+def claim(req: ClaimRequest) -> dict[str, Any]:
+    """First caller for a final's id gets it. Several BaseSpace pages hear the same push-to-talk (browser tabs, the
+    shell's launcher and dot windows); without this each sent it to the agent (5 copies, live). Kept 2 minutes."""
+    now = time.time()
+    with _claims_lock:
+        for k in [k for k, t in _claims.items() if now - t > 120]:
+            del _claims[k]
+        if req.id in _claims:
+            return {"claimed": False}
+        _claims[req.id] = now
+    return {"claimed": True}
 
 
 class ControlRequest(BaseModel):
