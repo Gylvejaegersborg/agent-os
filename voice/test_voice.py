@@ -15,7 +15,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from voice_service.auth import has_token, load_token  # noqa: E402
 from voice_service.config import DEFAULTS, load_config  # noqa: E402
 from voice_service.hotkey import parse as parse_hotkey  # noqa: E402
+from voice_service.engines import Transcript  # noqa: E402
 from voice_service.lazy import Lazy  # noqa: E402
+from voice_service.mic import MicListener  # noqa: E402
+from voice_service.stt import Detection  # noqa: E402
 from voice_service.router import Router  # noqa: E402
 from voice_service.segmenter import HoldRecorder, Segmenter  # noqa: E402
 from voice_service.speech import CALIBRATION, SentenceLanguage, SentenceSplitter, Speaker, first_clause, split_sentences  # noqa: E402
@@ -204,6 +207,81 @@ h2.set_preroll_probs([])
 for _ in range(10):
     h2.push([0.0], 0.95)
 check(h2.release() is not None, "speech from the first frame (nothing to trim before it)")
+
+print("-- English partials --")
+
+
+class FakeEn:
+    name = "fake-en"
+
+    def __init__(self):
+        self.calls = 0
+
+    def run(self, fn):
+        return fn(self)
+
+    def transcribe(self, audio):
+        self.calls += 1
+        return Transcript(text=f"words so far {audio.size // 16000}s {self.calls}", language="en", engine="fake-en", confidence=None, duration_s=audio.size / 16000, took_ms=1)
+
+
+class FakeStt:
+    def __init__(self, lang, mode="auto"):
+        self.router = Router(mode=mode, sticky_window_s=0)
+        self.en, self.lang = FakeEn(), lang
+
+    def prefetch(self):
+        pass
+
+    def detect(self, audio):
+        return Detection(self.lang, 0.95, 1)
+
+    def route(self, audio, detection=None, now=None):
+        return self.router.decide(self.lang, 0.95), None
+
+    def transcribe(self, audio, route):
+        return Transcript(text="final text", language=route.engine, engine="fake", confidence=None, duration_s=1, took_ms=1)
+
+
+class FakeVad:
+    def __call__(self, frame):
+        return 0.9
+
+    def reset(self):
+        pass
+
+
+def hold_and_collect(lang, mode="auto", seconds=2.0):
+    cfg = load_config(Path(tempfile.gettempdir()) / "does-not-exist.yaml")
+    cfg["mic"]["partial_ms"] = 60
+    mic = MicListener(cfg, FakeVad(), FakeStt(lang, mode))
+    got = []
+    mic.subscribe(got.append)
+    mic.start(use_device=False)
+    mic.ptt(True)
+    for _ in range(int(seconds * 1000 / 32)):
+        mic.feed(np.full(512, 0.1, np.float32))
+        time.sleep(0.004)
+    time.sleep(0.4)  # language ID and a few partial ticks
+    mic.ptt(False)
+    time.sleep(0.4)
+    mic.stop()
+    return got, mic
+
+
+got, mic = hold_and_collect("en")
+kinds = [e["type"] for e in got]
+partials = [e for e in got if e["type"] == "partial"]
+check(len(partials) >= 2 and [p["n"] for p in partials] == list(range(1, len(partials) + 1)), f"English hold: partials while held, numbered ({len(partials)})")
+check(kinds.index("ptt_end") > kinds.index("partial") and "partial" not in kinds[kinds.index("ptt_end"):], "no partial after the key is let go")
+check(kinds[-1] == "final" and got[-1]["text"] == "final text", "the final comes last and replaces them")
+check(all(p["language"] == "en" and p["text"] for p in partials), "partials carry English text")
+got, _ = hold_and_collect("no")
+check(not any(e["type"] == "partial" for e in got) and any(e["type"] == "final" for e in got), "Norwegian hold: no partials, just the final")
+got, _ = hold_and_collect("no", mode="en")
+check(any(e["type"] == "partial" for e in got), "mode en: partials without waiting for language ID")
+got, _ = hold_and_collect("en", mode="no")
+check(not any(e["type"] == "partial" for e in got), "mode no: never partials")
 
 print("-- auth --")
 check(has_token("Bearer s3cret-token-0123456789", "s3cret-token-0123456789"), "the right token passes")

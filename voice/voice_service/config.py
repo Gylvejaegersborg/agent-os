@@ -78,6 +78,10 @@ DEFAULTS: dict[str, Any] = {
         "trigger": "push_to_talk",
         "ptt_key": "ctrl+alt+b",
         "ptt_max_s": 120,  # a key stuck down stops recording after this
+        # Live English text while push-to-talk is held: the hold so far re-transcribed this often (mic.py).
+        "partials": True,
+        "partial_ms": 500,
+        "partial_max_s": 10,  # longer holds keep their last partial until the final (the cost grows with length)
     },
     # Every route but GET /health needs the Agent-OS gateway's token (auth.py says why). Relative to voice/.
     "auth": {"enabled": True, "token_file": "../data/gateway-token"},

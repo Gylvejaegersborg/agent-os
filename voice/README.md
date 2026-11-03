@@ -24,7 +24,14 @@ with English words in Norwegian speech), Kokoro for English speech back, `/healt
 - *Speculative transcription.* At `vad.speculative_ms` (250 ms) of silence, the utterance so far is queued.
   If the silence reaches 600 ms, that same utterance is final and its text is usually ready; if speech comes
   back, the result is dropped. Final utterances are never dropped from the queue.
-- Warm-up at load was already in phase 1. English partials aren't built yet.
+- Warm-up at load was already in phase 1.
+- *English partials* (`mic.partials`, with push-to-talk): once early language ID says English (≥ 0.80, 1 s in) or
+  the mode is en, the hold so far is re-transcribed with Phonon-2 every `partial_ms` (500 ms; one run at a time)
+  and sent as `{type: "partial", text, n}` on `/v1/listen`; the final replaces them. Your 13.6 s test clip gave a
+  growing line every ~0.8 s ("Here's the plan for the release." → "… The single goes out first." → …); runs
+  take 0.2–0.7 s. They stop growing after `partial_max_s` (10 s), as each run re-reads the whole hold. The final
+  isn't held up: Phonon-2's onnxruntime session runs a partial and the final side by side (measured: release →
+  final the same with partials on and off). None for Norwegian: NB-Whisper is too slow to repeat.
 
 **Phase 2 (bilingual speech-to-text):**
 - *Language ID:* vanilla whisper-tiny (int8; NB-Whisper's fine-tune pulls every guess towards Norwegian), on a
@@ -177,7 +184,7 @@ these numbers. Phase 1's mic test (operator, Norwegian): ~2.7 s, text right in 5
 
 The spec's "first audio within ~500 ms of the first sentence" now holds in both languages.
 
-**Not yet:** ≥ 95% routing (90% on the test set), English partials, dictation reaching an agent and replies
+**Not yet:** ≥ 95% routing (90% on the test set), dictation reaching an agent and replies
 spoken by the HUD (hud/core's launcher AI mode; `speak()` in BaseSpace is ready for it).
 
 ## Set up (Windows)

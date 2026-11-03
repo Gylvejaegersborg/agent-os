@@ -58,6 +58,8 @@ def main() -> None:
     got = threading.Event()
 
     def on(event: dict) -> None:
+        if event["type"] == "partial":
+            print(f"   partial {event['n']} ({event['audio_s']} s in, {event['transcribe_ms']} ms): {event['text']}")
         if event["type"] == "final":
             finals.append(event)
             got.set()
