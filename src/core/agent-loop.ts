@@ -15,7 +15,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { appendEvent, project } from "./eventlog.js";
 import { publishEvent } from "./eventbus.js";
-import { MAX_CALLS_PER_REPLY, type ModelAdapter, type ModelMessage, type ToolSpec } from "./model.js";
+import { MAX_CALLS_PER_REPLY, type ModelAdapter, type ModelImage, type ModelMessage, type ToolSpec } from "./model.js";
 import type { Worker } from "./worker.js";
 import { fireHook } from "./hooks.js";
 import { generateId } from "./id.js";
@@ -132,7 +132,13 @@ export interface RunTurnOptions {
    *  overrides it. Default false/omitted — every existing caller's
    *  behavior is unchanged. */
   planMode?: boolean;
+  /** Images sent with this user message (a HUD screenshot). They reach the model on every hop of THIS turn and are
+   *  never stored: the event log, history, hooks, the bus and Hindsight only ever see the text with IMAGE_MARKER. */
+  images?: ModelImage[];
 }
+
+/** What stands in for a turn's images everywhere they're not kept. */
+export const IMAGE_MARKER = " [screenshot]";
 
 /** Tools plan mode blocks outright, regardless of what Layer A's
  *  PermissionPolicy would otherwise decide. shell/edit_file/write_file
@@ -778,7 +784,11 @@ function offeredTools(
 }
 
 export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
-  const { sessionId, agentId, userMessage, model, worker, skills, enableSubagents, enableMemoryNominations, enableArtifacts, enableBaseSpace, sandboxPolicy, planMode } = opts;
+  const { sessionId, agentId, model, worker, skills, enableSubagents, enableMemoryNominations, enableArtifacts, enableBaseSpace, sandboxPolicy, planMode } = opts;
+  const images = opts.images?.length ? opts.images : undefined;
+  // From here on the user's message is the marked text — every write below (log, hooks, bus, Hindsight) gets the
+  // marker, never the bytes. The images themselves only live in `images`, for this call.
+  const userMessage = images ? `${opts.userMessage}${IMAGE_MARKER}` : opts.userMessage;
   const injectMemory = opts.injectMemory ?? true;
   const maxHops = opts.maxToolHops ?? 3;
 
@@ -886,6 +896,11 @@ export async function runTurn(opts: RunTurnOptions): Promise<AgentTurnResult> {
       break;
     }
     const history = await getModelFacingHistory(sessionId);
+    if (images) {
+      // Every hop, not just the first: after a tool call the model still needs to see what it was asked about.
+      const at = history.map((m) => m.role === "user" && m.content === userMessage).lastIndexOf(true);
+      if (at !== -1) history[at] = { ...history[at]!, images };
+    }
     const planModeText = planMode
       ? "PLAN MODE IS ACTIVE: you can inspect (read_file, shell commands that only read/list, skill) but calling shell/edit_file/write_file/subagent " +
         "will be blocked outright by the harness regardless of anything else — this is not a suggestion you can reason your way around. Investigate, " +

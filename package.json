@@ -62,6 +62,7 @@
     "team": "tsc -b && node dist/team-cli.js",
     "typecheck": "tsc -b --noEmit",
     "test-desktop": "tsc -b && node dist/test-desktop.js",
+    "test-images": "tsc -b && node dist/test-images.js",
     "test-desktop-learning": "tsc -b && node dist/test-desktop-learning.js",
     "test-cancel-inflight": "tsc -b && node dist/test-cancel-inflight.js",
     "test-flow-proposals": "tsc -b && node dist/test-flow-proposals.js",

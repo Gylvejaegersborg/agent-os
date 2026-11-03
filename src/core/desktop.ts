@@ -43,6 +43,8 @@ export interface DesktopFocus {
   title: string;
   since: string;
   device?: string;
+  /** The BaseSpace project or goal this window's title matches (same rule as the day summary's byWork). */
+  serves?: { kind: "project" | "goal"; id: string; title: string };
 }
 
 /** A device name is a label: short, plain characters only. */
@@ -140,13 +142,19 @@ export async function recordDesktopBatch(body: Record<string, unknown>): Promise
 
   const f = body.focus as Record<string, unknown> | undefined;
   if (f && typeof f.app === "string" && f.app) {
+    const title = String(f.title ?? "").slice(0, MAX_TITLE);
+    // Matched on every report, not only when the window changes: a project added in BaseSpace while the window
+    // stays open should show up on the next batch.
+    const serves = servesFor(title, await workCandidates());
     const next: DesktopFocus = {
       app: f.app.slice(0, MAX_APP),
-      title: String(f.title ?? "").slice(0, MAX_TITLE),
+      title,
       since: typeof f.since === "string" && !Number.isNaN(Date.parse(f.since)) ? f.since : new Date(now).toISOString(),
       ...(device ? { device } : {}),
+      ...(serves ? { serves } : {}),
     };
-    const changed = !currentFocus || currentFocus.app !== next.app || currentFocus.title !== next.title;
+    const changed =
+      !currentFocus || currentFocus.app !== next.app || currentFocus.title !== next.title || servesKey(currentFocus) !== servesKey(next);
     currentFocus = next;
     // Only a CHANGE is published — the bus event-sources every publish, and
     // a repeat of the same window every 15s would just be noise there.
@@ -265,6 +273,36 @@ export function titleMatches(title: string, name: string): boolean {
   return need.every((t) => have.has(t));
 }
 
+type WorkCandidate = { kind: "project" | "goal"; id: string; name: string };
+
+/** The projects and goals in the last BaseSpace snapshot, as window titles are matched against them. */
+async function workCandidates(): Promise<WorkCandidate[]> {
+  const snap = await loadSnapshot().catch(() => undefined);
+  return [
+    ...(Array.isArray(snap?.projects) ? snap!.projects : []).map((p: any) => ({ kind: "project" as const, id: String(p.id), name: String(p.name ?? "") })),
+    ...(Array.isArray(snap?.goals) ? snap!.goals : []).map((g: any) => ({ kind: "goal" as const, id: String(g.id), name: String(g.title ?? "") })),
+  ];
+}
+
+/** The one project/goal a window serves. The day summary counts a window toward every match, but the HUD can show
+ *  (and focus a session on) only one: the most specific name wins — most significant words — and a project before
+ *  a goal on a tie, since the project is the concrete work in front of the operator. */
+export function servesFor(title: string, candidates: WorkCandidate[]): DesktopFocus["serves"] {
+  let best: WorkCandidate | undefined;
+  let bestWords = 0;
+  for (const c of candidates) {
+    if (!titleMatches(title, c.name)) continue;
+    const words = significantTokens(c.name).length;
+    if (!best || words > bestWords || (words === bestWords && best.kind === "goal" && c.kind === "project")) {
+      best = c;
+      bestWords = words;
+    }
+  }
+  return best ? { kind: best.kind, id: best.id, title: best.name } : undefined;
+}
+
+const servesKey = (f: DesktopFocus) => (f.serves ? `${f.serves.kind}:${f.serves.id}` : "");
+
 export interface DesktopDaySummary {
   day: string;
   activeSec: number;
@@ -318,11 +356,7 @@ export async function desktopDaySummary(day: string): Promise<DesktopDaySummary>
   }
   flush();
 
-  const snap = await loadSnapshot().catch(() => undefined);
-  const candidates: { kind: "project" | "goal"; id: string; name: string }[] = [
-    ...(Array.isArray(snap?.projects) ? snap!.projects : []).map((p: any) => ({ kind: "project" as const, id: String(p.id), name: String(p.name ?? "") })),
-    ...(Array.isArray(snap?.goals) ? snap!.goals : []).map((g: any) => ({ kind: "goal" as const, id: String(g.id), name: String(g.title ?? "") })),
-  ];
+  const candidates = await workCandidates();
   const byWork = new Map<string, { kind: "project" | "goal"; id: string; name: string; sec: number }>();
   let unmatchedSec = 0;
   for (const s of active) {
@@ -386,6 +420,7 @@ export function renderDesktopDigest(s: DesktopDaySummary): string {
 export async function renderDesktopReport(day?: string): Promise<string> {
   const d = day && /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : localDay(new Date());
   const now = getDesktopFocus();
-  const head = now ? `Right now: ${now.app} "${now.title}" (since ${now.since}).\n` : "";
+  const serves = now?.serves ? `, serves ${now.serves.kind} "${now.serves.title}"` : "";
+  const head = now ? `Right now: ${now.app} "${now.title}" (since ${now.since}${serves}).\n` : "";
   return head + renderDesktopDigest(await desktopDaySummary(d));
 }

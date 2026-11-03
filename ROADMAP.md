@@ -133,10 +133,24 @@ checked — see the correction below.
       closed — `shell`/`skill`/`subagent`/`nominate-memory`/
       `record-artifact`/`read_file`/`edit_file`/`write_file`, nothing
       pluggable in from an external server. **[core]**
-- [ ] **Multimodal input.** The Workbench chat is text-only — no
-      image/screenshot attachment support in `useAgentOsChat`/
-      `ConversationPane`, and no corresponding support in `model.ts`'s
-      `ModelMessage`. **[core]** **[UI]**
+- [x] **Multimodal input — core.** `ModelMessage.images` (png/jpeg, base64,
+      user messages only); `POST /sessions/:id/turns` takes `images` (≤ 2,
+      ≤ 4 MB decoded each, bytes must match the type; 400 otherwise). They
+      reach the model on every hop of that one turn and are never stored:
+      the event log, history, hooks, the bus and Hindsight get the text with
+      ` [screenshot]`. Adapters: Anthropic (image blocks, `complete` and
+      streaming), OpenAI (`image_url` data URLs), Ollama (`image_url` on its
+      OpenAI-compatible endpoint, only when `/api/show` lists `vision`; a
+      text model gets the text plus "(a screenshot was attached, but this
+      model can't see images)"), Claude CLI (`--input-format stream-json`
+      with image blocks — built from the CLI's documented SDK input format
+      and tested against a fake CLI, not yet run against a live one). The
+      stub model ignores images. OpenAI-compatible servers whose model can't
+      take images will answer with their own error. Tests: `test-images`.
+      **[core]**
+- [ ] **Multimodal input — UI.** No image/screenshot attachment in
+      `useAgentOsChat`/`ConversationPane` yet; the HUD is the first sender.
+      **[UI]**
 - [x] **Cancellation preempts an in-flight step.** `cancelSession()` fires the
       running turn's `AbortController` (`session.ts`); the signal reaches the
       Anthropic/OpenAI/Ollama fetches, kills the Claude CLI child process and

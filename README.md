@@ -331,10 +331,26 @@ turns back into a normal tool call — so plan mode, permissions, hooks,
 approvals and the sandbox all still apply. This is the same way Orca and
 Paperclip use a Claude subscription: through Anthropic's own CLI rather
 than by sending the subscription's token to the API from a third-party app
-(which is what the older `ANTHROPIC_TOKEN` path does). `CLAUDE_CLI_PATH`
+(which is what the older `ANTHROPIC_TOKEN` path does). A turn with images
+(see "Images in a turn" below) switches that one call to `--input-format stream-json`: stdin is a
+single user message with the image blocks, then the transcript. `CLAUDE_CLI_PATH`
 overrides where the CLI is; `AGENT_OS_CLAUDE_CLI_TIMEOUT_MS` (default
 180000) caps one call. `npm run test-model-router` covers it with a fake
 CLI; it was also run live against a logged-in CLI.
+
+**Images in a turn** (a HUD screenshot). `POST /sessions/:id/turns` takes an
+optional `images: [{mediaType: "image/png" | "image/jpeg", data: <base64>}]`
+— at most 2, at most 4 MB decoded each, and the bytes must be the type they
+claim; anything else is a 400. The images reach the model on every hop of
+that one turn and are never written anywhere: the event log, session
+history, hooks, the bus and Hindsight get the message text with
+` [screenshot]` appended instead. What each provider does with them:
+Anthropic — image content blocks before the text; OpenAI — `image_url` data
+URLs; Ollama — the same on its OpenAI-compatible endpoint, but only when
+`/api/show` lists `vision` for the model (a text model gets the text plus
+"(a screenshot was attached, but this model can't see images)"); Claude CLI —
+stream-json input with image blocks (tested against a fake CLI; not yet
+checked against a live one). `npm run test-images`.
 
 **What a call costs, and what keeps it down.** Every model call resends the
 whole system prompt, and through the CLI there's no prompt caching — so the

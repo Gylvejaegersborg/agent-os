@@ -11,7 +11,7 @@
 // an oversight.
 
 import { listToolDefinitions, toToolSpec } from "../tool-registry.js";
-import type { ModelAdapter, ModelCallOptions, ModelMessage, ModelResponse, ToolSpec } from "../model.js";
+import { textWithImageNote, type ModelAdapter, type ModelCallOptions, type ModelImage, type ModelMessage, type ModelResponse, type ToolSpec } from "../model.js";
 import { appendEvent, project } from "../eventlog.js";
 import { claudeCliAvailable, createClaudeCliModel } from "./claude-cli.js";
 
@@ -92,17 +92,35 @@ function toAnthropicMessages(messages: ModelMessage[]): { system?: string; messa
   // keep the model's tool_use blocks, and a tool_result block without its
   // matching tool_use id is rejected by the API (400). Consecutive
   // same-role messages are merged so roles always alternate.
-  const rest: { role: "user" | "assistant"; content: string }[] = [];
+  // A merge keeps the images: they go before all of the merged text.
+  const rest: { role: "user" | "assistant"; content: string; images: ModelImage[] }[] = [];
   for (const m of messages) {
     if (m.role === "system") continue;
     const role = m.role === "assistant" ? "assistant" : "user";
     const content = m.role === "tool" ? `Tool result:\n${m.content}` : m.content;
+    const images = m.role === "user" ? (m.images ?? []) : [];
     const last = rest[rest.length - 1];
-    if (last && last.role === role) last.content += `\n\n${content}`;
-    else rest.push({ role, content });
+    if (last && last.role === role) {
+      last.content += `\n\n${content}`;
+      last.images.push(...images);
+    } else rest.push({ role, content, images: [...images] });
   }
-  if (rest[0]?.role === "assistant") rest.unshift({ role: "user", content: "(conversation continues)" });
-  return { system, messages: rest };
+  if (rest[0]?.role === "assistant") rest.unshift({ role: "user", content: "(conversation continues)", images: [] });
+  return {
+    system,
+    messages: rest.map(({ role, content, images }) => ({
+      role,
+      content: images.length
+        ? [...images.map((i) => ({ type: "image", source: { type: "base64", media_type: i.mediaType, data: i.data } })), { type: "text", text: content }]
+        : content,
+    })),
+  };
+}
+
+/** OpenAI-style content (OpenAI, and Ollama's OpenAI-compatible endpoint): a data URL per image, then the text. */
+function toOpenAiContent(m: ModelMessage): string | unknown[] {
+  if (m.role !== "user" || !m.images?.length) return m.content;
+  return [...m.images.map((i) => ({ type: "image_url", image_url: { url: `data:${i.mediaType};base64,${i.data}` } })), { type: "text", text: m.content }];
 }
 
 export function createAnthropicModel(opts: AnthropicOptions): ModelAdapter {
@@ -284,7 +302,7 @@ export function createOpenAiModel(opts: OpenAiOptions): ModelAdapter {
     async complete(messages: ModelMessage[], callOpts?: ModelCallOptions): Promise<ModelResponse> {
       const openAiMessages = messages.map((m) => ({
         role: m.role === "tool" ? "user" : m.role, // scaffold-level simplification
-        content: m.content,
+        content: toOpenAiContent(m),
       }));
 
       const body: Record<string, unknown> = { model, messages: openAiMessages };
@@ -388,6 +406,31 @@ export async function fetchWithOllamaRetry(baseUrl: string, init: RequestInit, m
   );
 }
 
+const ollamaVision = new Map<string, boolean>();
+
+/** Whether an Ollama model takes images: /api/show lists "vision" in its capabilities. Asked once per model. When
+ *  Ollama can't say (an older server with no capabilities field, or the call fails) the images are sent anyway. */
+export async function ollamaSeesImages(baseUrl: string, model: string): Promise<boolean> {
+  const key = `${baseUrl}|${model}`;
+  const known = ollamaVision.get(key);
+  if (known !== undefined) return known;
+  let sees = true;
+  try {
+    const res = await fetch(baseUrl.replace(/\/v1\/chat\/completions$/, "/api/show"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model }),
+      signal: AbortSignal.timeout(3000),
+    });
+    const caps = res.ok ? ((await res.json()) as { capabilities?: unknown }).capabilities : undefined;
+    if (Array.isArray(caps)) sees = caps.includes("vision");
+  } catch {
+    // can't tell: send them
+  }
+  ollamaVision.set(key, sees);
+  return sees;
+}
+
 /** Ollama's OpenAI-compatible endpoint (/v1/chat/completions) — same
  *  request/response shape as createOpenAiModel above, no API key needed
  *  since it's a local (or self-hosted) server. This is the adapter you
@@ -399,13 +442,20 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
   const model = opts.model ?? process.env.OLLAMA_MODEL ?? "llama3.2";
   const baseUrl = opts.baseUrl ?? "http://localhost:11434/v1/chat/completions";
 
+  // The OpenAI-compatible endpoint takes images as image_url data URLs (the `images` field is only on Ollama's native
+  // /api/chat). Only a vision model gets them; a text model gets the note instead of an error or a silent drop.
+  const toOllamaMessages = async (messages: ModelMessage[]) => {
+    const sees = messages.some((m) => m.images?.length) ? await ollamaSeesImages(baseUrl, model) : true;
+    return messages.map((m) => ({
+      role: m.role === "tool" ? "user" : m.role,
+      content: sees ? toOpenAiContent(m) : textWithImageNote(m),
+    }));
+  };
+
   return {
     id: `ollama:${model}`,
     async complete(messages: ModelMessage[], callOpts?: ModelCallOptions): Promise<ModelResponse> {
-      const ollamaMessages = messages.map((m) => ({
-        role: m.role === "tool" ? "user" : m.role,
-        content: m.content,
-      }));
+      const ollamaMessages = await toOllamaMessages(messages);
 
       const body: Record<string, unknown> = { model, messages: ollamaMessages, stream: false };
       const tools = callOpts?.tools ?? opts.tools ?? registryToolSpecs();
@@ -451,10 +501,7 @@ export function createOllamaModel(opts: OllamaOptions = {}): ModelAdapter {
     // assumption the non-streaming path above makes via `tool_calls?.[0]`),
     // so only index 0 is tracked.
     async completeStream(messages: ModelMessage[], onDelta: (deltaText: string) => void, callOpts?: ModelCallOptions): Promise<ModelResponse> {
-      const ollamaMessages = messages.map((m) => ({
-        role: m.role === "tool" ? "user" : m.role,
-        content: m.content,
-      }));
+      const ollamaMessages = await toOllamaMessages(messages);
 
       const body: Record<string, unknown> = { model, messages: ollamaMessages, stream: true };
       const tools = callOpts?.tools ?? opts.tools ?? registryToolSpecs();
