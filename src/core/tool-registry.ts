@@ -117,6 +117,32 @@ export function resetToolRegistry(): void {
 
 export const BUILTIN_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
+    name: "ui.snapshot",
+    description: "Reads the semantic UI snapshot exposed to the browser UI SDK bridge.",
+    inputSchema: {},
+    timeoutMs: 30000,
+  },
+  {
+    name: "ui.query",
+    description: "Queries visible or closed UI components through the browser UI SDK bridge.",
+    inputSchema: {
+      text: { type: "string", description: "Optional component or row text to match." },
+      within: { type: "string", description: "Optional list/component name to search within." },
+      kind: { type: "string", description: "Optional component kind." },
+      closed: { type: "boolean", description: "Whether closed tabs and sections may be inspected." },
+    },
+    timeoutMs: 30000,
+  },
+  {
+    name: "ui.act",
+    description: "Requests an agent-originated mutation on a browser UI SDK component. Requires human approval.",
+    inputSchema: {
+      steps: { type: "array", required: true, description: "Ordered UI SDK agent steps.", items: { type: "object" } },
+    },
+    timeoutMs: 60000,
+    requiresApproval: true,
+  },
+  {
     name: "shell",
     description: "Runs a shell command through the session's configured Worker.",
     inputSchema: { command: { type: "string", required: true, description: "The shell command to execute." } },

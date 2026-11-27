@@ -35,6 +35,7 @@
 //      and model management" section for that future work).
 
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import * as path from "node:path";
 import { parseTurnImages, type ModelAdapter } from "../core/model.js";
 import type { Worker } from "../core/worker.js";
 import type { SkillRegistry } from "../core/skills.js";
@@ -150,6 +151,11 @@ import {
   localDay,
   transitionTask,
   flowStepExecutions,
+  generateId,
+  requestUi,
+  respondUi,
+  startHarnessRefinement,
+  promoteHarnessCandidate,
 } from "../core/index.js";
 import { checkPathSandbox } from "../core/permissions.js";
 import { runReview } from "./review-loop.js";
@@ -201,6 +207,7 @@ export interface GatewayHandle {
 }
 
 const TURN_BODY_MAX_BYTES = 12 * 1024 * 1024;
+const harnessActiveTurns = new Set<string>();
 
 function readRequestBody(req: IncomingMessage, maxBytes = 1024 * 1024): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
@@ -286,6 +293,14 @@ function withCors(req: IncomingMessage, res: ServerResponse): boolean {
  *  startWebhookServer). */
 export function startGateway(deps: GatewayDeps, port = 0): Promise<GatewayHandle> {
   return new Promise((resolve) => {
+    const refinement = process.env.AGENT_OS_HARNESS_REFINEMENT === "off"
+      ? undefined
+      : startHarnessRefinement({
+          dataDir: process.env.AGENT_OS_DATA_DIR ?? path.join(process.cwd(), "data"),
+          fallbackCadenceMs: Number(process.env.AGENT_OS_HARNESS_CADENCE_MS ?? 30 * 60 * 1000),
+          idleCpuLimit: Number(process.env.AGENT_OS_HARNESS_IDLE_CPU ?? 0.5),
+          idleMemoryFreeBytes: Number(process.env.AGENT_OS_HARNESS_MAX_RSS_BYTES ?? 2 * 1024 * 1024 * 1024),
+        }, () => harnessActiveTurns.size);
     const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
       if (withCors(req, res)) return;
       // Every route but GET /health needs the gateway token (auth.ts), when the gateway was given one.
@@ -318,6 +333,7 @@ export function startGateway(deps: GatewayDeps, port = 0): Promise<GatewayHandle
         server,
         port: actualPort,
         stop: () => {
+          refinement?.stop();
           closeAllTerminals();
           return new Promise<void>((res, rej) => server.close((err) => (err ? rej(err) : res())));
         },
@@ -372,6 +388,16 @@ function mcpDeps(deps: GatewayDeps): McpDeps {
  *  reject it's told not to. Best effort: errors are logged, not thrown. */
 async function resumeAfterDecision(deps: GatewayDeps, approval: ApprovalRequest): Promise<void> {
   try {
+    if (approval.toolName === "harness.promote") {
+      if (approval.status === "approved") {
+        const candidateId = typeof approval.args.candidateId === "string" ? approval.args.candidateId : "";
+        const candidatePath = typeof approval.args.candidatePath === "string" ? approval.args.candidatePath : "";
+        const snapshotPath = typeof approval.args.snapshotPath === "string" ? approval.args.snapshotPath : "";
+        if (!candidateId || !candidatePath || !snapshotPath) throw new Error("Harness promotion approval is missing staged paths");
+        await promoteHarnessCandidate(process.env.AGENT_OS_DATA_DIR ?? path.join(process.cwd(), "data"), candidateId, snapshotPath, candidatePath);
+      }
+      return;
+    }
     const session = await getSession(approval.sessionId);
     if (!session || session.status === "cancelled") return;
     const call = `${approval.toolName} ${JSON.stringify(approval.args)}`.slice(0, 400);
@@ -393,6 +419,16 @@ async function resumeAfterDecision(deps: GatewayDeps, approval: ApprovalRequest)
         enableMemoryNominations: deps.enableMemoryNominations,
         enableArtifacts: deps.enableArtifacts,
         sandboxPolicy: deps.sandboxPolicy,
+        uiRequest: approval.toolName === "ui.act"
+          ? (operation, input, timeoutMs = 60000) => requestUi({
+              sessionId: session.id,
+              turnId: generateId(),
+              operation,
+              timeoutMs,
+              source: "agent",
+              input,
+            })
+          : undefined,
       });
       userMessage =
         `[Approvals] Approved ${approval.id}: ${call}. Go ahead and carry on — it has already been run for you ` +
@@ -405,6 +441,17 @@ async function resumeAfterDecision(deps: GatewayDeps, approval: ApprovalRequest)
       sessionId: session.id,
       agentId: session.agentId,
       userMessage,
+      enableUi: approval.toolName === "ui.act",
+      uiRequest: approval.toolName === "ui.act"
+        ? (operation, input, timeoutMs = 60000) => requestUi({
+            sessionId: session.id,
+            turnId: generateId(),
+            operation,
+            timeoutMs,
+            source: "agent",
+            input,
+          })
+        : undefined,
       model,
       worker: deps.worker,
       skills: deps.skills,
@@ -464,6 +511,49 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
   if (method === "GET" && segments.length === 1 && segments[0] === "events") {
     handleEventStream(req, res, url);
     return;
+  }
+
+  // Browser <-> gateway UI bridge. Server-originated requests are published
+  // over the existing SSE event stream; the browser posts one typed response
+  // back to the matching requestId. No parallel transport or mutable UI store.
+  if (segments[0] === "ui") {
+    if (method === "POST" && segments.length === 3 && segments[1] === "responses") {
+      const body = await readRequestBody(req);
+      const requestId = decodeURIComponent(segments[2]!);
+      const outcome = typeof body.ok === "boolean"
+        ? (body.ok
+            ? { ok: true as const, result: body.result }
+            : { ok: false as const, outcome: (body.outcome === "rejected" || body.outcome === "cancelled" || body.outcome === "timeout" ? body.outcome : "error") as "rejected" | "cancelled" | "timeout" | "error", error: typeof body.error === "string" ? body.error : undefined })
+        : { ok: false as const, outcome: "error" as const, error: "invalid UI response" };
+      if (!respondUi(requestId, outcome)) {
+        sendJson(res, 404, { error: "no pending UI request", requestId });
+      } else {
+        sendJson(res, 200, { ok: true, requestId });
+      }
+      return;
+    }
+    if (method === "POST" && segments.length === 2 && ["snapshot", "query", "act"].includes(segments[1]!)) {
+      const body = await readRequestBody(req);
+      const operation = segments[1]! as "snapshot" | "query" | "act";
+      const sessionId = typeof body.sessionId === "string" ? body.sessionId : "ui-direct";
+      const turnId = typeof body.turnId === "string" ? body.turnId : generateId();
+      const timeoutMs = typeof body.timeout === "number" ? body.timeout : 30000;
+      const source = body.source === "user" ? "user" : "agent";
+      if (operation === "act" && source === "agent") {
+        sendJson(res, 403, { error: "agent-originated ui.act requires the durable approval flow" });
+        return;
+      }
+      const outcome = await requestUi({
+        sessionId,
+        turnId,
+        operation,
+        timeoutMs,
+        source,
+        input: typeof body.input === "object" && body.input !== null ? body.input as Record<string, unknown> : {},
+      });
+      sendJson(res, 200, outcome);
+      return;
+    }
   }
 
   // ---- Work handed between agents (core/work.ts). The operator assigns,
@@ -1244,10 +1334,26 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
       // stub, when no provider is configured at all) exactly like before
       // this existed. See models/real.ts's createModelForAgent().
       const model = (await createModelForAgent(session.agentId)) ?? deps.model;
-      const result = await runTurn({
+      harnessActiveTurns.add(session.id);
+      let result;
+      try {
+        result = await runTurn({
         sessionId: session.id,
         agentId: session.agentId,
         userMessage: body.userMessage,
+        enableUi: body.enableUi === true,
+        openuiPrompt: typeof body.openuiPrompt === "string" ? body.openuiPrompt : undefined,
+        harnessDataDir: process.env.AGENT_OS_DATA_DIR,
+        uiRequest: body.enableUi === true
+          ? (operation, input, timeoutMs = 30000) => requestUi({
+              sessionId: session.id,
+              turnId: generateId(),
+              operation,
+              timeoutMs,
+              source: "agent",
+              input,
+            })
+          : undefined,
         model,
         worker: deps.worker,
         skills: deps.skills,
@@ -1263,7 +1369,10 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
         // turn at a time.
         planMode: body.planMode === true,
         ...(images.length ? { images } : {}),
-      });
+        });
+      } finally {
+        harnessActiveTurns.delete(session.id);
+      }
       sendJson(res, 200, result);
       return;
     }
@@ -1538,6 +1647,9 @@ async function route(req: IncomingMessage, res: ServerResponse, deps: GatewayDep
           if (!pending) throw new Error(`no such approval request: ${segments[1]}`);
           // Checked before the rule is added: an already rejected (or approved) request must not leave a standing rule behind.
           if (pending.status !== "pending") throw new Error(`approval request ${pending.id} is already resolved ("${pending.status}") and cannot be resolved again`);
+          if (pending.toolName === "ui.act" || pending.toolName === "harness.promote") {
+            throw new Error(`${pending.toolName} can never be added to the always-allow list`);
+          }
           await addAllowRule({
             agentId: pending.agentId,
             toolName: pending.toolName,

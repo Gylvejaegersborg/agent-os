@@ -53,3 +53,5 @@ export * from "./soundlab.js";
 export * from "./soundpack.js";
 export * from "./connectors.js";
 export * from "./connector-tool.js";
+export * from "./ui-bridge.js";
+export * from "./harness-refinement.js";
