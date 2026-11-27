@@ -448,7 +448,21 @@ async function main(): Promise<void> {
     const listAfterDelete = (await listAfterDeleteRes.json()) as any;
     assert(!listAfterDelete.skills.some((s: any) => s.name === "test-skill"), "the deleted skill no longer shows up in the catalog");
 
-    console.log("\n-- 14. Unknown routes return 404, not a crash --");
+    console.log("\n-- 14. UI bridge envelope and default-gate routes --");
+    const uiActRes = await fetch(`${base}/ui/act`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: session.id, turnId: "gateway-ui-turn", source: "agent", input: { steps: [{ ref: "Create", action: "press" }] } }),
+    });
+    assert(uiActRes.status === 403, "direct source:agent ui.act is denied unless it is resolved by the durable approval flow");
+    const uiResponseRes = await fetch(`${base}/ui/responses/missing-request`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ok: false, outcome: "cancelled" }),
+    });
+    assert(uiResponseRes.status === 404, "UI responses require a matching pending request");
+
+    console.log("\n-- 15. Unknown routes return 404, not a crash --");
     const notFoundRes = await fetch(`${base}/no-such-route`);
     assert(notFoundRes.status === 404, "an unknown route returns 404");
   } finally {
